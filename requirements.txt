@@ -1,0 +1,8 @@
+fastapi>=0.110,<1
+python-multipart
+uvicorn[standard]>=0.29,<1
+pydantic>=2,<3
+websockets>=12,<14
+watchfiles>=0.21,<1
+PyJWT>=2,<3
+google-auth>=2,<3
