@@ -1,0 +1,3142 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import hljs from "highlight.js/lib/common";
+import { marked } from "../lib/markdown";
+import {
+  listSessions,
+  listSessionsStatus,
+  getSession,
+  createSession,
+  attachSession,
+  resumeSession,
+  terminateSession,
+  deleteSession,
+  getConfig,
+  getSshConfig,
+  getConversation,
+  getGitInfo,
+  gitRollback,
+  gitManualCommit,
+  getCommitDetail,
+  renameSession,
+  createTask,
+  cancelTask,
+  restartServer,
+  setGitAutoCommit,
+  saveGitignore,
+  gitSetRemote,
+  listFiles,
+  readFile,
+  sqliteQuery,
+  sqliteExec,
+  openShell,
+  listAvailableClaudeSessions,
+  setClaudeSessionId,
+  fetchRawFileBlob,
+  makeRemoteUri,
+  browseExternalSessions,
+  listModels,
+  setSessionModel,
+  listSessionTodos,
+  listGoals,
+  listSessionAuqs,
+  type TodoItem,
+  type TodoPlan,
+  type Goal,
+  type AuqEntry,
+  type ExternalSession,
+  type ExternalSessionGroup,
+  type SessionMeta,
+  type ModelInfo,
+  type ConversationTurn,
+  type GitLogEntry,
+  type GitDiffFile,
+  type ScheduledTask,
+  type FileEntry,
+  type SqliteInfo,
+  type AttachResponse,
+  type AvailableClaudeSession,
+  type SshConfig,
+  type UsageInfo,
+  type TuiAuqData,
+  type TuiApproveData,
+  getUsageInfo,
+} from "../api/sessionApi";
+import gitIcon from "../assets/git.svg";
+import terminalIcon from "../assets/terminal.svg";
+import scheduleIcon from "../assets/schedule.svg";
+import { TerminalPane } from "../components/TerminalPane";
+import { TuiPane } from "../components/TuiPane";
+import { ConversationPane } from "../components/ConversationPane";
+import { PromptText } from "../components/SessionCard";
+import { UsageBar } from "../components/UsageBar";
+import { WsClient } from "../lib/wsClient";
+import { ClaudeCapsModal } from "../components/ClaudeCapsModal";
+
+const MOBILE_PAGE_SIZE = 10;
+const POLL_INTERVAL = 1000;
+
+/* ══════════════════════════════════════════════════
+   Terminal line buffer — handles ANSI + \r overwrite
+   ══════════════════════════════════════════════════ */
+class TerminalLineBuffer {
+  private lines: string[] = [""];
+  private row = 0;
+  private col = 0;
+
+  feed(raw: string): void {
+    let i = 0;
+    while (i < raw.length) {
+      const ch = raw[i];
+
+      // ESC sequences
+      if (ch === "\x1B") {
+        i++;
+        if (i >= raw.length) break;
+        if (raw[i] === "[") {
+          // CSI: ESC [ <params> <cmd>
+          i++;
+          let params = "";
+          while (i < raw.length && !this.isCsiEnd(raw[i])) params += raw[i++];
+          if (i < raw.length) { this.handleCsi(raw[i], params); i++; }
+        } else if (raw[i] === "]") {
+          // OSC: ESC ] … BEL or ST
+          i++;
+          while (i < raw.length && raw[i] !== "\x07" && raw[i] !== "\x1B") i++;
+          if (i < raw.length && raw[i] === "\x07") i++;
+          else if (i < raw.length && raw[i] === "\x1B") i += 2;
+        } else {
+          // Two-char escape — skip
+          i++;
+        }
+        continue;
+      }
+
+      // Control characters
+      if (ch === "\r") {
+        this.col = 0;
+      } else if (ch === "\n") {
+        this.row++;
+        this.col = 0;
+        if (this.lines.length <= this.row) this.lines.push("");
+      } else if (ch === "\b") {
+        this.col = Math.max(0, this.col - 1);
+      } else if (ch >= " ") {
+        // Printable
+        while (this.lines.length <= this.row) this.lines.push("");
+        while (this.lines[this.row].length < this.col) this.lines[this.row] += " ";
+        this.lines[this.row] =
+          this.lines[this.row].slice(0, this.col) +
+          ch +
+          this.lines[this.row].slice(this.col + 1);
+        this.col++;
+      }
+      i++;
+    }
+  }
+
+  private isCsiEnd(ch: string): boolean {
+    const c = ch.charCodeAt(0);
+    return c >= 0x40 && c <= 0x7e;
+  }
+
+  private handleCsi(cmd: string, params: string): void {
+    const ns = params.split(";").map((p) => parseInt(p) || 0);
+    const n = ns[0] || 1;
+    switch (cmd) {
+      case "A": this.row = Math.max(0, this.row - n); break;
+      case "B": this.row += n; while (this.lines.length <= this.row) this.lines.push(""); break;
+      case "C": this.col += n; break;
+      case "D": this.col = Math.max(0, this.col - n); break;
+      case "H": case "f":
+        this.row = Math.max(0, (ns[0] || 1) - 1);
+        this.col = Math.max(0, (ns[1] || 1) - 1);
+        while (this.lines.length <= this.row) this.lines.push("");
+        break;
+      case "J":
+        if (ns[0] === 2 || ns[0] === 3) { this.lines = [""]; this.row = 0; this.col = 0; }
+        else if (ns[0] === 0) { this.lines[this.row] = this.lines[this.row].slice(0, this.col); this.lines.splice(this.row + 1); }
+        break;
+      case "K":
+        if (ns[0] === 0) this.lines[this.row] = (this.lines[this.row] || "").slice(0, this.col);
+        else if (ns[0] === 2) { this.lines[this.row] = ""; this.col = 0; }
+        break;
+    }
+  }
+
+  reset(): void { this.lines = [""]; this.row = 0; this.col = 0; }
+
+  getText(): string {
+    let end = this.lines.length - 1;
+    while (end > 0 && !this.lines[end].trim()) end--;
+    return this.lines.slice(0, end + 1).join("\n");
+  }
+}
+
+/* ─── Mobile Usage Row ─── */
+function MobileUsageRow() {
+  return (
+    <div style={{
+      padding: "6px 14px",
+      background: "var(--bg-surface)",
+      borderBottom: "1px solid var(--border-subtle)",
+      flexShrink: 0,
+    }}>
+      <UsageBar />
+    </div>
+  );
+}
+
+/* ─── Create Session Modal ─── */
+function CreateModal({
+  workspaceBase, username, onClose, onCreate,
+}: { workspaceBase: string; username: string; onClose: () => void; onCreate: (s: SessionMeta) => void }) {
+  const [project, setProject] = useState("");
+  const [suffix, setSuffix] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const prefix = `${workspaceBase}/${username}/`;
+
+  const submit = async () => {
+    if (!project.trim()) return;
+    setLoading(true); setErr("");
+    try {
+      const cwd = suffix.trim() ? prefix + suffix.trim() : undefined;
+      onCreate(await createSession({ project: project.trim(), cwd }));
+    } catch (e) { setErr(String(e)); } finally { setLoading(false); }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end" }} onClick={onClose}>
+      <div style={{ width: "100%", background: "var(--bg-surface)", borderRadius: "16px 16px 0 0", padding: "20px 16px 36px", display: "flex", flexDirection: "column", gap: 12 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 4px" }} />
+        <h3 style={{ margin: 0, fontSize: 16, color: "var(--text-primary)" }}>New Session</h3>
+        <input placeholder="Project name *" value={project} onChange={(e) => setProject(e.target.value)} autoFocus style={inp} />
+        <div>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 2 }}>Working directory (optional)</div>
+          <div style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "monospace", marginBottom: 4 }}>{prefix}</div>
+          <input placeholder="subdir" value={suffix} onChange={(e) => setSuffix(e.target.value)} style={inp} />
+        </div>
+        {err && <div style={{ fontSize: 12, color: "var(--accent-red)" }}>{err}</div>}
+        <button onClick={submit} disabled={loading || !project.trim()} style={{ ...btn, background: "var(--accent-green)", color: "#fff", opacity: loading || !project.trim() ? 0.5 : 1 }}>
+          {loading ? "Creating…" : "Create Session"}
+        </button>
+        <button onClick={onClose} style={{ ...btn, background: "var(--bg-hover)", color: "var(--text-secondary)" }}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Browse External Sessions Panel (mobile) ─── */
+function relativeTime(mtime: number): string {
+  const diff = Date.now() / 1000 - mtime;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d ago`;
+  return new Date(mtime * 1000).toLocaleDateString();
+}
+
+function MobileBrowseExternalPanel({
+  onClose, onLoad,
+}: { onClose: () => void; onLoad: (ext: ExternalSession) => Promise<void> }) {
+  const [groups, setGroups] = useState<ExternalSessionGroup[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [loadingId, setLoadingId] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    browseExternalSessions().then((data) => setGroups(data)).catch(() => {}).finally(() => setLoading(false));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const q = search.toLowerCase();
+
+  // Filter groups: empty sessions out, apply search, sort (dir_exists first, then by latest_mtime desc)
+  const filteredGroups = useMemo(() => {
+    return groups
+      .map((g) => {
+        const nonEmpty = g.sessions.filter((s) => s.title || s.prompts.length > 0);
+        const visible = nonEmpty.filter((s) =>
+          !q ||
+          g.dir.toLowerCase().includes(q) ||
+          (s.title?.toLowerCase().includes(q)) ||
+          s.prompts.some((p) => p.toLowerCase().includes(q))
+        );
+        return { ...g, sessions: visible };
+      })
+      .filter((g) => g.sessions.length > 0)
+      .sort((a, b) => {
+        if (a.dir_exists !== b.dir_exists) return a.dir_exists ? -1 : 1;
+        return b.latest_mtime - a.latest_mtime;
+      });
+  }, [groups, q]);
+
+  const toggleCollapse = (dir: string) =>
+    setCollapsed((prev) => { const next = new Set(prev); next.has(dir) ? next.delete(dir) : next.add(dir); return next; });
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 400, display: "flex", flexDirection: "column" }}>
+      {/* Header */}
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1, flexShrink: 0 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Browse External Sessions</span>
+      </div>
+      {/* Search */}
+      <div style={{ flexShrink: 0, padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
+        <input
+          placeholder="Search sessions…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          style={{ ...inp, fontSize: 14 }}
+        />
+      </div>
+      {/* Grouped list */}
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {loading && <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>}
+        {!loading && filteredGroups.length === 0 && (
+          <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>{q ? "No matches" : "No external sessions found"}</div>
+        )}
+        {filteredGroups.map((g) => {
+          const dirName = g.dir.split("/").filter(Boolean).pop() || g.dir;
+          const isCollapsed = collapsed.has(g.dir);
+          return (
+            <div key={g.dir}>
+              {/* Dir header */}
+              <div
+                onClick={() => toggleCollapse(g.dir)}
+                style={{ padding: "8px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
+              >
+                <span style={{ fontSize: 12, color: "var(--text-muted)", transition: "transform 0.1s", display: "inline-block", transform: isCollapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>▾</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: g.dir_exists ? "var(--text-primary)" : "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {dirName}
+                    </span>
+                    {!g.dir_exists && (
+                      <span style={{ fontSize: 10, color: "var(--accent-red)", background: "rgba(248,81,73,0.1)", border: "1px solid rgba(248,81,73,0.3)", borderRadius: 3, padding: "0 4px", flexShrink: 0 }}>
+                        missing
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {g.sessions.length} session{g.sessions.length !== 1 ? "s" : ""} · {relativeTime(g.latest_mtime)}
+                  </div>
+                </div>
+              </div>
+              {/* Sessions under this dir */}
+              {!isCollapsed && g.sessions.map((s) => {
+                const canLoad = g.dir_exists;
+                const isLoadingThis = loadingId === s.claude_session_id;
+                return (
+                  <div key={s.claude_session_id} style={{ padding: "10px 14px 10px 28px", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "flex-start", gap: 10, background: "var(--bg-base)" }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 500 }}>
+                        {s.title || <span style={{ color: "var(--text-faint)", fontStyle: "italic" }}>No title</span>}
+                      </div>
+                      {s.prompts.length > 0 && (
+                        <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          <PromptText text={s.prompts[s.prompts.length - 1]} />
+                        </div>
+                      )}
+                      <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>{relativeTime(s.mtime)}</div>
+                    </div>
+                    <button
+                      disabled={!canLoad || isLoadingThis}
+                      onPointerDown={(e) => e.preventDefault()}
+                      onClick={async () => {
+                        if (!canLoad) return;
+                        setLoadingId(s.claude_session_id);
+                        try { await onLoad(s); } finally { setLoadingId(null); }
+                      }}
+                      style={{
+                        background: canLoad ? "var(--accent-blue)" : "var(--bg-hover)",
+                        color: canLoad ? "#fff" : "var(--text-faint)",
+                        border: "none", borderRadius: 6,
+                        padding: "6px 14px", fontSize: 13,
+                        cursor: canLoad ? "pointer" : "not-allowed",
+                        flexShrink: 0, opacity: isLoadingThis ? 0.6 : 1,
+                      }}
+                    >
+                      {isLoadingThis ? "…" : "Load"}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Session List ─── */
+// Cache the latest mobile session list in localStorage so reopen feels instant.
+// We rehydrate immediately on mount, then refresh in the background.
+const MOBILE_LIST_CACHE_KEY = "mobileSessionListCache";
+function _readListCache(): { items: SessionMeta[]; total: number } | null {
+  try {
+    const raw = localStorage.getItem(MOBILE_LIST_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.items)) return null;
+    return { items: parsed.items as SessionMeta[], total: Number(parsed.total) || 0 };
+  } catch { return null; }
+}
+function _writeListCache(items: SessionMeta[], total: number) {
+  try {
+    localStorage.setItem(MOBILE_LIST_CACHE_KEY, JSON.stringify({ items, total }));
+  } catch { /* quota — ignore */ }
+}
+
+function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggleTheme }: { username: string; onLogout: () => void; onOpen: (s: SessionMeta) => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void }) {
+  const isAdmin = localStorage.getItem("role") === "admin";
+  const cached = _readListCache();
+  const [sessions, setSessions] = useState<SessionMeta[]>(cached?.items ?? []);
+  const [total, setTotal] = useState(cached?.total ?? 0);
+  const [page, setPage] = useState(0);
+  // If we have cached items we can skip the loading spinner — the user sees
+  // the previous list instantly and it updates a moment later from the API.
+  const [loading, setLoading] = useState(!cached);
+  const [showCreate, setShowCreate] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [workspaceBase, setWorkspaceBase] = useState("/workspace");
+  const [restarting, setRestarting] = useState(false);
+  const [showAllSessions, setShowAllSessions] = useState<boolean>(
+    () => localStorage.getItem("mobileShowAllSessions") === "1",
+  );
+  useEffect(() => {
+    localStorage.setItem("mobileShowAllSessions", showAllSessions ? "1" : "0");
+  }, [showAllSessions]);
+
+  useEffect(() => { getConfig().then((c) => setWorkspaceBase(c.workspace)).catch(() => {}); }, []);
+
+  const fetchSessions = useCallback(async (p: number, showLoading = false) => {
+    if (showLoading) setLoading(true);
+    try {
+      const res = await listSessions();
+      const isActive = (s: SessionMeta) => s.status === "running" || s.status === "detached";
+      const visible = showAllSessions ? res.items : res.items.filter(isActive);
+      const effectiveTotal = showAllSessions ? res.total : visible.length;
+      setTotal(effectiveTotal);
+      const pageItems = visible.slice(p * MOBILE_PAGE_SIZE, (p + 1) * MOBILE_PAGE_SIZE);
+      const ordered = [...pageItems.filter(isActive), ...pageItems.filter((s) => !isActive(s))];
+      setSessions(ordered);
+      if (p === 0) _writeListCache(ordered, effectiveTotal);
+    } catch { /* keep prior cached list rather than wiping it */ } finally { if (showLoading) setLoading(false); }
+  }, [showAllSessions]);
+
+  // Lightweight status-only refresh: merge status fields without touching title/prompts
+  const refreshStatus = useCallback(async () => {
+    try {
+      const res = await listSessionsStatus();
+      const statusById = new Map(res.items.map((s) => [s.id, s]));
+      setSessions((prev) => prev.map((s) => {
+        const st = statusById.get(s.id);
+        if (!st) return s;
+        return { ...s, status: st.status, attached_clients: st.attached_clients, has_new_output: st.has_new_output, is_streaming: st.is_streaming, scheduled_tasks: st.scheduled_tasks };
+      }));
+    } catch {}
+  }, []);
+
+  // Initial load (with spinner) + full refresh every 30s + status refresh every 3s
+  useEffect(() => {
+    fetchSessions(page, true);
+    const fullTimer = setInterval(() => fetchSessions(page, false), 30000);
+    const statusTimer = setInterval(refreshStatus, 3000);
+    return () => { clearInterval(fullTimer); clearInterval(statusTimer); };
+  }, [page, fetchSessions, refreshStatus]);
+
+  const totalPages = Math.max(1, Math.ceil(total / MOBILE_PAGE_SIZE));
+
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const handleDelete = async (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    if (!window.confirm("Delete this session?")) return;
+    setDeletingId(id);
+    try {
+      await deleteSession(id);
+      setSessions((prev) => prev.filter((s) => s.id !== id));
+      setTotal((t) => t - 1);
+    } catch { alert("Failed to delete"); } finally { setDeletingId(null); }
+  };
+
+  const [resumingId, setResumingId] = useState<string | null>(null);
+  const handleResume = async (e: React.MouseEvent, s: SessionMeta) => {
+    e.stopPropagation();
+    setResumingId(s.id);
+    try {
+      await resumeSession(s.id);
+      await fetchSessions(page, false);
+      onOpen({ ...s, status: "running" });
+    } catch (err) { alert(String(err)); } finally { setResumingId(null); }
+  };
+
+  const handleRestart = async () => {
+    if (!window.confirm("Restart server? All connections will be disconnected.")) return;
+    setRestarting(true);
+    try {
+      await restartServer();
+    } catch {
+      // Server may disconnect before responding — that's expected
+    }
+    const poll = setInterval(async () => {
+      try {
+        const r = await fetch("/health");
+        if (r.ok) { clearInterval(poll); setRestarting(false); }
+      } catch {}
+    }, 1500);
+    setTimeout(() => { clearInterval(poll); setRestarting(false); }, 30000);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", position: "fixed", inset: 0, background: "var(--bg-base)" }}>
+      <div style={{ padding: "14px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+        <span style={{ fontSize: 17, fontWeight: 700, color: "var(--text-bright)" }}>Claude Manager</span>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{username}</span>
+          {onToggleTheme && (
+            <button onClick={onToggleTheme} title="Toggle theme"
+              style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-muted)", fontSize: 14, padding: "4px 7px", cursor: "pointer" }}>
+              {theme === "light" ? "🌙" : "☀️"}
+            </button>
+          )}
+          {onSwitchToAdmin && (
+            <button onClick={onSwitchToAdmin}
+              style={{ fontSize: 12, padding: "5px 10px", background: "rgba(88,166,255,0.12)", color: "var(--accent-blue)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 6 }}>
+              Admin
+            </button>
+          )}
+          {isAdmin && (
+            <button onClick={handleRestart} disabled={restarting}
+              style={{ fontSize: 12, padding: "5px 10px", background: restarting ? "var(--bg-hover)" : "var(--bg-hover)", color: restarting ? "var(--text-muted)" : "var(--text-secondary)", border: "1px solid var(--border)", borderRadius: 6, cursor: restarting ? "not-allowed" : "pointer" }}>
+              {restarting ? "Restarting…" : "⟳ Restart"}
+            </button>
+          )}
+          <button onClick={onLogout}
+            style={{ fontSize: 12, padding: "5px 10px", background: "var(--bg-hover)", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 6 }}>
+            Logout
+          </button>
+        </div>
+      </div>
+
+      {/* Token usage — 5h session + weekly */}
+      <MobileUsageRow />
+
+      <div style={{ padding: "6px 10px 4px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+        <button
+          onClick={() => { setShowAllSessions((v) => !v); setPage(0); }}
+          style={{
+            width: "100%", padding: "5px 10px", borderRadius: 5, fontSize: 12,
+            background: showAllSessions ? "var(--bg-hover)" : "rgba(88,166,255,0.1)",
+            border: `1px solid ${showAllSessions ? "var(--border)" : "rgba(88,166,255,0.3)"}`,
+            color: showAllSessions ? "var(--text-muted)" : "var(--accent-blue)",
+            cursor: "pointer", textAlign: "left",
+          }}
+        >
+          {showAllSessions ? "Showing all sessions" : "Active sessions only"}
+        </button>
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {loading
+          ? <div style={{ textAlign: "center", padding: 48, color: "var(--text-faint)" }}>Loading…</div>
+          : sessions.length === 0
+            ? <div style={{ textAlign: "center", padding: 48, color: "var(--text-faint)" }}>{showAllSessions ? "No sessions yet" : "No active sessions"}</div>
+            : sessions.map((s) => (
+              <div key={s.id} onClick={() => onOpen(s)}
+                style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer", display: "flex", flexDirection: "column", gap: 5 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{
+                    width: 7, height: 7, borderRadius: "50%", background: statusDot(s.status), flexShrink: 0, display: "inline-block",
+                    animation: s.is_streaming ? "cursor-blink 0.8s step-end infinite" : undefined,
+                  }} />
+                  <span style={{ fontSize: 15, color: "var(--text-bright)", fontWeight: 600, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {s.project}
+                  </span>
+                  {s.is_streaming ? (
+                    <span style={{ fontSize: 10, color: "var(--accent-blue)", background: "rgba(88,166,255,0.1)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 4, padding: "1px 6px", flexShrink: 0 }}>responding</span>
+                  ) : s.has_new_output ? (
+                    <span style={{ fontSize: 10, color: "var(--accent-green)", background: "rgba(63,185,80,0.1)", border: "1px solid rgba(63,185,80,0.3)", borderRadius: 4, padding: "1px 6px", flexShrink: 0 }}>unread</span>
+                  ) : s.status === "terminated" ? (
+                    <span style={{ fontSize: 10, color: "var(--accent-red)", background: "rgba(248,81,73,0.1)", border: "1px solid rgba(248,81,73,0.25)", borderRadius: 4, padding: "1px 6px", flexShrink: 0 }}>terminated</span>
+                  ) : s.status === "detached" ? (
+                    <span style={{ fontSize: 10, color: "var(--text-muted)", background: "var(--bg-hover)", border: "1px solid var(--border)", borderRadius: 4, padding: "1px 6px", flexShrink: 0 }}>detached</span>
+                  ) : null}
+                  {s.status === "terminated" && (
+                    <>
+                      <button
+                        onClick={(e) => handleResume(e, s)}
+                        disabled={resumingId === s.id}
+                        style={{ background: "transparent", border: "none", color: resumingId === s.id ? "var(--text-faintest)" : "var(--accent-green)", fontSize: 15, padding: "2px 4px", cursor: "pointer", flexShrink: 0, lineHeight: 1 }}
+                        title="Resume"
+                      >{resumingId === s.id ? "…" : "▶"}</button>
+                      <button
+                        onClick={(e) => handleDelete(e, s.id)}
+                        disabled={deletingId === s.id}
+                        style={{ background: "transparent", border: "none", color: deletingId === s.id ? "var(--text-faintest)" : "var(--text-faint)", fontSize: 16, padding: "2px 4px", cursor: "pointer", flexShrink: 0, lineHeight: 1 }}
+                        title="Delete"
+                      >🗑</button>
+                    </>
+                  )}
+                  <span style={{ fontSize: 13, color: "var(--text-faint)" }}>›</span>
+                </div>
+                {s.prompts?.[0] && <div style={{ fontSize: 13, color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", paddingLeft: 15 }}><PromptText text={s.prompts[0]} /></div>}
+                {s.prompts && s.prompts.length >= 2 && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 15 }}>
+                    <span style={{ fontSize: 12, color: "var(--text-muted)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><PromptText text={s.prompts[s.prompts.length - 1]} /></span>
+                    {s.last_user_input_at && <span style={{ fontSize: 10, color: "var(--text-faintest)", flexShrink: 0 }}>{relTime(s.last_user_input_at)}</span>}
+                  </div>
+                )}
+                {(!s.prompts || s.prompts.length < 2) && s.last_user_input_at && (
+                  <div style={{ fontSize: 10, color: "var(--text-faintest)", paddingLeft: 15 }}>{relTime(s.last_user_input_at)}</div>
+                )}
+                <div style={{ fontSize: 11, color: "var(--text-faintest)", paddingLeft: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.cwd}</div>
+              </div>
+            ))
+        }
+      </div>
+
+      {totalPages > 1 && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 16, padding: "10px 16px", borderTop: "1px solid var(--border)", background: "var(--bg-surface)", flexShrink: 0 }}>
+          <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0} style={{ ...btn, padding: "6px 20px", opacity: page === 0 ? 0.35 : 1, background: "var(--bg-hover)", color: "var(--text-muted)" }}>‹ Prev</button>
+          <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{page + 1} / {totalPages}</span>
+          <button onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))} disabled={page >= totalPages - 1} style={{ ...btn, padding: "6px 20px", opacity: page >= totalPages - 1 ? 0.35 : 1, background: "var(--bg-hover)", color: "var(--text-muted)" }}>Next ›</button>
+        </div>
+      )}
+
+      <div style={{ padding: "12px 16px", borderTop: "1px solid var(--border)", background: "var(--bg-surface)", flexShrink: 0, display: "flex", gap: 8 }}>
+        <button onClick={() => setShowCreate(true)} style={{ ...btn, flex: 1, background: "var(--accent-green)", color: "#fff", fontSize: 15, padding: "12px" }}>+ New Session</button>
+        <button onClick={() => setShowImport(true)} style={{ ...btn, background: "rgba(88,166,255,0.1)", color: "var(--accent-blue)", border: "1px solid rgba(88,166,255,0.3)", fontSize: 15, padding: "12px 16px" }}>⬆ Import</button>
+      </div>
+
+      {showCreate && (
+        <CreateModal workspaceBase={workspaceBase} username={username}
+          onClose={() => setShowCreate(false)}
+          onCreate={(s) => { setShowCreate(false); onOpen(s); }} />
+      )}
+      {showImport && (
+        <MobileBrowseExternalPanel
+          onClose={() => setShowImport(false)}
+          onLoad={async (ext) => {
+            const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
+            const newSession = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id });
+            setShowImport(false);
+            onOpen(newSession);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ─── Chat bubble ─── */
+function _fmtTs(ts: number): string {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function Bubble({ turn }: { turn: ConversationTurn & { streaming?: boolean } }) {
+  const isUser = turn.role === "user";
+  const ts = _fmtTs(turn.ts);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", marginBottom: 10, padding: "0 12px" }}>
+      <div style={{
+        maxWidth: "86%",
+        padding: "10px 13px",
+        borderRadius: isUser ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
+        background: isUser ? "color-mix(in srgb, var(--accent-blue) 18%, var(--bg-base))" : "var(--bg-hover)",
+        color: isUser ? "var(--text-bright)" : "var(--text-primary)",
+        fontSize: 14,
+        lineHeight: 1.6,
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+      }}>
+        {turn.text}
+      </div>
+      {ts && <span style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 2, paddingLeft: 2, paddingRight: 2 }}>{ts}</span>}
+    </div>
+  );
+}
+
+/* ─── Streaming bubble (live terminal output) ─── */
+function StreamingBubble({ text }: { text: string }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 10, padding: "0 12px" }}>
+      <div style={{
+        maxWidth: "92%",
+        padding: "10px 13px",
+        borderRadius: "16px 16px 16px 4px",
+        background: "var(--bg-deep)",
+        border: "1px solid var(--border-subtle)",
+        color: "var(--text-secondary)",
+        fontSize: 12,
+        lineHeight: 1.5,
+        fontFamily: '"Cascadia Code", Menlo, Monaco, "Courier New", monospace',
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-all",
+      }}>
+        {text}
+        <span style={{ display: "inline-block", marginLeft: 3, color: "var(--accent-blue)", animation: "cursor-blink 0.8s step-end infinite" }}>▍</span>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Unified diff helpers ─── */
+type _EditType = "same" | "removed" | "added";
+interface _Edit { type: _EditType; text: string; oldLine: number; newLine: number; }
+
+function _lcsEdits(oldL: string[], newL: string[]): _Edit[] {
+  const m = oldL.length, n = newL.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = oldL[i-1] === newL[j-1] ? dp[i-1][j-1] + 1 : Math.max(dp[i-1][j], dp[i][j-1]);
+  const edits: _Edit[] = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldL[i-1] === newL[j-1]) { edits.push({ type: "same", text: oldL[i-1], oldLine: i, newLine: j }); i--; j--; }
+    else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) { edits.push({ type: "added", text: newL[j-1], oldLine: i, newLine: j }); j--; }
+    else { edits.push({ type: "removed", text: oldL[i-1], oldLine: i, newLine: j }); i--; }
+  }
+  return edits.reverse();
+}
+
+interface _ULine { type: _EditType | "hunk"; text: string; lineNo?: number; }
+
+function _computeUnifiedDiff(oldContent: string, newContent: string, ctx = 3): _ULine[] {
+  const edits = _lcsEdits(oldContent.split("\n"), newContent.split("\n"));
+  if (!edits.length) return [];
+
+  // Mark visible indices (changed ± ctx)
+  const visible = new Set<number>();
+  edits.forEach((e, i) => {
+    if (e.type !== "same") {
+      for (let k = Math.max(0, i - ctx); k < Math.min(edits.length, i + ctx + 1); k++) visible.add(k);
+    }
+  });
+  if (!visible.size) return [{ type: "hunk", text: "No changes" }];
+
+  const result: _ULine[] = [];
+  let prev = -2;
+  for (let i = 0; i < edits.length; i++) {
+    if (!visible.has(i)) continue;
+    if (i !== prev + 1) {
+      const e = edits[i];
+      result.push({ type: "hunk", text: `@@ -${e.oldLine} +${e.newLine} @@` });
+    }
+    const e = edits[i];
+    const lineNo = e.type === "added" ? e.newLine : e.oldLine;
+    result.push({ type: e.type, text: e.text, lineNo });
+    prev = i;
+  }
+  return result;
+}
+
+function MobileFileDiff({ file, onClose }: { file: GitDiffFile; onClose: () => void }) {
+  const lines = useMemo(() => _computeUnifiedDiff(file.old_content, file.new_content), [file]);
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 400, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "10px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-muted)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 12, color: "var(--text-bright)", fontFamily: "monospace", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{file.path}</span>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", fontFamily: "monospace", fontSize: 11, lineHeight: "18px" }}>
+        {lines.map((line, i) => {
+          if (line.type === "hunk") {
+            return (
+              <div key={i} style={{ background: "var(--bg-surface)", color: "var(--accent-blue)", padding: "2px 8px", borderTop: i > 0 ? "1px solid var(--border)" : undefined }}>
+                {line.text}
+              </div>
+            );
+          }
+          const bg = line.type === "removed" ? "var(--diff-del-bg)" : line.type === "added" ? "var(--diff-add-bg)" : "transparent";
+          const sigil = line.type === "removed" ? "-" : line.type === "added" ? "+" : " ";
+          const sigilColor = line.type === "removed" ? "var(--diff-del-text)" : line.type === "added" ? "var(--diff-add-text)" : "var(--text-faint)";
+          const textColor = line.type === "removed" ? "var(--diff-del-text)" : line.type === "added" ? "var(--diff-add-text)" : "var(--text-body)";
+          return (
+            <div key={i} style={{ display: "flex", background: bg, minHeight: 18 }}>
+              <span style={{ width: 30, flexShrink: 0, textAlign: "right", paddingRight: 5, color: "var(--text-faint)", userSelect: "none", borderRight: "1px solid var(--border)" }}>{line.lineNo}</span>
+              <span style={{ width: 14, flexShrink: 0, textAlign: "center", color: sigilColor, userSelect: "none" }}>{sigil}</span>
+              <span style={{ flex: 1, color: textColor, whiteSpace: "pre-wrap", wordBreak: "break-all", paddingRight: 6 }}>{line.text}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Mobile Git Panel ─── */
+const GIT_PAGE_SIZE = 15;
+
+function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sessionId: string; session: SessionMeta; onSessionChange: (s: SessionMeta) => void; onClose: () => void }) {
+  const [log, setLog] = useState<GitLogEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [isRepo, setIsRepo] = useState(false);
+  const [autoCommit, setAutoCommit] = useState(session.git_auto_commit);
+  const [gitignore, setGitignore] = useState("");
+  const [gitignoreDraft, setGitignoreDraft] = useState("");
+  const [editingGitignore, setEditingGitignore] = useState(false);
+  const [remote, setRemote] = useState("");
+  const [remoteInput, setRemoteInput] = useState("");
+  const [editingRemote, setEditingRemote] = useState(false);
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(0);
+  const [revertHash, setRevertHash] = useState<string | null>(null);
+  const [reverting, setReverting] = useState(false);
+  const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [detailHash, setDetailHash] = useState<string | null>(null);
+  const [detailMsg, setDetailMsg] = useState<string>("");
+  const [detailFiles, setDetailFiles] = useState<GitDiffFile[]>([]);
+  const [diffFile, setDiffFile] = useState<GitDiffFile | null>(null);
+  const [committing, setCommitting] = useState(false);
+
+  useEffect(() => {
+    setLoading(true);
+    getGitInfo(sessionId)
+      .then((info) => { setIsRepo(info.is_repo); setLog(info.log); setGitignore(info.gitignore ?? ""); setGitignoreDraft(info.gitignore ?? ""); setAutoCommit(info.auto_commit); setRemote(info.remote ?? ""); setRemoteInput(info.remote ?? ""); })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [sessionId]);
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return log;
+    const q = search.toLowerCase();
+    return log.filter((e) => e.subject.toLowerCase().includes(q) || e.short_hash.includes(q));
+  }, [log, search]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / GIT_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages - 1);
+  const pageLog = filtered.slice(safePage * GIT_PAGE_SIZE, (safePage + 1) * GIT_PAGE_SIZE);
+
+  const doRevert = async () => {
+    if (!revertHash) return;
+    setReverting(true);
+    try {
+      const res = await gitRollback(sessionId, revertHash);
+      setMsg({ text: res.output || "Rolled back", ok: true });
+      // Refresh log
+      const info = await getGitInfo(sessionId);
+      setLog(info.log);
+    } catch (e) {
+      setMsg({ text: String(e), ok: false });
+    } finally {
+      setReverting(false);
+      setRevertHash(null);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      {/* Header */}
+      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Git</span>
+        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{filtered.length} commits</span>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          {isRepo && (
+            <>
+              <button
+                disabled={committing}
+                onClick={async () => {
+                  setCommitting(true);
+                  try {
+                    const res = await gitManualCommit(sessionId);
+                    setMsg({ text: res.committed ? res.output || "Committed" : "Nothing to commit", ok: res.committed });
+                    if (res.committed) { const info = await getGitInfo(sessionId); setLog(info.log); }
+                  } catch (e) { setMsg({ text: String(e), ok: false }); }
+                  finally { setCommitting(false); }
+                }}
+                style={{ fontSize: 11, padding: "3px 10px", background: committing ? "var(--bg-hover)" : "var(--bg-hover)", color: committing ? "var(--text-muted)" : "var(--accent-green)", border: "1px solid #2d5a2d", borderRadius: 5 }}
+              >
+                {committing ? "…" : "Commit"}
+              </button>
+              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Auto commit</span>
+              <button
+                onClick={async () => {
+                  const next = !autoCommit;
+                  if (!next && !window.confirm("Disable auto-commit? Claude replies will no longer trigger automatic git commits.")) return;
+                  try {
+                    await setGitAutoCommit(sessionId, next);
+                    setAutoCommit(next);
+                    onSessionChange({ ...session, git_auto_commit: next });
+                  } catch {}
+                }}
+                style={{ width: 36, height: 20, borderRadius: 10, background: autoCommit ? "var(--accent-green)" : "var(--border)", border: "none", cursor: "pointer", position: "relative", flexShrink: 0 }}
+              >
+                <span style={{ position: "absolute", top: 2, left: autoCommit ? 18 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.15s" }} />
+              </button>
+              <button
+                onClick={() => setEditingGitignore(true)}
+                style={{ fontSize: 11, padding: "3px 8px", background: "var(--bg-hover)", color: "var(--text-secondary)", border: "1px solid #374151", borderRadius: 5 }}
+              >
+                .gitignore
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {!isRepo && !loading && (
+        <div style={{ textAlign: "center", padding: 48, color: "var(--text-muted)" }}>Not a git repository</div>
+      )}
+
+      {isRepo && (
+        <>
+          {/* Remote URL bar */}
+          <div
+            onClick={() => { setRemoteInput(remote); setEditingRemote(true); }}
+            style={{ padding: "7px 14px", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", flexShrink: 0, background: "var(--bg-base)" }}
+          >
+            <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>Remote</span>
+            <span style={{ fontSize: 12, color: remote ? "var(--accent-blue)" : "var(--text-muted)", fontFamily: remote ? "monospace" : undefined, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {loading ? "…" : remote || "Not set — tap to configure"}
+            </span>
+            <span style={{ fontSize: 12, color: "var(--text-faint)", flexShrink: 0 }}>›</span>
+          </div>
+
+          {/* Search */}
+          <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+            <input
+              placeholder="Search commits…"
+              value={search}
+              onChange={(e) => { setSearch(e.target.value); setPage(0); }}
+              style={{ ...inp, fontSize: 14 }}
+            />
+          </div>
+
+          {/* Commit list */}
+          <div style={{ flex: 1, overflowY: "auto" }}>
+            {loading
+              ? <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>Loading…</div>
+              : pageLog.length === 0
+                ? <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>No commits found</div>
+                : pageLog.map((entry) => {
+                  const isLatest = entry.hash === log[0]?.hash;
+                  return (
+                    <div key={entry.hash} style={{ padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)", display: "flex", flexDirection: "column", gap: 4 }}>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                        <span style={{ fontFamily: "monospace", fontSize: 11, color: "var(--accent-blue)", flexShrink: 0, marginTop: 2 }}>{entry.short_hash}</span>
+                        <span style={{ fontSize: 13, color: "var(--text-primary)", flex: 1, lineHeight: 1.4 }}>{entry.subject}</span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                        <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{entry.author} · {new Date(entry.date).toLocaleString()}</span>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button
+                            onClick={async () => {
+                              setDetailHash(entry.hash);
+                              setDetailMsg("Loading…");
+                              setDetailFiles([]);
+                              try {
+                                const d = await getCommitDetail(sessionId, entry.hash);
+                                setDetailMsg(d.message);
+                                setDetailFiles(d.files ?? []);
+                              } catch {
+                                setDetailMsg("Failed to load commit detail.");
+                              }
+                            }}
+                            style={{ fontSize: 11, padding: "3px 10px", background: "var(--bg-hover)", color: "var(--accent-blue)", border: "1px solid #1d3557", borderRadius: 5 }}
+                          >
+                            Detail
+                          </button>
+                          {!isLatest && (
+                            <button
+                              onClick={() => setRevertHash(entry.hash)}
+                              style={{ fontSize: 11, padding: "3px 10px", background: "var(--bg-hover)", color: "var(--accent-amber)", border: "1px solid var(--border)", borderRadius: 5 }}
+                            >
+                              Revert
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+            }
+          </div>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 16, padding: "10px 16px", borderTop: "1px solid var(--border-subtle)", background: "var(--bg-base)", flexShrink: 0 }}>
+              <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={safePage === 0}
+                style={{ ...btn, padding: "5px 18px", opacity: safePage === 0 ? 0.35 : 1, background: "var(--bg-hover)", color: "var(--text-secondary)" }}>‹</button>
+              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{safePage + 1} / {totalPages}</span>
+              <button onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))} disabled={safePage >= totalPages - 1}
+                style={{ ...btn, padding: "5px 18px", opacity: safePage >= totalPages - 1 ? 0.35 : 1, background: "var(--bg-hover)", color: "var(--text-secondary)" }}>›</button>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Toast message */}
+      {msg && (
+        <div style={{ position: "absolute", bottom: 80, left: 16, right: 16, background: msg.ok ? "var(--bg-hover)" : "var(--bg-hover)", border: `1px solid ${msg.ok ? "var(--accent-green)" : "var(--accent-red)"}`, borderRadius: 8, padding: "10px 14px", color: msg.ok ? "var(--accent-green)" : "var(--accent-red)", fontSize: 13 }}
+          onClick={() => setMsg(null)}>
+          {msg.text}
+        </div>
+      )}
+
+      {/* Commit detail bottom sheet */}
+      {detailHash && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 300, display: "flex", alignItems: "flex-end" }}
+          onClick={() => setDetailHash(null)}>
+          <div style={{ width: "100%", background: "var(--bg-surface)", borderRadius: "16px 16px 0 0", padding: "16px 16px 28px", display: "flex", flexDirection: "column", maxHeight: "80vh" }}
+            onClick={(e) => e.stopPropagation()}>
+            {/* drag handle + hash */}
+            <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 12px" }} />
+            <div style={{ fontSize: 13, color: "var(--accent-blue)", fontFamily: "monospace", marginBottom: 8, flexShrink: 0 }}>{detailHash.slice(0, 8)}</div>
+            {/* scrollable body: message + files */}
+            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 0 }}>
+              <pre style={{ fontSize: 12, color: "var(--text-primary)", whiteSpace: "pre-wrap", wordBreak: "break-word", margin: "0 0 12px", fontFamily: "monospace", lineHeight: 1.5 }}>
+                {detailMsg}
+              </pre>
+              {detailFiles.length > 0 && (
+                <div style={{ borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>{detailFiles.length} file{detailFiles.length !== 1 ? "s" : ""} changed</div>
+                  {detailFiles.map((f) => (
+                    <button key={f.path} onClick={() => { setDiffFile(f); }}
+                      style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--bg-base)", border: "1px solid var(--border-subtle)", borderRadius: 6, padding: "8px 10px", marginBottom: 6, cursor: "pointer", textAlign: "left", width: "100%" }}>
+                      <span style={{ fontSize: 11, color: "var(--accent-blue)" }}>±</span>
+                      <span style={{ fontSize: 12, color: "var(--text-primary)", fontFamily: "monospace", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.path}</span>
+                      <span style={{ fontSize: 11, color: "var(--text-faint)" }}>›</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            {/* close always visible at bottom */}
+            <button onClick={() => setDetailHash(null)} style={{ ...btn, background: "var(--bg-hover)", color: "var(--text-secondary)", marginTop: 12, flexShrink: 0 }}>Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* File diff full-screen view */}
+      {diffFile && (
+        <MobileFileDiff file={diffFile} onClose={() => setDiffFile(null)} />
+      )}
+
+      {/* Revert confirmation */}
+      {revertHash && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 300, display: "flex", alignItems: "flex-end" }}>
+          <div style={{ width: "100%", background: "var(--bg-surface)", borderRadius: "16px 16px 0 0", padding: "20px 16px 36px", display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 4px" }} />
+            <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Revert to this commit?</div>
+            <div style={{ fontSize: 13, color: "var(--text-muted)" }}>
+              This will restore all files to <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{revertHash.slice(0, 8)}</span> and create a new commit. The history is preserved.
+            </div>
+            <button onClick={doRevert} disabled={reverting}
+              style={{ ...btn, background: "var(--accent-red)", color: "var(--text-primary)", border: "1px solid var(--accent-red)", opacity: reverting ? 0.6 : 1 }}>
+              {reverting ? "Reverting…" : "Confirm Revert"}
+            </button>
+            <button onClick={() => setRevertHash(null)} style={{ ...btn, background: "var(--bg-hover)", color: "var(--text-secondary)" }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Remote URL editor bottom sheet */}
+      {editingRemote && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 300, display: "flex", alignItems: "flex-end" }}
+          onClick={() => setEditingRemote(false)}>
+          <div style={{ width: "100%", background: "var(--bg-surface)", borderRadius: "16px 16px 0 0", padding: "16px 16px 32px", display: "flex", flexDirection: "column", gap: 10 }}
+            onClick={(e) => e.stopPropagation()}>
+            <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 4px" }} />
+            <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>Git Remote URL</div>
+            <input
+              value={remoteInput}
+              onChange={(e) => setRemoteInput(e.target.value)}
+              placeholder="https://github.com/user/repo.git"
+              style={{ ...inp, fontSize: 13, fontFamily: "monospace" }}
+            />
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await gitSetRemote(sessionId, remoteInput.trim());
+                    setRemote(res.remote);
+                    setMsg({ text: "Remote URL saved", ok: true });
+                    setEditingRemote(false);
+                  } catch (e) { setMsg({ text: String(e), ok: false }); }
+                }}
+                disabled={!remoteInput.trim() || remoteInput.trim() === remote}
+                style={{ ...btn, flex: 1, background: "var(--accent-green)", color: "#fff", opacity: (!remoteInput.trim() || remoteInput.trim() === remote) ? 0.5 : 1 }}
+              >Save</button>
+              <button onClick={() => { setRemoteInput(remote); setEditingRemote(false); }}
+                style={{ ...btn, flex: 1, background: "var(--bg-hover)", color: "var(--text-secondary)" }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* .gitignore editor bottom sheet */}
+      {editingGitignore && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 300, display: "flex", alignItems: "flex-end" }}
+          onClick={() => setEditingGitignore(false)}>
+          <div style={{ width: "100%", background: "var(--bg-surface)", borderRadius: "16px 16px 0 0", padding: "16px 16px 32px", display: "flex", flexDirection: "column", gap: 10, maxHeight: "75vh" }}
+            onClick={(e) => e.stopPropagation()}>
+            <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 4px" }} />
+            <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>.gitignore</div>
+            <textarea
+              value={gitignoreDraft}
+              onChange={(e) => setGitignoreDraft(e.target.value)}
+              style={{ flex: 1, minHeight: 220, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, color: "var(--text-primary)", fontSize: 12, fontFamily: "monospace", padding: "8px 10px", outline: "none", resize: "none" }}
+            />
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={async () => {
+                  try {
+                    await saveGitignore(sessionId, gitignoreDraft);
+                    setGitignore(gitignoreDraft);
+                    setMsg({ text: ".gitignore saved", ok: true });
+                    setEditingGitignore(false);
+                  } catch (e) { setMsg({ text: String(e), ok: false }); }
+                }}
+                disabled={gitignoreDraft === gitignore}
+                style={{ ...btn, flex: 1, background: "var(--accent-green)", color: "#fff", opacity: gitignoreDraft === gitignore ? 0.5 : 1 }}
+              >Save</button>
+              <button onClick={() => { setGitignoreDraft(gitignore); setEditingGitignore(false); }}
+                style={{ ...btn, flex: 1, background: "var(--bg-hover)", color: "var(--text-secondary)" }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Mobile Schedule Panel ─── */
+function MobileSchedulePanel({
+  sessionId, tasks, onTasksChange, onClose,
+}: {
+  sessionId: string;
+  tasks: ScheduledTask[];
+  onTasksChange: (tasks: ScheduledTask[]) => void;
+  onClose: () => void;
+}) {
+  const [prompt, setPrompt] = useState("");
+  const [delayMins, setDelayMins] = useState("5");
+  const [delaySecs, setDelaySecs] = useState("0");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState("");
+
+  const pendingTasks = tasks.filter(t => t.status === "pending");
+
+  const submit = async () => {
+    if (!prompt.trim()) return;
+    const delay = (parseInt(delayMins) || 0) * 60 + (parseInt(delaySecs) || 0);
+    if (delay <= 0) { setErr("Delay must be > 0"); return; }
+    setSubmitting(true); setErr("");
+    try {
+      const t = await createTask(sessionId, prompt.trim(), delay);
+      onTasksChange([...tasks, t]);
+      setPrompt(""); setDelayMins("5"); setDelaySecs("0");
+    } catch (e) { setErr(String(e)); }
+    finally { setSubmitting(false); }
+  };
+
+  const cancel = async (taskId: string) => {
+    try {
+      await cancelTask(sessionId, taskId);
+      onTasksChange(tasks.filter(t => t.id !== taskId));
+    } catch {}
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Scheduled Prompts</span>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px 14px", display: "flex", flexDirection: "column", gap: 16 }}>
+        {/* New task form */}
+        <div style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-secondary)" }}>New Scheduled Prompt</div>
+          <textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Prompt to send…"
+            rows={3}
+            style={{ background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 8, padding: "8px 10px", color: "var(--text-primary)", fontSize: 14, resize: "none", outline: "none", width: "100%", boxSizing: "border-box", fontFamily: "inherit" }}
+          />
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)", flexShrink: 0 }}>Delay:</span>
+            <input type="number" min="0" value={delayMins} onChange={(e) => setDelayMins(e.target.value)}
+              style={{ width: 52, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, padding: "4px 6px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "center" }} />
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>min</span>
+            <input type="number" min="0" max="59" value={delaySecs} onChange={(e) => setDelaySecs(e.target.value)}
+              style={{ width: 52, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, padding: "4px 6px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "center" }} />
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>sec</span>
+          </div>
+          {err && <div style={{ fontSize: 12, color: "var(--accent-red)" }}>{err}</div>}
+          <button
+            onClick={submit}
+            disabled={submitting || !prompt.trim()}
+            style={{ background: submitting || !prompt.trim() ? "var(--bg-hover)" : "var(--accent-green)", color: submitting || !prompt.trim() ? "var(--text-faint)" : "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 14, cursor: submitting || !prompt.trim() ? "default" : "pointer" }}
+          >
+            {submitting ? "Scheduling…" : "Schedule"}
+          </button>
+        </div>
+
+        {/* Pending tasks */}
+        {pendingTasks.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-secondary)" }}>Pending ({pendingTasks.length})</div>
+            {pendingTasks.map((t) => {
+              const runAt = new Date(t.run_at);
+              const secondsLeft = Math.max(0, Math.round((runAt.getTime() - Date.now()) / 1000));
+              const minsLeft = Math.floor(secondsLeft / 60);
+              const secsLeft = secondsLeft % 60;
+              return (
+                <div key={t.id} style={{ background: "var(--bg-surface)", border: "1px solid var(--border-subtle)", borderRadius: 8, padding: "10px 12px", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, color: "var(--text-primary)", marginBottom: 4, wordBreak: "break-word" }}>{t.command}</div>
+                    <div style={{ fontSize: 11, color: "var(--text-faint)" }}>
+                      Runs at {runAt.toLocaleTimeString()} · in {minsLeft > 0 ? `${minsLeft}m ` : ""}{secsLeft}s
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => cancel(t.id)}
+                    style={{ background: "var(--bg-hover)", border: "1px solid #6e3030", color: "var(--accent-red)", fontSize: 11, padding: "4px 8px", borderRadius: 6, flexShrink: 0, cursor: "pointer" }}
+                  >Cancel</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {pendingTasks.length === 0 && (
+          <div style={{ textAlign: "center", padding: 24, color: "var(--text-faint)", fontSize: 13 }}>No pending scheduled prompts</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Mobile Tasks Panel (TodoWrite / TaskCreate snapshots) ─── */
+function MobileTasksPanel({
+  sessionId, onClose,
+}: {
+  sessionId: string;
+  onClose: () => void;
+}) {
+  const [active, setActive] = useState<TodoItem[]>([]);
+  const [history, setHistory] = useState<TodoPlan[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const refresh = useCallback(async () => {
+    try {
+      const data = await listSessionTodos(sessionId);
+      setActive(data.active || []);
+      setHistory(data.history || []);
+    } catch { /* ignore */ }
+    finally { setLoaded(true); }
+  }, [sessionId]);
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 5000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  const total = active.length;
+  const done = active.filter(t => t.status === "completed").length;
+  const inProg = active.filter(t => t.status === "in_progress").length;
+  const pending = total - done - inProg;
+  const statusIcon = (s: TodoItem["status"]) => s === "completed" ? "✓" : s === "in_progress" ? "▶" : "○";
+  const statusColor = (s: TodoItem["status"]) => s === "completed" ? "var(--accent-green)" : s === "in_progress" ? "var(--accent-amber)" : "var(--text-faint)";
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Tasks</span>
+        <button onClick={refresh} title="Refresh" style={{ marginLeft: "auto", background: "transparent", border: "1px solid var(--border)", color: "var(--text-secondary)", cursor: "pointer", fontSize: 12, padding: "2px 8px", borderRadius: 4 }}>⟳</button>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "14px", display: "flex", flexDirection: "column", gap: 14 }}>
+        {!loaded && <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 16 }}>Loading…</div>}
+        {loaded && total === 0 && history.length === 0 && (
+          <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 24, fontSize: 13 }}>No tasks yet.</div>
+        )}
+
+        {total > 0 && (
+          <div style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "var(--accent-blue)", marginBottom: 6 }}>Active</div>
+            <div style={{ height: 6, borderRadius: 3, background: "var(--bg-hover)", overflow: "hidden", position: "relative", marginBottom: 6 }}>
+              {done > 0 && <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${(done / total) * 100}%`, background: "var(--accent-green)" }} />}
+              {inProg > 0 && <div style={{ position: "absolute", left: `${(done / total) * 100}%`, top: 0, height: "100%", width: `${(inProg / total) * 100}%`, background: "#f59e0b88" }} />}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 10 }}>
+              {done} done · {inProg} in progress · {pending} pending
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {active.map((t, i) => (
+                <div key={t.id ?? i} style={{
+                  display: "flex", alignItems: "flex-start", gap: 8,
+                  padding: "6px 8px", borderRadius: 4,
+                  background: t.status === "in_progress" ? "rgba(245,158,11,0.08)" : "transparent",
+                  border: "1px solid " + (t.status === "in_progress" ? "rgba(245,158,11,0.3)" : "transparent"),
+                }}>
+                  <span style={{ fontSize: 12, color: statusColor(t.status), flexShrink: 0, marginTop: 2, fontFamily: "monospace" }}>{statusIcon(t.status)}</span>
+                  <span style={{
+                    fontSize: 13, lineHeight: 1.45, flex: 1,
+                    color: t.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
+                    textDecoration: t.status === "completed" ? "line-through" : "none",
+                    wordBreak: "break-word",
+                  }}>{t.content}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {history.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-faint)" }}>History ({history.length})</div>
+            {history.map((plan, i) => (
+              <MobileTodoHistoryRow key={`${plan.completed_ts}-${i}`} plan={plan} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MobileTodoHistoryRow({ plan }: { plan: TodoPlan }) {
+  const [expanded, setExpanded] = useState(false);
+  const total = plan.todos.length;
+  const fmt = (ts: number) => {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+  return (
+    <div style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 10px", opacity: 0.85 }}>
+      <div onClick={() => setExpanded(v => !v)} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none" }}>
+        <span style={{ color: "var(--text-faint)", fontSize: 11, width: 10 }}>{expanded ? "▼" : "▶"}</span>
+        <span style={{ color: "var(--accent-green)", fontSize: 12, flexShrink: 0, fontFamily: "monospace" }}>✓</span>
+        <span style={{ flex: 1, fontSize: 12, color: "var(--text-secondary)" }}>{total} task{total === 1 ? "" : "s"} done</span>
+        <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)" }}>{fmt(plan.created_ts)} → {fmt(plan.completed_ts)}</span>
+      </div>
+      {expanded && (
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: 4 }}>
+          {plan.todos.map((t, i) => (
+            <div key={t.id ?? i} style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
+              <span style={{ color: "var(--accent-green)", fontSize: 11, flexShrink: 0, marginTop: 2, fontFamily: "monospace" }}>✓</span>
+              <span style={{ fontSize: 12, lineHeight: 1.4, flex: 1, color: "var(--text-faint)", textDecoration: "line-through", wordBreak: "break-word" }}>{t.content}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Mobile Goals Panel (/goal history) ─── */
+function MobileGoalsPanel({
+  sessionId, onClose,
+}: {
+  sessionId: string;
+  onClose: () => void;
+}) {
+  const [active, setActive] = useState<Goal | null>(null);
+  const [history, setHistory] = useState<Goal[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const refresh = useCallback(async () => {
+    try {
+      const data = await listGoals(sessionId);
+      setActive(data.active);
+      setHistory(data.history || []);
+    } catch { /* ignore */ }
+    finally { setLoaded(true); }
+  }, [sessionId]);
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 5000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  const fmt = (ts: number) => {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  };
+  const historyDesc = [...history].sort((a, b) => b.set_at - a.set_at);
+
+  const renderRow = (g: Goal, status: "active" | "met" | "replaced" | "closed") => {
+    const struck = status === "met";
+    const badge =
+      status === "active" ? { text: `${g.checks} check${g.checks === 1 ? "" : "s"}`, color: "var(--accent-blue)" } :
+      status === "met" ? { text: `met @ ${fmt(g.met_at || 0)}`, color: "#5cb85c" } :
+      status === "replaced" ? { text: "replaced", color: "var(--text-faint)" } :
+      { text: "closed", color: "var(--text-faint)" };
+    return (
+      <div key={`${g.set_at}-${g.condition}`} style={{
+        background: "var(--bg-surface)",
+        border: "1px solid " + (status === "active" ? "rgba(88,166,255,0.4)" : "var(--border)"),
+        borderRadius: 8, padding: "10px 12px", opacity: status === "active" ? 1 : 0.78,
+      }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+          <span style={{
+            flex: 1, minWidth: 0, color: "var(--text-body)", fontSize: 13,
+            textDecoration: struck ? "line-through" : "none", wordBreak: "break-word", lineHeight: 1.45,
+          }}>{g.condition}</span>
+          <span style={{ flexShrink: 0, color: badge.color, fontSize: 11, marginTop: 2, whiteSpace: "nowrap" }}>{badge.text}</span>
+        </div>
+        {g.last_reason && (
+          <div style={{ marginTop: 4, color: "var(--text-faint)", fontSize: 12, lineHeight: 1.4, fontStyle: "italic" }}>{g.last_reason}</div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Goals</span>
+        <button onClick={refresh} title="Refresh" style={{ marginLeft: "auto", background: "transparent", border: "1px solid var(--border)", color: "var(--text-secondary)", cursor: "pointer", fontSize: 12, padding: "2px 8px", borderRadius: 4 }}>⟳</button>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "14px", display: "flex", flexDirection: "column", gap: 14 }}>
+        {!loaded && <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 16 }}>Loading…</div>}
+        {loaded && !active && historyDesc.length === 0 && (
+          <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 24, fontSize: 13, lineHeight: 1.5 }}>
+            No goals set yet.<br />
+            <span style={{ fontSize: 12 }}>
+              Use <code style={{ background: "var(--bg-surface)", padding: "1px 4px", borderRadius: 3 }}>/goal &lt;condition&gt;</code> in chat to set one.
+            </span>
+          </div>
+        )}
+        {active && (
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "var(--accent-blue)", marginBottom: 6 }}>Active</div>
+            {renderRow(active, "active")}
+          </div>
+        )}
+        {historyDesc.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-faint)" }}>History ({historyDesc.length})</div>
+            {historyDesc.map(g => renderRow(g, g.met ? "met" : g.replaced ? "replaced" : "closed"))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Mobile AUQs Panel (AskUserQuestion history) ─── */
+function MobileAuqsPanel({
+  sessionId, onClose,
+}: {
+  sessionId: string;
+  onClose: () => void;
+}) {
+  const [auqs, setAuqs] = useState<AuqEntry[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [sort, setSort] = useState<"asc" | "desc">(() => (localStorage.getItem("auqsPanelSort") === "desc" ? "desc" : "asc"));
+  const [showOptions, setShowOptions] = useState<boolean>(() => localStorage.getItem("auqsPanelShowOptions") === "1");
+  const refresh = useCallback(async () => {
+    try { setAuqs(await listSessionAuqs(sessionId)); } catch { /* ignore */ }
+    finally { setLoaded(true); }
+  }, [sessionId]);
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 5000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  const fmt = (ts: number) => {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  };
+  const toggleSort = () => {
+    const next = sort === "asc" ? "desc" : "asc";
+    setSort(next);
+    try { localStorage.setItem("auqsPanelSort", next); } catch {}
+  };
+  const toggleShowOptions = () => {
+    const next = !showOptions;
+    setShowOptions(next);
+    try { localStorage.setItem("auqsPanelShowOptions", next ? "1" : "0"); } catch {}
+  };
+  const sorted = [...auqs].sort((a, b) => sort === "asc" ? a.ts - b.ts : b.ts - a.ts);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>AUQs {loaded ? `(${auqs.length})` : ""}</span>
+        <button
+          onClick={toggleShowOptions}
+          title={showOptions ? "Show only Q + answer" : "Show all options"}
+          style={{
+            marginLeft: "auto",
+            background: showOptions ? "color-mix(in srgb, var(--accent-blue) 18%, var(--bg-base))" : "transparent",
+            border: "1px solid var(--border)",
+            color: showOptions ? "var(--accent-blue)" : "var(--text-secondary)",
+            cursor: "pointer", fontSize: 11, padding: "2px 8px", borderRadius: 4,
+          }}
+        >
+          {showOptions ? "⊟ Options" : "⊞ Options"}
+        </button>
+        <button onClick={toggleSort} style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-secondary)", cursor: "pointer", fontSize: 11, padding: "2px 8px", borderRadius: 4 }}>
+          {sort === "asc" ? "↑ Old→New" : "↓ New→Old"}
+        </button>
+        <button onClick={refresh} title="Refresh" style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-secondary)", cursor: "pointer", fontSize: 12, padding: "2px 8px", borderRadius: 4 }}>⟳</button>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "14px", display: "flex", flexDirection: "column", gap: 10 }}>
+        {!loaded && <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 16 }}>Loading…</div>}
+        {loaded && auqs.length === 0 && (
+          <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 24, fontSize: 13 }}>No AskUserQuestion rounds in this session yet.</div>
+        )}
+        {sorted.map((a, idx) => {
+          const pending = !a.answers;
+          const indexLabel = sort === "asc" ? idx + 1 : auqs.length - idx;
+          return (
+            <div key={a.tool_use_id} style={{
+              background: "var(--bg-surface)",
+              border: "1px solid " + (pending ? "rgba(245,158,11,0.4)" : "var(--border)"),
+              borderRadius: 8, padding: "10px 12px",
+            }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ fontSize: 11, color: "var(--text-faint)" }}>#{indexLabel} · {fmt(a.ts)}</span>
+                <span style={{ fontSize: 11, color: pending ? "#f59e0b" : "#5cb85c" }}>
+                  {pending ? "pending" : `answered @ ${fmt(a.answered_ts || 0)}`}
+                </span>
+              </div>
+              {a.questions.map((q, qi) => {
+                const answer = a.answers?.[q.question];
+                const optionLabels = new Set((q.options ?? []).map((o) => o.label));
+                const answerParts = (answer ?? "")
+                  .split(",")
+                  .map((s) => s.trim())
+                  .filter(Boolean);
+                const isCustom =
+                  !!answer && optionLabels.size > 0 &&
+                  answerParts.some((p) => !optionLabels.has(p));
+                return (
+                  <div key={qi} style={{ marginTop: qi > 0 ? 8 : 0 }}>
+                    <div style={{ color: "var(--text-body)", fontSize: 13, lineHeight: 1.4, wordBreak: "break-word" }}>
+                      <span style={{ color: "var(--text-faint)", marginRight: 4 }}>Q:</span>{q.question}
+                    </div>
+                    {answer ? (
+                      <div style={{ marginTop: 3, color: "var(--accent-blue)", fontSize: 13, lineHeight: 1.4, paddingLeft: 18, wordBreak: "break-word" }}>
+                        <span style={{ color: "var(--text-faint)", marginLeft: -18, marginRight: 4 }}>A:</span>{answer}
+                        {isCustom && (
+                          <span
+                            title="Free-form answer typed by user, not one of the provided options"
+                            style={{
+                              marginLeft: 6, fontSize: 10, padding: "1px 5px",
+                              borderRadius: 3, background: "rgba(245,158,11,0.15)",
+                              color: "#f59e0b", whiteSpace: "nowrap",
+                              verticalAlign: 1,
+                            }}
+                          >✎ custom</span>
+                        )}
+                      </div>
+                    ) : (
+                      <div style={{ marginTop: 3, color: "var(--text-faint)", fontSize: 12, paddingLeft: 18, fontStyle: "italic" }}>waiting for answer…</div>
+                    )}
+                    {showOptions && q.options && q.options.length > 0 && (() => {
+                      const picked = new Set(answerParts);
+                      return (
+                        <div style={{ marginTop: 6, paddingLeft: 18, display: "flex", flexDirection: "column", gap: 3 }}>
+                          {q.options!.map((opt, oi) => {
+                            const isPicked = picked.has(opt.label);
+                            return (
+                              <div key={oi} style={{
+                                fontSize: 12, lineHeight: 1.35,
+                                color: isPicked ? "var(--accent-blue)" : "var(--text-faint)",
+                                wordBreak: "break-word",
+                              }}>
+                                <span style={{ marginRight: 4 }}>{isPicked ? "●" : "○"}</span>
+                                <span style={{ fontWeight: isPicked ? 600 : 400 }}>{opt.label}</span>
+                                {opt.description && (
+                                  <span style={{ color: "var(--text-faintest)", marginLeft: 6 }}>— {opt.description}</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Mobile Shell Panel ─── */
+function MobileResumeSelectPanel({
+  sessionId,
+  onClose,
+  onDone,
+}: {
+  sessionId: string;
+  onClose: () => void;
+  onDone: (newSession: SessionMeta) => void;
+}) {
+  const [items, setItems] = useState<AvailableClaudeSession[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    listAvailableClaudeSessions(sessionId)
+      .then(setItems)
+      .catch((e) => setErr(String(e)))
+      .finally(() => setLoading(false));
+  }, [sessionId]);
+
+  const handleSelect = async (item: AvailableClaudeSession) => {
+    setBusy(true);
+    setErr("");
+    try {
+      await setClaudeSessionId(sessionId, item.claude_session_id);
+      await terminateSession(sessionId);
+      const resumed = await resumeSession(sessionId);
+      onDone(resumed);
+    } catch (e) {
+      setErr(String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 14, color: "var(--text-primary)", fontWeight: 600 }}>Select Claude Session</span>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px" }}>
+        {loading && <div style={{ color: "var(--text-secondary)", fontSize: 14 }}>Loading…</div>}
+        {!loading && items.length === 0 && !err && (
+          <div style={{ color: "var(--text-secondary)", fontSize: 14 }}>No other sessions found in this project</div>
+        )}
+        {err && <div style={{ color: "var(--accent-red)", fontSize: 13, marginBottom: 8 }}>{err}</div>}
+        {items.map((item) => (
+          <button
+            key={item.claude_session_id}
+            disabled={busy}
+            onClick={() => handleSelect(item)}
+            style={{
+              display: "block", width: "100%", textAlign: "left",
+              background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 8,
+              padding: "10px 14px", marginBottom: 8, cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.6 : 1,
+            }}
+          >
+            <div style={{ fontSize: 13, color: "var(--text-primary)", marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {item.title || item.claude_session_id}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {item.claude_session_id}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
+              {new Date(item.mtime * 1000).toLocaleString()}
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const CTRL_COMMON = [
+  { letter: "C", desc: "int",  title: "Ctrl+C — Interrupt" },
+  { letter: "D", desc: "eof",  title: "Ctrl+D — EOF / logout" },
+  { letter: "Z", desc: "sus",  title: "Ctrl+Z — Suspend" },
+  { letter: "L", desc: "clr",  title: "Ctrl+L — Clear screen" },
+  { letter: "A", desc: "home", title: "Ctrl+A — Beginning of line" },
+  { letter: "E", desc: "end",  title: "Ctrl+E — End of line" },
+  { letter: "U", desc: "kill", title: "Ctrl+U — Kill line" },
+  { letter: "W", desc: "back", title: "Ctrl+W — Delete word back" },
+  { letter: "R", desc: "hist", title: "Ctrl+R — History search" },
+];
+
+const ROW1_NAV = [
+  { label: "ESC", seq: "\x1b",   title: "Escape" },
+  { label: "TAB", seq: "\t",     title: "Tab" },
+  { label: "←",   seq: "\x1b[D", title: "Arrow Left" },
+  { label: "↑",   seq: "\x1b[A", title: "Arrow Up" },
+  { label: "↓",   seq: "\x1b[B", title: "Arrow Down" },
+  { label: "→",   seq: "\x1b[C", title: "Arrow Right" },
+];
+
+function MobileShellPanel({ cwd, res, onClose }: { cwd: string; res: AttachResponse; onClose: () => void }) {
+  const sendRawRef = useRef<((data: string) => void) | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [ctrlActive, setCtrlActive] = useState(false);
+
+  // Track visual viewport so the panel stays above the soft keyboard
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      const el = containerRef.current;
+      if (!el) return;
+      el.style.top = `${vv.offsetTop}px`;
+      el.style.height = `${vv.height}px`;
+    };
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    update();
+    return () => { vv.removeEventListener("resize", update); vv.removeEventListener("scroll", update); };
+  }, []);
+
+  const sendKey = (seq: string) => sendRawRef.current?.(seq);
+  const sendCtrlLetter = (letter: string) => {
+    sendKey(String.fromCharCode(letter.charCodeAt(0) - 64));
+    setCtrlActive(false);
+  };
+
+  const toolbarBtnBase: React.CSSProperties = {
+    flex: 1, height: 44, background: "transparent", border: "none",
+    borderRight: "1px solid var(--border-subtle)", color: "var(--text-primary)",
+    fontSize: 13, fontFamily: "monospace", fontWeight: 600,
+    cursor: "pointer", padding: 0, userSelect: "none",
+  };
+
+  return (
+    <div ref={containerRef} style={{ position: "fixed", left: 0, right: 0, top: 0, height: "100%", background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      {/* Header */}
+      <div style={{ padding: "10px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 13, color: "var(--text-secondary)", fontFamily: "monospace", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          &gt;_ {cwd}
+        </span>
+      </div>
+      {/* Terminal */}
+      <div style={{ flex: 1, overflow: "hidden", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
+        <TerminalPane
+          key={res.session_id + res.ws_token}
+          sessionId={res.session_id}
+          wsUrl={res.ws_url}
+          onDisconnect={onClose}
+          defaultFit
+          showWideToggle
+          sendRawRef={sendRawRef}
+        />
+      </div>
+      {/* Toolbar — two rows, always above keyboard */}
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderTop: "1px solid var(--border)" }}>
+        {/* Row 1: CTRL toggle + navigation */}
+        <div style={{ display: "flex", borderBottom: "1px solid var(--border-subtle)" }}>
+          <button
+            title="Ctrl modifier — tap to activate, then tap a letter"
+            onPointerDown={(e) => { e.preventDefault(); setCtrlActive(v => !v); }}
+            style={{
+              ...toolbarBtnBase,
+              background: ctrlActive ? "color-mix(in srgb, var(--accent-blue) 20%, var(--bg-base))" : "transparent",
+              color: ctrlActive ? "var(--accent-blue)" : "var(--text-secondary)",
+              borderRadius: 0,
+              letterSpacing: 0.5,
+            }}
+          >
+            CTRL
+          </button>
+          {ROW1_NAV.map((k) => (
+            <button
+              key={k.label}
+              title={k.title}
+              onPointerDown={(e) => { e.preventDefault(); sendKey(k.seq); }}
+              style={{
+                ...toolbarBtnBase,
+                color: k.label.length === 1 && "←↑↓→".includes(k.label) ? "var(--text-primary)" : "var(--text-primary)",
+                fontSize: k.label.length === 1 && "←↑↓→".includes(k.label) ? 18 : 13,
+              }}
+            >
+              {k.label}
+            </button>
+          ))}
+        </div>
+        {/* Row 2: only shown when CTRL is active */}
+        {ctrlActive && <div style={{ display: "flex", overflowX: "auto", scrollbarWidth: "none", borderTop: "1px solid var(--border-subtle)" }}>
+          {CTRL_COMMON.map(({ letter, desc, title }) => (
+            <button
+              key={letter}
+              title={title}
+              onPointerDown={(e) => { e.preventDefault(); sendCtrlLetter(letter); }}
+              style={{
+                flexShrink: 0, minWidth: 52, height: 44,
+                background: "transparent", border: "none",
+                borderRight: "1px solid var(--border-subtle)",
+                cursor: "pointer", userSelect: "none",
+                display: "flex", flexDirection: "column",
+                alignItems: "center", justifyContent: "center", gap: 1,
+                padding: 0,
+              }}
+            >
+              <span style={{ fontSize: 13, fontFamily: "monospace", fontWeight: 700, color: "var(--accent-blue)", lineHeight: 1 }}>^{letter}</span>
+              <span style={{ fontSize: 9, color: "var(--text-muted)", lineHeight: 1, letterSpacing: 0.3 }}>{desc}</span>
+            </button>
+          ))}
+        </div>}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Mobile File Browser ─── */
+const FILE_CODE_EXTS = new Set([
+  "py","pyx","pyi","js","jsx","ts","tsx","mjs","cjs","css","scss","sass","less",
+  "html","htm","xml","svg","sh","bash","zsh","fish","go","rs","java","kt","scala",
+  "c","h","cpp","cc","cxx","hpp","rb","php","swift","cs","sql","graphql","proto",
+  "tf","hcl","yaml","yml","toml","json","r","lua",
+]);
+const FILE_EXT_ICONS: Record<string,string> = {
+  py:"🐍",js:"📜",ts:"📘",tsx:"⚛️",jsx:"⚛️",json:"{}",yaml:"📋",yml:"📋",
+  toml:"📋",md:"📝",txt:"📄",csv:"📊",sql:"🗄️",css:"🎨",scss:"🎨",
+  html:"🌐",htm:"🌐",sh:"⚙️",bash:"⚙️",go:"🔵",rs:"🦀",java:"☕",
+  c:"🔷",cpp:"🔷",h:"🔷",rb:"💎",swift:"🍎",db:"🗄️",sqlite:"🗄️",sqlite3:"🗄️",pdf:"📕",
+};
+const FILE_SPECIAL_ICONS: Record<string,string> = {
+  Makefile:"⚙️",Dockerfile:"🐳",".gitignore":"🔍",".env":"🔑","package.json":"📦",
+};
+function mobileFileIcon(name: string): string {
+  if (FILE_SPECIAL_ICONS[name]) return FILE_SPECIAL_ICONS[name];
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+  return FILE_EXT_ICONS[ext] || "📄";
+}
+function mobileFormatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1048576) return `${(bytes/1024).toFixed(1)}K`;
+  return `${(bytes/1048576).toFixed(1)}M`;
+}
+
+type MobileFileKind = "code" | "markdown" | "csv" | "sqlite" | "pdf" | "image" | "text";
+function getMobileFileKind(entry: FileEntry): MobileFileKind {
+  if (entry.is_sqlite) return "sqlite";
+  const ext = entry.name.split(".").pop()?.toLowerCase() || "";
+  if (ext === "pdf") return "pdf";
+  if (ext === "csv" || ext === "tsv") return "csv";
+  if (ext === "md" || ext === "markdown") return "markdown";
+  if (["png","jpg","jpeg","gif","webp","bmp","ico","svg","avif","tiff","tif","heic","heif"].includes(ext)) return "image";
+  if (FILE_CODE_EXTS.has(ext)) return "code";
+  return "text";
+}
+
+function MobileCodeViewer({ content, ext }: { content: string; ext: string }) {
+  const html = useMemo(() => {
+    try {
+      const lang = hljs.getLanguage(ext) ? ext : undefined;
+      const h = lang ? hljs.highlight(content, { language: lang }).value : hljs.highlightAuto(content).value;
+      return h;
+    } catch {
+      return content.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    }
+  }, [content, ext]);
+  const lines = content.split("\n").length;
+  return (
+    <div style={{ display: "flex", flex: 1, overflow: "auto", background: "var(--bg-base)" }}>
+      <div style={{ padding: "12px 6px 12px 12px", textAlign: "right", color: "var(--text-faint)", fontSize: 12, lineHeight: 1.6, fontFamily: "monospace", userSelect: "none", flexShrink: 0, borderRight: "1px solid var(--border-subtle)", minWidth: 36 }}>
+        {Array.from({ length: lines }, (_, i) => <div key={i}>{i+1}</div>)}
+      </div>
+      <pre style={{ flex: 1, margin: 0, padding: "12px", fontSize: 12, lineHeight: 1.6, fontFamily: "monospace", overflow: "visible" }}>
+        <code dangerouslySetInnerHTML={{ __html: html }} />
+      </pre>
+    </div>
+  );
+}
+
+function MobileCsvViewer({ content }: { content: string }) {
+  const rows = useMemo(() => content.trim().split("\n").map(line => {
+    const cells: string[] = []; let cur = "", inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQ) { if (ch==='"' && line[i+1]==='"') { cur+='"'; i++; } else if (ch==='"') inQ=false; else cur+=ch; }
+      else { if (ch==='"') inQ=true; else if (ch===',') { cells.push(cur); cur=""; } else cur+=ch; }
+    }
+    cells.push(cur); return cells;
+  }), [content]);
+  if (!rows.length) return <div style={{ padding: 16, color: "var(--text-muted)" }}>Empty</div>;
+  const hdrs = rows[0];
+  return (
+    <div style={{ overflow: "auto", flex: 1 }}>
+      <table style={{ borderCollapse: "collapse", fontSize: 12, minWidth: "100%", whiteSpace: "nowrap" }}>
+        <thead>
+          <tr style={{ background: "var(--bg-surface)", position: "sticky", top: 0 }}>
+            {hdrs.map((h, i) => <th key={i} style={{ padding: "6px 10px", borderBottom: "1px solid var(--border)", color: "var(--text-secondary)", textAlign: "left" }}>{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.slice(1).map((row, ri) => (
+            <tr key={ri} style={{ background: ri%2===0?"transparent":"rgba(255,255,255,0.02)" }}>
+              {hdrs.map((_,ci) => <td key={ci} style={{ padding: "4px 10px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-primary)", fontFamily: "monospace", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>{row[ci]??""}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── SQL helpers for cell editing ─────────────────────────────────────────────
+function copyText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).catch(() => _execCopy(text));
+  } else {
+    _execCopy(text);
+  }
+}
+function _execCopy(text: string) {
+  const el = document.createElement("textarea");
+  el.value = text;
+  el.style.position = "fixed"; el.style.opacity = "0";
+  document.body.appendChild(el);
+  el.focus(); el.select();
+  try { document.execCommand("copy"); } catch {}
+  document.body.removeChild(el);
+}
+
+function _sqlLiteral(val: unknown): string {
+  if (val === null || val === undefined) return "NULL";
+  if (typeof val === "number") return String(val);
+  return "'" + String(val).replace(/'/g, "''") + "'";
+}
+function _sqlWhere(columns: string[], rawValues: unknown[]): string {
+  return columns.map((c, i) => {
+    const v = rawValues[i];
+    if (v === null || v === undefined) return `"${c}" IS NULL`;
+    return `"${c}" = ${_sqlLiteral(v)}`;
+  }).join(" AND ");
+}
+/** Convert user-typed text to a SQL literal, preserving original type affinity. */
+function _sqlSetValue(newText: string, rawOriginal: unknown): string {
+  if (newText === "" && (rawOriginal === null || rawOriginal === undefined)) return "NULL";
+  if (typeof rawOriginal === "number") {
+    const n = Number(newText);
+    if (newText.trim() !== "" && !isNaN(n)) return String(n);
+  }
+  return "'" + newText.replace(/'/g, "''") + "'";
+}
+
+interface CellCtx {
+  displayValue: string;
+  rawValue: unknown;
+  columnName: string;
+  allColumns: string[];
+  allRawValues: unknown[];
+}
+
+function MobileCellPopup({ ctx, tableName, onSave, onClose }: {
+  ctx: CellCtx; tableName: string;
+  onSave: (sql: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const { displayValue, rawValue, columnName, allColumns, allRawValues } = ctx;
+  const [formatted, setFormatted] = useState<string | null>(null);
+  const [fmtErr, setFmtErr] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState(displayValue);
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState("");
+
+  const tryFormat = () => {
+    if (formatted !== null) { setFormatted(null); setFmtErr(""); return; }
+    try {
+      let parsed: unknown;
+      try { parsed = JSON.parse(displayValue.trim()); } catch {
+        parsed = JSON.parse(displayValue.trim().replace(/,(\s*[}\]])/g, "$1"));
+      }
+      setFormatted(JSON.stringify(parsed, null, 2));
+      setFmtErr("");
+    } catch { setFmtErr("Invalid JSON"); }
+  };
+
+  const startEdit = () => {
+    setEditText(displayValue);
+    setSaveErr("");
+    setEditing(true);
+  };
+
+  const handleSave = async () => {
+    setSaving(true); setSaveErr("");
+    try {
+      const setVal = _sqlSetValue(editText, rawValue);
+      const where = _sqlWhere(allColumns, allRawValues);
+      const sql = `UPDATE "${tableName}" SET "${columnName}" = ${setVal} WHERE ${where}`;
+      await onSave(sql);
+      onClose();
+    } catch (e) { setSaveErr(String(e)); } finally { setSaving(false); }
+  };
+
+  const displayText = formatted ?? displayValue;
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 9000, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxHeight: "75vh", background: "var(--bg-surface)", borderRadius: "16px 16px 0 0", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "10px auto 0" }} />
+        {/* Toolbar */}
+        <div style={{ padding: "10px 16px 8px", display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", flexShrink: 0, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{columnName}</span>
+          {!editing && (
+            <>
+              <button onClick={tryFormat}
+                style={{ fontSize: 11, padding: "3px 10px", borderRadius: 4, background: formatted !== null ? "color-mix(in srgb, var(--accent-blue) 20%, var(--bg-base))" : "var(--border)", color: formatted !== null ? "var(--accent-blue)" : "var(--text-secondary)", border: "none" }}>
+                {formatted !== null ? "Raw" : "Format JSON"}
+              </button>
+              {fmtErr && <span style={{ fontSize: 11, color: "var(--accent-red)" }}>Parse failed</span>}
+              <button onClick={() => copyText(displayText)}
+                style={{ fontSize: 11, padding: "3px 10px", borderRadius: 4, background: "var(--bg-hover)", color: "var(--accent-blue)", border: "1px solid var(--border)" }}>
+                Copy
+              </button>
+              <button onClick={startEdit}
+                style={{ fontSize: 11, padding: "3px 10px", borderRadius: 4, background: "var(--bg-hover)", color: "var(--accent-green)", border: "1px solid #2d5a2d" }}>
+                Edit
+              </button>
+            </>
+          )}
+          {editing && (
+            <>
+              <button onClick={handleSave} disabled={saving}
+                style={{ fontSize: 11, padding: "3px 12px", borderRadius: 4, background: saving ? "var(--bg-hover)" : "var(--accent-green)", color: saving ? "var(--text-muted)" : "#fff", border: "none" }}>
+                {saving ? "Saving…" : "Save"}
+              </button>
+              <button onClick={() => setEditing(false)}
+                style={{ fontSize: 11, padding: "3px 10px", borderRadius: 4, background: "var(--border)", color: "var(--text-secondary)", border: "none" }}>
+                Cancel
+              </button>
+              {saveErr && <span style={{ fontSize: 11, color: "var(--accent-red)", width: "100%" }}>{saveErr}</span>}
+            </>
+          )}
+          <div style={{ marginLeft: "auto" }}>
+            <button onClick={onClose} style={{ fontSize: 16, background: "transparent", border: "none", color: "var(--text-muted)", padding: "0 4px", cursor: "pointer" }}>✕</button>
+          </div>
+        </div>
+        {/* Content / Editor */}
+        {editing ? (
+          <textarea
+            autoFocus
+            value={editText}
+            onChange={e => setEditText(e.target.value)}
+            style={{ flex: 1, margin: "12px 16px 24px", padding: "10px 12px", fontSize: 13, color: "var(--text-primary)", background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 8, fontFamily: "monospace", lineHeight: 1.6, resize: "none", outline: "none" }}
+          />
+        ) : (
+          <pre style={{ flex: 1, overflow: "auto", margin: 0, padding: "12px 16px 24px", fontSize: 13, color: formatted !== null ? "var(--accent-blue)" : "var(--text-primary)", fontFamily: "monospace", lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+            {displayText}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MobileSqliteViewer({ sessionId, path }: { sessionId: string; path: string }) {
+  const [info, setInfo] = useState<SqliteInfo | null>(null);
+  const [table, setTable] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+  const [cellCtx, setCellCtx] = useState<CellCtx | null>(null);
+
+  const loadTable = useCallback(async (tbl: string, p: string, sid: string) => {
+    const r = await sqliteQuery(sid, p, tbl, 200, 0);
+    setInfo(r); setTable(tbl);
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await sqliteQuery(sessionId, path);
+        if (res.tables.length > 0) {
+          await loadTable(res.tables[0], path, sessionId);
+        } else { setInfo(res); }
+      } catch (e) { setErr(String(e)); } finally { setLoading(false); }
+    })();
+  }, [sessionId, path, loadTable]);
+
+  const handleSave = useCallback(async (sql: string) => {
+    await sqliteExec(sessionId, path, sql);
+    if (table) await loadTable(table, path, sessionId);
+  }, [sessionId, path, table, loadTable]);
+
+  if (loading) return <div style={{ padding: 24, color: "var(--text-muted)", textAlign: "center" }}>Loading…</div>;
+  if (err) return <div style={{ padding: 16, color: "var(--accent-red)", fontSize: 13 }}>{err}</div>;
+  if (!info) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, overflow: "hidden" }}>
+      {cellCtx && table && (
+        <MobileCellPopup ctx={cellCtx} tableName={table} onSave={handleSave} onClose={() => setCellCtx(null)} />
+      )}
+      {info.tables.length > 1 && (
+        <div style={{ padding: "6px 12px", borderBottom: "1px solid var(--border-subtle)", display: "flex", gap: 6, overflowX: "auto", flexShrink: 0 }}>
+          {info.tables.map(t => (
+            <button key={t} onClick={() => loadTable(t, path, sessionId)}
+              style={{ fontSize: 11, padding: "3px 10px", borderRadius: 4, background: t===table?"color-mix(in srgb, var(--accent-blue) 20%, var(--bg-base))":"var(--bg-hover)", color: t===table?"var(--accent-blue)":"var(--text-secondary)", border: "1px solid "+(t===table?"var(--accent-blue)":"var(--border)"), whiteSpace: "nowrap" }}>
+              {t}
+            </button>
+          ))}
+        </div>
+      )}
+      <div style={{ overflow: "auto", flex: 1 }}>
+        <table style={{ borderCollapse: "collapse", fontSize: 12, minWidth: "100%", whiteSpace: "nowrap" }}>
+          <thead>
+            <tr style={{ background: "var(--bg-surface)", position: "sticky", top: 0 }}>
+              {info.columns.map((c, i) => <th key={i} style={{ padding: "6px 10px", borderBottom: "1px solid var(--border)", color: "var(--text-secondary)", textAlign: "left" }}>{c}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {info.rows.map((row, ri) => (
+              <tr key={ri} style={{ background: ri%2===0?"transparent":"rgba(255,255,255,0.02)" }}>
+                {(row as unknown[]).map((cell, ci) => {
+                  const s = cell == null ? "" : String(cell);
+                  const long = s.length > 40;
+                  return (
+                    <td key={ci}
+                      onClick={() => setCellCtx({
+                        displayValue: s, rawValue: cell,
+                        columnName: info.columns[ci],
+                        allColumns: info.columns,
+                        allRawValues: row as unknown[],
+                      })}
+                      style={{ padding: "4px 10px", borderBottom: "1px solid var(--border-subtle)", color: cell==null?"var(--text-faint)": long?"var(--accent-blue)":"var(--text-primary)", fontFamily: "monospace", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", cursor: "pointer" }}>
+                      {s}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {info.total > 200 && <div style={{ padding: "8px 12px", color: "var(--text-muted)", fontSize: 11 }}>Showing 200 of {info.total} rows</div>}
+      </div>
+    </div>
+  );
+}
+
+interface DirNodeState { entries: FileEntry[]; loaded: boolean; expanded: boolean; loading: boolean; }
+
+function MobileFileBrowserPanel({
+  sessionId, sessionCwd, onClose, onSetBackHandler,
+}: {
+  sessionId: string; sessionCwd: string;
+  onClose: () => void;
+  onSetBackHandler: (fn: (() => void) | null) => void;
+}) {
+  const [tree, setTree] = useState<Record<string, DirNodeState>>({});
+  const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
+  const [rootLoading, setRootLoading] = useState(true);
+  const [showHidden, setShowHidden] = useState(false);
+  const [previewEntry, setPreviewEntry] = useState<FileEntry | null>(null);
+  const [fileContent, setFileContent] = useState("");
+  const [fileLoading, setFileLoading] = useState(false);
+  const [fileError, setFileError] = useState("");
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+
+  const loadDir = useCallback(async (path: string, hidden = false) => {
+    setTree(t => ({ ...t, [path]: { ...t[path], loading: true } }));
+    try {
+      const res = await listFiles(sessionId, path, hidden);
+      setTree(t => ({ ...t, [path]: { entries: res.entries, loaded: true, expanded: true, loading: false } }));
+    } catch {
+      setTree(t => ({ ...t, [path]: { ...t[path], loading: false } }));
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    (async () => {
+      setRootLoading(true);
+      try {
+        // Pass undefined (no path) → backend uses session.cwd as root
+        const res = await listFiles(sessionId, undefined, showHidden);
+        setRootEntries(res.entries);
+      } catch { setRootEntries([]); } finally { setRootLoading(false); }
+    })();
+  }, [sessionId, sessionCwd, showHidden]);
+
+  const openFile = useCallback(async (entry: FileEntry) => {
+    setPreviewEntry(entry);
+    setBlobUrl(null);
+    if (entry.is_sqlite) return;
+    const kind = getMobileFileKind(entry);
+    if (kind === "pdf" || kind === "image") {
+      try {
+        const url = await fetchRawFileBlob(sessionId, entry.path);
+        setBlobUrl(url);
+      } catch (e) { setFileError(String(e)); }
+      return;
+    }
+    if (!entry.is_text) { setFileContent(""); setFileError("Binary file — cannot preview"); return; }
+    setFileLoading(true); setFileError(""); setFileContent("");
+    try {
+      const res = await readFile(sessionId, entry.path);
+      setFileContent(res.content);
+    } catch (e) { setFileError(String(e)); } finally { setFileLoading(false); }
+  }, [sessionId]);
+
+  // Revoke blob URL when leaving a pdf/image preview
+  useEffect(() => {
+    if (!previewEntry && blobUrl) {
+      URL.revokeObjectURL(blobUrl);
+      setBlobUrl(null);
+    }
+  }, [previewEntry, blobUrl]);
+
+  // Back handler: when preview is open, back closes it; otherwise parent handles
+  useEffect(() => {
+    if (previewEntry) {
+      history.pushState({ mobileFilesPreview: true }, "");
+      onSetBackHandler(() => setPreviewEntry(null));
+    } else {
+      onSetBackHandler(null);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewEntry]);
+
+  const toggleDir = useCallback((path: string) => {
+    const node = tree[path];
+    if (!node?.loaded) { loadDir(path, showHidden); return; }
+    setTree(t => ({ ...t, [path]: { ...t[path], expanded: !t[path].expanded } }));
+  }, [tree, loadDir, showHidden]);
+
+  function renderEntries(entries: FileEntry[], depth = 0): React.ReactNode {
+    return entries.map(entry => {
+      const indent = 12 + depth * 18;
+      if (entry.type === "dir") {
+        const node = tree[entry.path];
+        const expanded = node?.expanded ?? false;
+        const loading = node?.loading ?? false;
+        return (
+          <div key={entry.path}>
+            <div onClick={() => !entry.is_skipped && toggleDir(entry.path)}
+              style={{ padding: `10px 12px 10px ${indent}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: entry.is_skipped ? "default" : "pointer", userSelect: "none" }}>
+              <span style={{ fontSize: 10, color: "var(--text-faint)", width: 10, flexShrink: 0 }}>{entry.is_skipped ? "" : expanded ? "▼" : "▶"}</span>
+              <span style={{ fontSize: 16 }}>📁</span>
+              <span style={{ fontSize: 14, color: entry.is_skipped ? "var(--text-faint)" : "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {entry.name}{entry.is_skipped && <span style={{ fontSize: 11, color: "var(--text-faint)" }}> (skipped)</span>}
+              </span>
+              {loading && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>…</span>}
+            </div>
+            {expanded && node?.entries && renderEntries(node.entries, depth + 1)}
+          </div>
+        );
+      }
+      const clickable = entry.is_text || entry.is_sqlite || getMobileFileKind(entry) === "pdf" || getMobileFileKind(entry) === "image";
+      return (
+        <div key={entry.path} onClick={() => clickable && openFile(entry)}
+          style={{ padding: `10px 12px 10px ${indent + 18}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: clickable ? "pointer" : "default" }}>
+          <span style={{ fontSize: 15 }}>{mobileFileIcon(entry.name)}</span>
+          <span style={{ fontSize: 14, color: clickable ? "var(--text-primary)" : "var(--text-faint)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
+          {entry.size != null && <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{mobileFormatSize(entry.size)}</span>}
+        </div>
+      );
+    });
+  }
+
+  // ── File preview ──────────────────────────────────────────────────────────
+  if (previewEntry) {
+    const kind = getMobileFileKind(previewEntry);
+    const ext = previewEntry.name.split(".").pop()?.toLowerCase() || "";
+    const rawUrl = `/api/sessions/${sessionId}/fs/raw?path=${encodeURIComponent(previewEntry.path)}`;
+    return (
+      <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 210, display: "flex", flexDirection: "column" }}>
+        <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+          <button onClick={() => history.back()} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+          <span style={{ flex: 1, fontSize: 14, fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{previewEntry.name}</span>
+          <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{kind}</span>
+        </div>
+        <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+          {fileLoading && <div style={{ padding: 24, color: "var(--text-muted)", textAlign: "center" }}>Loading…</div>}
+          {fileError && <div style={{ padding: 16, color: "var(--accent-red)", fontSize: 13 }}>{fileError}</div>}
+          {!fileLoading && !fileError && (
+            <>
+              {kind === "code" && <MobileCodeViewer content={fileContent} ext={ext} />}
+              {kind === "markdown" && (
+                <div className="md-preview" dangerouslySetInnerHTML={{ __html: marked.parse(fileContent) as string }}
+                  style={{ flex: 1, overflow: "auto", padding: "16px", color: "var(--text-primary)", fontSize: 14, lineHeight: 1.7 }} />
+              )}
+              {kind === "csv" && <MobileCsvViewer content={fileContent} />}
+              {kind === "text" && (
+                <pre style={{ flex: 1, overflow: "auto", margin: 0, padding: 16, fontSize: 13, color: "var(--text-primary)", lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{fileContent}</pre>
+              )}
+              {kind === "sqlite" && <MobileSqliteViewer sessionId={sessionId} path={previewEntry.path} />}
+              {kind === "pdf" && (
+                blobUrl
+                  ? <iframe src={blobUrl} style={{ flex: 1, border: "none" }} title={previewEntry.name} />
+                  : <div style={{ padding: 24, color: "var(--text-muted)", textAlign: "center" }}>Loading PDF…</div>
+              )}
+              {kind === "image" && (
+                <div style={{ flex: 1, overflow: "auto", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "var(--bg-deep)" }}>
+                  {blobUrl
+                    ? <img src={blobUrl} alt={previewEntry.name} style={{ maxWidth: "100%", maxHeight: "100%", borderRadius: 8, objectFit: "contain" }} />
+                    : <div style={{ color: "var(--text-muted)" }}>Loading…</div>
+                  }
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Tree view ─────────────────────────────────────────────────────────────
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Files</span>
+        <span style={{ fontSize: 11, color: "var(--text-faint)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{sessionCwd}</span>
+        <button onClick={() => setShowHidden(h => !h)}
+          style={{ fontSize: 11, padding: "3px 8px", background: showHidden ? "color-mix(in srgb, var(--accent-blue) 20%, var(--bg-base))" : "var(--bg-hover)", color: showHidden ? "var(--accent-blue)" : "var(--text-muted)", border: "1px solid " + (showHidden ? "var(--accent-blue)" : "var(--border)"), borderRadius: 5 }}>
+          {showHidden ? "hidden ✓" : "hidden"}
+        </button>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {rootLoading
+          ? <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>
+          : rootEntries.length === 0
+            ? <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Empty directory</div>
+            : renderEntries(rootEntries)
+        }
+      </div>
+    </div>
+  );
+}
+
+function ScrollJumpBtn({ scrollRef, stickToBottom }: { scrollRef: React.RefObject<HTMLDivElement | null>; stickToBottom: React.MutableRefObject<boolean> }) {
+  const btnStyle: React.CSSProperties = { width: 28, height: 28, borderRadius: "50%", background: "rgba(31,41,55,0.85)", border: "1px solid #374151", color: "var(--text-secondary)", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(4px)" };
+  return (
+    <div style={{ position: "absolute", right: 10, top: 10, display: "flex", flexDirection: "column", gap: 6, zIndex: 99 }}>
+      <button onClick={() => { const el = scrollRef.current; if (!el) return; stickToBottom.current = false; el.scrollTo({ top: 0, behavior: "smooth" }); }} style={btnStyle}>↑</button>
+      <button onClick={() => { const el = scrollRef.current; if (!el) return; stickToBottom.current = true; el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); }} style={btnStyle}>↓</button>
+    </div>
+  );
+}
+
+/* ─── Inquirer prompt detection ─── */
+function detectInquirerPrompt(text: string): { question: string; options: string[] } | null {
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  // Find last line starting with "?" (inquirer question marker)
+  let qIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].startsWith("?")) { qIdx = i; break; }
+  }
+  if (qIdx < 0) return null;
+  // Extract numbered options from lines after the question
+  const opts: string[] = [];
+  for (const l of lines.slice(qIdx + 1)) {
+    const m = l.match(/^(?:❯\s*)?(\d+)[.)]\s+(.+)/);
+    if (m) opts.push(m[2].trim());
+  }
+  if (opts.length < 2) return null;
+  return { question: lines[qIdx].replace(/^\?\s*/, ""), options: opts };
+}
+
+/* ─── Session Detail ─── */
+const statusDot = (s: string) =>
+  s === "running" ? "var(--accent-green)" : s === "stopped" || s === "terminated" ? "var(--accent-red)" : "var(--text-secondary)";
+
+function relTime(iso: string): string {
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+function SessionDrawer({
+  open, onClose, onOpen, currentSession, onNewSession,
+  onImport, onLogout, onSwitchToAdmin, theme, onToggleTheme, username,
+}: {
+  open: boolean; onClose: () => void;
+  onOpen: (s: SessionMeta) => void;
+  currentSession: SessionMeta;
+  onNewSession: () => void;
+  onImport: () => void;
+  onLogout: () => void;
+  onSwitchToAdmin?: () => void;
+  theme?: "dark" | "light";
+  onToggleTheme?: () => void;
+  username: string;
+}) {
+  const [sessions, setSessions] = useState<SessionMeta[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [usage, setUsage] = useState<UsageInfo | null>(null);
+  const [showAllSessions, setShowAllSessions] = useState<boolean>(
+    () => localStorage.getItem("mobileShowAllSessions") === "1",
+  );
+  useEffect(() => {
+    localStorage.setItem("mobileShowAllSessions", showAllSessions ? "1" : "0");
+  }, [showAllSessions]);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    listSessions().then((r) => {
+      const active = (s: SessionMeta) => s.status === "running" || s.status === "detached";
+      setSessions([...r.items.filter(active), ...r.items.filter((s) => !active(s))]);
+    }).catch(() => {}).finally(() => setLoading(false));
+    getUsageInfo().then(setUsage).catch(() => {});
+  }, [open]);
+
+  const handleDrawerDelete = async (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    if (!window.confirm("Delete this session?")) return;
+    setDeletingId(id);
+    try {
+      await deleteSession(id);
+      setSessions((prev) => prev.filter((s) => s.id !== id));
+    } catch { alert("Failed to delete"); } finally { setDeletingId(null); }
+  };
+
+  const isActive = (s: SessionMeta) => s.status === "running" || s.status === "detached";
+  const others = sessions
+    .filter(s => s.id !== currentSession.id)
+    .filter(s => showAllSessions || isActive(s));
+  // Use fresh data from the fetched list when available
+  const displayCurrent = sessions.find(s => s.id === currentSession.id) ?? currentSession;
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div
+        onClick={onClose}
+        style={{
+          position: "fixed", inset: 0, zIndex: 300,
+          background: open ? "rgba(0,0,0,0.55)" : "transparent",
+          pointerEvents: open ? "auto" : "none",
+          transition: "background 0.22s",
+        }}
+      />
+      {/* Panel */}
+      <div style={{
+        position: "fixed", top: 0, left: 0, bottom: 0,
+        width: "86%", maxWidth: 340,
+        background: "var(--bg-base)",
+        borderRight: "1px solid var(--border)",
+        zIndex: 301,
+        display: "flex", flexDirection: "column",
+        transform: open ? "translateX(0)" : "translateX(-100%)",
+        transition: "transform 0.24s cubic-bezier(0.4,0,0.2,1)",
+        willChange: "transform",
+      }}>
+        {/* ── Header ── */}
+        <div style={{ padding: "14px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", flexShrink: 0 }}>
+          <span style={{ fontSize: 15, fontWeight: 700, color: "var(--text-bright)", flex: 1 }}>Sessions</span>
+          <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 22, lineHeight: 1, cursor: "pointer", padding: "0 2px" }}>✕</button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          {/* ── Current session ── */}
+          <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--border)" }}>
+            <div style={{ fontSize: 10, color: "var(--text-faintest)", fontWeight: 600, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>Current</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+              <span style={{
+                width: 7, height: 7, borderRadius: "50%", flexShrink: 0, display: "inline-block",
+                background: statusDot(displayCurrent.status),
+                animation: displayCurrent.is_streaming ? "cursor-blink 0.8s step-end infinite" : undefined,
+              }} />
+              <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-bright)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {displayCurrent.project}
+              </span>
+              {displayCurrent.is_streaming ? (
+                <span style={{ fontSize: 9, color: "var(--accent-blue)", background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 3, padding: "1px 5px", flexShrink: 0 }}>live</span>
+              ) : displayCurrent.status === "terminated" ? (
+                <span style={{ fontSize: 9, color: "var(--accent-red)", background: "rgba(248,81,73,0.1)", border: "1px solid rgba(248,81,73,0.25)", borderRadius: 3, padding: "1px 5px", flexShrink: 0 }}>terminated</span>
+              ) : displayCurrent.status === "detached" ? (
+                <span style={{ fontSize: 9, color: "var(--text-muted)", background: "var(--bg-hover)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 5px", flexShrink: 0 }}>detached</span>
+              ) : null}
+            </div>
+            {displayCurrent.prompts?.[0] && <div style={{ fontSize: 12, color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", paddingLeft: 14, marginTop: 3 }}><PromptText text={displayCurrent.prompts[0]} /></div>}
+            {displayCurrent.prompts && displayCurrent.prompts.length >= 2 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 14, marginTop: 2 }}>
+                <span style={{ fontSize: 11, color: "var(--text-muted)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><PromptText text={displayCurrent.prompts[displayCurrent.prompts.length - 1]} /></span>
+                {displayCurrent.last_user_input_at && <span style={{ fontSize: 10, color: "var(--text-faintest)", flexShrink: 0 }}>{relTime(displayCurrent.last_user_input_at)}</span>}
+              </div>
+            )}
+            {(!displayCurrent.prompts || displayCurrent.prompts.length < 2) && displayCurrent.last_user_input_at && (
+              <div style={{ fontSize: 10, color: "var(--text-faintest)", paddingLeft: 14, marginTop: 2 }}>{relTime(displayCurrent.last_user_input_at)}</div>
+            )}
+          </div>
+
+          {/* ── Other sessions ── */}
+          <div style={{ padding: "10px 14px 4px" }}>
+            <div style={{ fontSize: 10, color: "var(--text-faintest)", fontWeight: 600, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>Switch to</div>
+            <button
+              onClick={() => setShowAllSessions((v) => !v)}
+              style={{
+                width: "100%", padding: "5px 10px", borderRadius: 5, fontSize: 11,
+                background: showAllSessions ? "var(--bg-hover)" : "rgba(88,166,255,0.1)",
+                border: `1px solid ${showAllSessions ? "var(--border)" : "rgba(88,166,255,0.3)"}`,
+                color: showAllSessions ? "var(--text-muted)" : "var(--accent-blue)",
+                cursor: "pointer", textAlign: "left",
+              }}
+            >
+              {showAllSessions ? "Showing all sessions" : "Active sessions only"}
+            </button>
+          </div>
+          {loading
+            ? <div style={{ textAlign: "center", padding: 20, color: "var(--text-faint)", fontSize: 13 }}>Loading…</div>
+            : others.length === 0
+              ? <div style={{ padding: "4px 14px 12px", fontSize: 12, color: "var(--text-faintest)" }}>{showAllSessions ? "No other sessions" : "No other active sessions"}</div>
+              : others.map((s) => (
+                <div
+                  key={s.id}
+                  onClick={() => { history.replaceState(null, "", `#/s/${s.id}`); onOpen(s); onClose(); }}
+                  style={{ padding: "11px 14px", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer", display: "flex", flexDirection: "column", gap: 3 }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                    <span style={{
+                      width: 6, height: 6, borderRadius: "50%", flexShrink: 0, display: "inline-block",
+                      background: statusDot(s.status),
+                      animation: s.is_streaming ? "cursor-blink 0.8s step-end infinite" : undefined,
+                    }} />
+                    <span style={{ fontSize: 14, fontWeight: 600, flex: 1, color: "var(--text-bright)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.project}</span>
+                    {s.is_streaming ? (
+                      <span style={{ fontSize: 9, color: "var(--accent-blue)", background: "rgba(88,166,255,0.1)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 3, padding: "1px 5px", flexShrink: 0 }}>live</span>
+                    ) : s.has_new_output ? (
+                      <span style={{ fontSize: 9, color: "var(--accent-green)", background: "rgba(63,185,80,0.1)", border: "1px solid rgba(63,185,80,0.3)", borderRadius: 3, padding: "1px 5px", flexShrink: 0 }}>new</span>
+                    ) : s.status === "terminated" ? (
+                      <span style={{ fontSize: 9, color: "var(--accent-red)", background: "rgba(248,81,73,0.1)", border: "1px solid rgba(248,81,73,0.25)", borderRadius: 3, padding: "1px 5px", flexShrink: 0 }}>ended</span>
+                    ) : s.status === "detached" ? (
+                      <span style={{ fontSize: 9, color: "var(--text-muted)", background: "var(--bg-hover)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 5px", flexShrink: 0 }}>detached</span>
+                    ) : null}
+                    {s.status === "terminated" && (
+                      <button
+                        onClick={(e) => handleDrawerDelete(e, s.id)}
+                        disabled={deletingId === s.id}
+                        style={{ background: "transparent", border: "none", color: deletingId === s.id ? "var(--text-faintest)" : "var(--text-faint)", fontSize: 15, padding: "1px 3px", cursor: "pointer", flexShrink: 0, lineHeight: 1 }}
+                        title="Delete"
+                      >{deletingId === s.id ? "…" : "🗑"}</button>
+                    )}
+                  </div>
+                  {s.prompts?.[0] && <div style={{ fontSize: 12, color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", paddingLeft: 13 }}><PromptText text={s.prompts[0]} /></div>}
+                  {s.prompts && s.prompts.length >= 2 && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 13 }}>
+                      <span style={{ fontSize: 11, color: "var(--text-muted)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><PromptText text={s.prompts[s.prompts.length - 1]} /></span>
+                      {s.last_user_input_at && <span style={{ fontSize: 10, color: "var(--text-faintest)", flexShrink: 0 }}>{relTime(s.last_user_input_at)}</span>}
+                    </div>
+                  )}
+                  {(!s.prompts || s.prompts.length < 2) && s.last_user_input_at && (
+                    <div style={{ fontSize: 10, color: "var(--text-faintest)", paddingLeft: 13 }}>{relTime(s.last_user_input_at)}</div>
+                  )}
+                </div>
+              ))
+          }
+        </div>
+
+        {/* ── Bottom actions ── */}
+        <div style={{ padding: "12px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-surface)", flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+          {/* Token usage — single row */}
+          {usage && (usage.five_hour || usage.seven_day) && (() => {
+            const fmt = (w: NonNullable<UsageInfo["five_hour"]>, week: boolean) => {
+              const pct = +(w.utilization * 100).toFixed(1);
+              const col = pct >= 80 ? "#f87171" : pct >= 50 ? "#fbbf24" : "#4ade80";
+              const d = new Date(w.resets_at);
+              const mm = String(d.getMonth() + 1).padStart(2, "0");
+              const dd = String(d.getDate()).padStart(2, "0");
+              const hhmm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+              const reset = week ? `${mm}-${dd} ${hhmm}` : hhmm;
+              return { pct, col, reset };
+            };
+            const s = usage.five_hour ? fmt(usage.five_hour, false) : null;
+            const w = usage.seven_day ? fmt(usage.seven_day, true) : null;
+            return (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
+                {s && <><span style={{ color: "var(--text-faintest)" }}>5h</span><span style={{ color: s.col, fontWeight: 700 }}>{s.pct}%</span><span style={{ color: "var(--text-faintest)" }}>↻{s.reset}</span></>}
+                {s && w && <span style={{ color: "var(--border)", fontSize: 10 }}>|</span>}
+                {w && <><span style={{ color: "var(--text-faintest)" }}>7d</span><span style={{ color: w.col, fontWeight: 700 }}>{w.pct}%</span><span style={{ color: "var(--text-faintest)" }}>↻{w.reset}</span></>}
+              </div>
+            );
+          })()}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={() => { onNewSession(); onClose(); }}
+              style={{ flex: 1, padding: "11px 0", background: "var(--accent-green)", color: "#fff", border: "none", borderRadius: 10, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+            >+ New</button>
+            <button
+              onClick={() => { onImport(); onClose(); }}
+              style={{ flex: 1, padding: "11px 0", background: "rgba(88,166,255,0.1)", color: "var(--accent-blue)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 10, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+            >⬆ Import</button>
+          </div>
+          {/* Footer: user info + theme + admin + logout */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingTop: 4 }}>
+            <span style={{ fontSize: 12, color: "var(--text-faint)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{username}</span>
+            {onToggleTheme && (
+              <button onClick={onToggleTheme} style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 7, color: "var(--text-muted)", fontSize: 14, padding: "4px 8px", cursor: "pointer" }} title="Toggle theme">
+                {theme === "light" ? "🌙" : "☀️"}
+              </button>
+            )}
+            {onSwitchToAdmin && (
+              <button onClick={() => { onSwitchToAdmin(); onClose(); }} style={{ background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 7, color: "var(--accent-blue)", fontSize: 12, padding: "4px 10px", cursor: "pointer" }}>
+                Admin
+              </button>
+            )}
+            <button onClick={onLogout} style={{ background: "var(--bg-hover)", border: "1px solid var(--border)", borderRadius: 7, color: "var(--text-muted)", fontSize: 12, padding: "4px 10px", cursor: "pointer" }}>
+              Logout
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function DetailView({ session: initialSession, sshConfig, onBack, username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: {
+  session: SessionMeta; sshConfig: SshConfig; onBack: () => void; username: string;
+  onLogout: () => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void;
+}) {
+  const [session, setSession] = useState(initialSession);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [showCaps, setShowCaps] = useState(false);
+  const [fontSize, setFontSize] = useState<number>(() => Number(localStorage.getItem("cm_mobile_font") || 13));
+  const changeFontSize = (delta: number) => setFontSize(prev => {
+    const next = Math.min(20, Math.max(10, prev + delta));
+    localStorage.setItem("cm_mobile_font", String(next));
+    return next;
+  });
+  const [showGit, setShowGit] = useState(false);
+  const [showSchedule, setShowSchedule] = useState(false);
+  const [showFiles, setShowFiles] = useState(false);
+  const [showTasks, setShowTasks] = useState(false);
+  const [showGoals, setShowGoals] = useState(false);
+  const [showAuqs, setShowAuqs] = useState(false);
+  const [shellRes, setShellRes] = useState<AttachResponse | null>(null);
+  const [showResumeSelect, setShowResumeSelect] = useState(false);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [settingModel, setSettingModel] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [workspaceBase, setWorkspaceBase] = useState("/workspace");
+  useEffect(() => { getConfig().then((c) => setWorkspaceBase(c.workspace)).catch(() => {}); }, []);
+
+  // ── TUI view ──────────────────────────────────────────────────────────────
+  const [viewMode, setViewMode] = useState<"chat" | "tui">("chat");
+  const [tuiWs, setTuiWs] = useState<{ url: string; token: string } | null>(null);
+  const [tuiLoading, setTuiLoading] = useState(false);
+  const [tuiCtrlActive, setTuiCtrlActive] = useState(false);
+  const [tuiHint, setTuiHint] = useState<string | null>(null);
+  const [tuiHintDismissed, setTuiHintDismissed] = useState(false);
+  const [tuiAuqData, setTuiAuqData] = useState<TuiAuqData | null>(null);
+  const [tuiApproveData, setTuiApproveData] = useState<TuiApproveData | null>(null);
+  const [compactingProgress, setCompactingProgress] = useState<string | null>(null);
+  const [isCompacting, setIsCompacting] = useState(false);
+  const tuiSendRawRef = useRef<((data: string) => void) | null>(null);
+  const tuiScrollBottomRef = useRef<(() => void) | null>(null);
+
+  const switchToTui = useCallback(async () => {
+    setTuiHintDismissed(true);
+    if (tuiWs) { setViewMode("tui"); return; }
+    setTuiLoading(true);
+    try {
+      const res = await attachSession(session.id);
+      setTuiWs({ url: res.ws_url, token: res.ws_token });
+      setViewMode("tui");
+    } catch (e) { alert(String(e)); }
+    finally { setTuiLoading(false); }
+  }, [tuiWs, session.id]);
+
+  // ── History management ──────────────────────────────────────────
+  const showGitRef = useRef(false);
+  const showScheduleRef = useRef(false);
+  const showFilesRef = useRef(false);
+  const shellResRef = useRef<AttachResponse | null>(null);
+  const filesBackHandlerRef = useRef<(() => void) | null>(null);
+  const showResumeSelectRef = useRef(false);
+  const showModelPickerRef = useRef(false);
+  const showCapsRef = useRef(false);
+  const stopResponseRef = useRef<(() => void) | null>(null);
+  const convRefreshRef = useRef<(() => void) | null>(null);
+  const showTasksRef = useRef(false);
+  const showGoalsRef = useRef(false);
+  const showAuqsRef = useRef(false);
+  showGitRef.current = showGit;
+  showScheduleRef.current = showSchedule;
+  showFilesRef.current = showFiles;
+  showTasksRef.current = showTasks;
+  showGoalsRef.current = showGoals;
+  showAuqsRef.current = showAuqs;
+  shellResRef.current = shellRes;
+  showResumeSelectRef.current = showResumeSelect;
+  showModelPickerRef.current = showModelPicker;
+  showCapsRef.current = showCaps;
+
+  // Push history entry when this view mounts; handle all back navigation here.
+  useEffect(() => {
+    history.pushState({ mobileDetail: true }, "");
+    const handlePop = () => {
+      if (filesBackHandlerRef.current) { filesBackHandlerRef.current(); return; }
+      if (showFilesRef.current) { setShowFiles(false); return; }
+      if (showGitRef.current) { setShowGit(false); return; }
+      if (showScheduleRef.current) { setShowSchedule(false); return; }
+      if (showTasksRef.current) { setShowTasks(false); return; }
+      if (showGoalsRef.current) { setShowGoals(false); return; }
+      if (showAuqsRef.current) { setShowAuqs(false); return; }
+      if (shellResRef.current) { setShellRes(null); return; }
+      if (showResumeSelectRef.current) { setShowResumeSelect(false); return; }
+      if (showModelPickerRef.current) { setShowModelPicker(false); return; }
+      if (showCapsRef.current) { setShowCaps(false); return; }
+      onBack();
+    };
+    window.addEventListener("popstate", handlePop);
+    return () => window.removeEventListener("popstate", handlePop);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Push extra history entry whenever a sub-panel opens.
+  useEffect(() => { if (showGit) history.pushState({ mobileDetail: true, sub: "git" }, ""); }, [showGit]);
+  useEffect(() => { if (showSchedule) history.pushState({ mobileDetail: true, sub: "schedule" }, ""); }, [showSchedule]);
+  useEffect(() => { if (showTasks) history.pushState({ mobileDetail: true, sub: "tasks" }, ""); }, [showTasks]);
+  useEffect(() => { if (showGoals) history.pushState({ mobileDetail: true, sub: "goals" }, ""); }, [showGoals]);
+  useEffect(() => { if (showAuqs) history.pushState({ mobileDetail: true, sub: "auqs" }, ""); }, [showAuqs]);
+  useEffect(() => { if (showFiles) history.pushState({ mobileDetail: true, sub: "files" }, ""); }, [showFiles]);
+  useEffect(() => { if (shellRes) history.pushState({ mobileDetail: true, sub: "shell" }, ""); }, [shellRes]);
+  useEffect(() => { if (showResumeSelect) history.pushState({ mobileDetail: true, sub: "resumeSelect" }, ""); }, [showResumeSelect]);
+  useEffect(() => { if (showModelPicker) history.pushState({ mobileDetail: true, sub: "modelPicker" }, ""); }, [showModelPicker]);
+  useEffect(() => { if (showCaps) history.pushState({ mobileDetail: true, sub: "caps" }, ""); }, [showCaps]);
+
+  const [scheduledTasks, setScheduledTasks] = useState<ScheduledTask[]>(initialSession.scheduled_tasks ?? []);
+
+  // Poll session status so is_streaming stays accurate (prevents QAReplyBlock
+  // from appearing mid-stream when the stale prop still reads false).
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const res = await listSessionsStatus();
+        const st = res.items.find((s) => s.id === initialSession.id);
+        if (st) {
+          setSession((prev) => ({
+            ...prev,
+            status: st.status,
+            is_streaming: st.is_streaming,
+            has_new_output: st.has_new_output,
+            attached_clients: st.attached_clients,
+            scheduled_tasks: st.scheduled_tasks,
+          }));
+          setScheduledTasks(st.scheduled_tasks ?? []);
+          setTuiHint((prev) => {
+            const next = st.tui_hint ?? null;
+            if (next !== prev) {
+              setTuiHintDismissed(false);
+              if (next && !prev) convRefreshRef.current?.();
+            }
+            return next;
+          });
+          setTuiAuqData(st.tui_auq_data ?? null);
+          setTuiApproveData(st.tui_approve_data ?? null);
+          setIsCompacting(!!st.is_compacting);
+          setCompactingProgress(st.compacting_progress ?? null);
+        }
+      } catch { /* ignore */ }
+    };
+    poll();
+    const id = setInterval(poll, 3000);
+    return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSession.id]);
+  const [renamingDetail, setRenamingDetail] = useState(false);
+  const [renameDetailValue, setRenameDetailValue] = useState("");
+
+  // Lock container to visual viewport so the header stays visible when soft keyboard opens.
+  // On Android Chrome, the keyboard shrinks visualViewport but may scroll layout viewport,
+  // which pushes fixed elements off screen. We counteract that by tracking vv offset/height.
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      const el = containerRef.current;
+      if (!el) return;
+      el.style.top = `${vv.offsetTop}px`;
+      el.style.height = `${vv.height}px`;
+    };
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    update();
+    return () => { vv.removeEventListener("resize", update); vv.removeEventListener("scroll", update); };
+  }, []);
+
+  return (
+    <div ref={containerRef} style={{ display: "flex", flexDirection: "column", position: "fixed", left: 0, right: 0, top: 0, height: "100%", overflow: "hidden", background: "var(--bg-base)" }}>
+      {/* Header — 2 rows — flex-shrink:0 so it always occupies its natural height */}
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)" }}>
+        {/* Row 1: menu icon + session name (centered) */}
+        <div style={{ padding: "8px 12px", display: "flex", alignItems: "center" }}>
+          <button
+            onClick={() => setDrawerOpen(true)}
+            style={{ background: "transparent", border: "none", color: "var(--text-muted)", fontSize: 20, padding: "0 4px", cursor: "pointer", lineHeight: 1, flexShrink: 0, width: 36 }}
+            title="Sessions"
+          >☰</button>
+          <div style={{ flex: 1, minWidth: 0, textAlign: "center" }}>
+            {renamingDetail ? (
+              <input
+                value={renameDetailValue}
+                onChange={(e) => setRenameDetailValue(e.target.value)}
+                onBlur={async () => {
+                  const v = renameDetailValue.trim();
+                  setRenamingDetail(false);
+                  if (v && v !== session.project) {
+                    try { const s = await renameSession(session.id, v); setSession(s); } catch {}
+                  }
+                }}
+                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); if (e.key === "Escape") setRenamingDetail(false); }}
+                autoFocus
+                style={{ fontSize: 14, fontWeight: 600, background: "var(--bg-base)", border: "1px solid #58a6ff", borderRadius: 4, color: "var(--text-bright)", padding: "2px 6px", outline: "none", width: "80%", textAlign: "center" }}
+              />
+            ) : (
+              <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-bright)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 4, maxWidth: "100%" }}>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.project}</span>
+                <button
+                  onClick={() => { setRenameDetailValue(session.project); setRenamingDetail(true); }}
+                  style={{ background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 13, cursor: "pointer", padding: 0, flexShrink: 0 }}
+                  title="Rename session"
+                >✎</button>
+              </div>
+            )}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 2, flexShrink: 0 }}>
+            <button onClick={() => changeFontSize(-1)} disabled={fontSize <= 10} style={{ background: "transparent", border: "none", color: fontSize <= 10 ? "var(--text-faintest)" : "var(--text-muted)", fontSize: 13, padding: "2px 5px", cursor: "pointer", lineHeight: 1 }} title="Smaller text">A−</button>
+            <button onClick={() => changeFontSize(1)} disabled={fontSize >= 20} style={{ background: "transparent", border: "none", color: fontSize >= 20 ? "var(--text-faintest)" : "var(--text-muted)", fontSize: 15, padding: "2px 5px", cursor: "pointer", lineHeight: 1 }} title="Larger text">A+</button>
+          </div>
+        </div>
+        {/* Row 2: compact action icon bar */}
+        {(() => {
+          const pendingCount = scheduledTasks.filter(t => t.status === "pending").length;
+          const isTerminated = session.status === "terminated";
+          const isDark = theme !== "light";
+          const svgFilter = isDark ? "invert(0.6)" : "invert(0.35)";
+          const svgStyle = { width: 14, height: 14, display: "block", filter: svgFilter };
+          const iconMuted = isDark ? "var(--text-secondary)" : "var(--text-faint)";
+          const borderColor = isDark ? "var(--bg-hover)" : "var(--border)";
+          const modelLabel = settingModel ? "…" : session.model
+            ? (session.model.includes("opus") ? "Opus" : session.model.includes("haiku") ? "Haiku" : "Sonnet")
+            : "M";
+          type Btn = { icon: React.ReactNode; onClick: () => void; color: string; bg: string; title: string; disabled?: boolean };
+          const canStop = !isTerminated && session.is_streaming;
+          const btns: Btn[] = [
+            { icon: <img src={terminalIcon} style={svgStyle} />, title: "Shell", onClick: async () => { try { const r = await openShell(session.id); setShellRes(r); } catch (e) { alert(String(e)); } }, color: iconMuted, bg: "transparent" },
+            { icon: "📁", title: "Files", onClick: () => setShowFiles(true), color: iconMuted, bg: "transparent" },
+            { icon: <img src={gitIcon} style={svgStyle} />, title: "Git", onClick: () => setShowGit(true), color: iconMuted, bg: "transparent" },
+            {
+              icon: pendingCount > 0
+                ? <span style={{ position: "relative", display: "inline-flex" }}><img src={scheduleIcon} style={svgStyle} /><span style={{ position: "absolute", top: -4, right: -5, fontSize: 8, background: "var(--accent-blue)", color: "#fff", borderRadius: 6, padding: "0 2px", lineHeight: "12px" }}>{pendingCount}</span></span>
+                : <img src={scheduleIcon} style={{ ...svgStyle, filter: isTerminated ? (isDark ? "invert(0.25)" : "invert(0.65)") : svgFilter }} />,
+              title: "Schedule", onClick: () => { if (!isTerminated) setShowSchedule(true); },
+              color: isTerminated ? (isDark ? "var(--border)" : "var(--text-secondary)") : pendingCount > 0 ? "var(--accent-blue)" : iconMuted, bg: "transparent",
+            },
+            { icon: <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: -0.3 }}>☑</span>, title: "Tasks", onClick: () => setShowTasks(true), color: iconMuted, bg: "transparent" },
+            { icon: <span style={{ fontSize: 11, fontWeight: 700 }}>◎</span>, title: "Goals", onClick: () => setShowGoals(true), color: iconMuted, bg: "transparent" },
+            { icon: <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: -0.2 }}>Q?</span>, title: "AUQs", onClick: () => setShowAuqs(true), color: iconMuted, bg: "transparent" },
+            {
+              icon: <span style={{ fontSize: 10, fontWeight: 700 }}>{modelLabel}</span>,
+              title: `Model: ${session.model || "default"}`,
+              onClick: async () => {
+                if (models.length === 0) { try { setModels(await listModels(session.tool || "claude")); } catch {} }
+                setShowModelPicker(true);
+              },
+              color: session.model ? "var(--accent-blue)" : iconMuted, bg: "transparent",
+            },
+            { icon: "⇄", title: "Switch session", onClick: () => setShowResumeSelect(true), color: "var(--accent-blue)", bg: "transparent" },
+            {
+              icon: canStop
+                ? <span className="stop-pulse" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 22, height: 22, borderRadius: 5, background: "#f97316", color: "#fff", fontSize: 11, fontWeight: 900 }}>■</span>
+                : <span style={{ fontSize: 13, fontWeight: 700 }}>■</span>,
+              title: "Stop reply",
+              onClick: () => { if (canStop) stopResponseRef.current?.(); },
+              color: "var(--text-faintest)", bg: "transparent",
+              disabled: !canStop,
+            },
+            isTerminated
+              ? { icon: "▶", title: "Resume", onClick: async () => { try { await resumeSession(session.id); setSession((s) => ({ ...s, status: "running" })); } catch (e) { alert(String(e)); } }, color: "var(--accent-green)", bg: "transparent" }
+              : { icon: "⏹", title: "Terminate", onClick: async () => { try { await terminateSession(session.id); onBack(); } catch {} }, color: "var(--accent-red)", bg: "transparent" },
+            { icon: "⚙", title: "Claude Capabilities", onClick: () => setShowCaps(true), color: iconMuted, bg: "transparent" },
+          ];
+          // With 12+ buttons, even-grid would shrink each below tap-target size on narrow
+          // phones. Use flex with a min-width per button and let it scroll horizontally
+          // when it overflows — preserves the layout on roomy screens, stays usable on narrow.
+          return (
+            <div style={{ display: "flex", borderTop: `1px solid ${borderColor}`, overflowX: "auto", scrollbarWidth: "none" }}>
+              {btns.map((b, i) => (
+                <button key={i} onClick={b.onClick} title={b.title} disabled={b.disabled}
+                  style={{ height: 34, flex: "1 0 auto", minWidth: 36, display: "flex", alignItems: "center", justifyContent: "center", background: b.bg, color: b.color, border: "none", borderRight: i < btns.length - 1 ? `1px solid ${borderColor}` : "none", cursor: b.disabled ? "default" : "pointer", padding: 0 }}>
+                  {b.icon}
+                </button>
+              ))}
+            </div>
+          );
+        })()}
+      </div>
+
+      <SessionDrawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        onOpen={(s) => setSession(s)}
+        currentSession={session}
+        onNewSession={() => setShowCreate(true)}
+        onImport={() => setShowImport(true)}
+        onLogout={onLogout}
+        onSwitchToAdmin={onSwitchToAdmin}
+        theme={theme}
+        onToggleTheme={onToggleTheme}
+        username={username}
+      />
+
+      {shellRes && <MobileShellPanel cwd={session.cwd} res={shellRes} onClose={() => history.back()} />}
+      {showFiles && (
+        <MobileFileBrowserPanel
+          sessionId={session.id}
+          sessionCwd={session.cwd}
+          onClose={() => history.back()}
+          onSetBackHandler={(fn) => { filesBackHandlerRef.current = fn; }}
+        />
+      )}
+      {showGit && <MobileGitPanel sessionId={session.id} session={session} onSessionChange={setSession} onClose={() => history.back()} />}
+      {showResumeSelect && (
+        <MobileResumeSelectPanel
+          sessionId={session.id}
+          onClose={() => history.back()}
+          onDone={(newSession) => { setSession(newSession); history.back(); }}
+        />
+      )}
+      {showSchedule && (
+        <MobileSchedulePanel
+          sessionId={session.id}
+          tasks={scheduledTasks}
+          onTasksChange={setScheduledTasks}
+          onClose={() => history.back()}
+        />
+      )}
+      {showTasks && <MobileTasksPanel sessionId={session.id} onClose={() => history.back()} />}
+      {showGoals && <MobileGoalsPanel sessionId={session.id} onClose={() => history.back()} />}
+      {showAuqs && <MobileAuqsPanel sessionId={session.id} onClose={() => history.back()} />}
+
+      {showModelPicker && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}
+          onClick={() => history.back()}>
+          <div style={{ width: "100%", background: "var(--bg-surface)", borderRadius: "12px 12px 0 0", padding: "16px 0 32px" }}
+            onClick={(e) => e.stopPropagation()}>
+            <div style={{ textAlign: "center", fontSize: 12, color: "var(--text-faint)", marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--border)" }}>
+              Switch Model
+            </div>
+            {[{ id: null, name: "Default (server setting)" }, ...models].map((m, i) => {
+              const isCurrent = m.id === null ? !session.model : session.model === m.id;
+              return (
+                <button
+                  key={m.id ?? "__default__"}
+                  onClick={() => {
+                    history.back();
+                    void (async () => {
+                      setSettingModel(true);
+                      try {
+                        const updated = await setSessionModel(session.id, m.id);
+                        setSession(updated);
+                      } catch (e) { alert(String(e)); }
+                      finally { setSettingModel(false); }
+                    })();
+                  }}
+                  style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: "14px 24px", background: "transparent", border: "none", color: isCurrent ? "var(--accent-blue)" : "var(--text-bright)", fontSize: 14, cursor: "pointer", borderTop: i === 0 ? "none" : "1px solid var(--border-subtle)" }}
+                >
+                  <span>{m.name}</span>
+                  {isCurrent && <span style={{ color: "var(--accent-blue)" }}>✓</span>}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {showCaps && (
+        <ClaudeCapsModal cwd={session.cwd ?? null} onClose={() => history.back()} />
+      )}
+
+      {/* Chat / TUI tab strip */}
+      <div style={{ display: "flex", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+        <button
+          onClick={() => setViewMode("chat")}
+          style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "chat" ? "2px solid var(--accent-blue)" : "2px solid transparent", color: viewMode === "chat" ? "var(--accent-blue)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "color 0.15s" }}
+        >💬 Chat</button>
+        <button
+          onClick={switchToTui}
+          disabled={tuiLoading}
+          style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "tui" ? "2px solid var(--accent-green)" : "2px solid transparent", color: viewMode === "tui" ? "var(--accent-green)" : tuiLoading ? "var(--text-faintest)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: tuiLoading ? "default" : "pointer", transition: "color 0.15s" }}
+        >{tuiLoading ? "Connecting…" : "TUI"}</button>
+      </div>
+
+      {/* Content area — both panes mounted, visibility toggled */}
+      <div style={{
+        flex: 1, minHeight: 0,
+        display: viewMode === "chat" ? "flex" : "none",
+        flexDirection: "column", overflow: "hidden",
+        // Base + 3 derived sizes used by ConversationPane / ToolCallBlock /
+        // ThinkingBlock so that tool-use modules also scale with font size.
+        "--conv-font":     `${fontSize}px`,
+        "--conv-font-sm":  `calc(${fontSize}px - 1.5px)`,
+        "--conv-font-xs":  `calc(${fontSize}px - 2.5px)`,
+        "--conv-font-xxs": `calc(${fontSize}px - 3.5px)`,
+      } as React.CSSProperties}>
+        {isCompacting && (() => {
+          const pctNum = compactingProgress ? parseInt(compactingProgress, 10) : NaN;
+          const hasPct = Number.isFinite(pctNum) && pctNum >= 0 && pctNum <= 100;
+          const filled = hasPct ? Math.max(0, Math.min(10, Math.round(pctNum / 10))) : 0;
+          const bar = "▰".repeat(filled) + "▱".repeat(10 - filled);
+          return (
+            <div style={{
+              flexShrink: 0,
+              padding: "6px 12px",
+              background: "color-mix(in srgb, var(--accent-orange, #d59f00) 14%, var(--bg-base))",
+              borderBottom: "1px solid color-mix(in srgb, var(--accent-orange, #d59f00) 35%, transparent)",
+              color: "var(--accent-orange, #d59f00)",
+              fontSize: 12,
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+            }}>
+              <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--accent-orange, #d59f00)", animation: "cursor-blink 1s step-end infinite" }} />
+              <span>Compacting conversation…</span>
+              <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", letterSpacing: 1, opacity: hasPct ? 1 : 0.55 }}>{bar}</span>
+              <span style={{ fontVariantNumeric: "tabular-nums", minWidth: 32, textAlign: "right" }}>{hasPct ? `${pctNum}%` : "…"}</span>
+            </div>
+          );
+        })()}
+        <ConversationPane
+          key={session.id}
+          sessionId={session.id}
+          tool={session.tool as "claude" | "cursor" | undefined}
+          isStreaming={session.is_streaming}
+          isWaitingForAuq={!!tuiHint?.includes("asking a question")}
+          pendingAuqData={tuiAuqData}
+          pendingApproveData={tuiApproveData}
+          stopRef={stopResponseRef}
+          refreshRef={convRefreshRef}
+        />
+      </div>
+      {tuiWs && (
+        <div style={{ flex: 1, minHeight: 0, display: viewMode === "tui" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
+          <TuiPane
+            key={tuiWs.token}
+            wsUrl={tuiWs.url}
+            theme={theme}
+            scrollToBottomRef={tuiScrollBottomRef}
+            sendRawRef={tuiSendRawRef}
+          />
+        </div>
+      )}
+
+      {/* TUI keyboard toolbar */}
+      {viewMode === "tui" && tuiWs && (() => {
+        const sendKey = (seq: string) => tuiSendRawRef.current?.(seq);
+        const sendCtrl = (letter: string) => { sendKey(String.fromCharCode(letter.charCodeAt(0) - 64)); setTuiCtrlActive(false); };
+        const tbBtn: React.CSSProperties = { flex: 1, height: 40, background: "transparent", border: "none", borderRight: "1px solid var(--border-subtle)", color: "var(--text-primary)", fontSize: 12, fontFamily: "monospace", fontWeight: 600, cursor: "pointer", padding: 0, userSelect: "none" };
+        return (
+          <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderTop: "1px solid var(--border)" }}>
+            <div style={{ display: "flex" }}>
+              <button
+                onPointerDown={(e) => { e.preventDefault(); setTuiCtrlActive(v => !v); }}
+                style={{ ...tbBtn, background: tuiCtrlActive ? "color-mix(in srgb, var(--accent-blue) 18%, var(--bg-base))" : "transparent", color: tuiCtrlActive ? "var(--accent-blue)" : "var(--text-secondary)", borderRadius: 0, letterSpacing: 0.5 }}
+              >CTRL</button>
+              {ROW1_NAV.map((k) => (
+                <button key={k.label} onPointerDown={(e) => { e.preventDefault(); sendKey(k.seq); }}
+                  style={{ ...tbBtn, fontSize: "←↑↓→".includes(k.label) ? 16 : 12 }}>{k.label}</button>
+              ))}
+              <button onPointerDown={(e) => { e.preventDefault(); tuiScrollBottomRef.current?.(); }}
+                style={{ ...tbBtn, borderRight: "none", color: "var(--text-secondary)" }}>↓</button>
+            </div>
+            {tuiCtrlActive && (
+              <div style={{ display: "flex", overflowX: "auto", scrollbarWidth: "none", borderTop: "1px solid var(--border-subtle)" }}>
+                {CTRL_COMMON.map(({ letter, desc, title }) => (
+                  <button key={letter} title={title} onPointerDown={(e) => { e.preventDefault(); sendCtrl(letter); }}
+                    style={{ flexShrink: 0, minWidth: 48, height: 40, background: "transparent", border: "none", borderRight: "1px solid var(--border-subtle)", cursor: "pointer", userSelect: "none", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 1, padding: 0 }}>
+                    <span style={{ fontSize: 12, fontFamily: "monospace", fontWeight: 700, color: "var(--accent-blue)", lineHeight: 1 }}>^{letter}</span>
+                    <span style={{ fontSize: 9, color: "var(--text-muted)", lineHeight: 1 }}>{desc}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {showCreate && (
+        <CreateModal
+          workspaceBase={workspaceBase}
+          username={username}
+          onClose={() => setShowCreate(false)}
+          onCreate={(s) => { setShowCreate(false); setSession(s); }}
+        />
+      )}
+      {showImport && (
+        <MobileBrowseExternalPanel
+          onClose={() => setShowImport(false)}
+          onLoad={async (ext) => {
+            const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
+            const s = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id });
+            setShowImport(false); setSession(s);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+const SESSION_HASH_RE = /^#\/s\/(.+)/;
+
+function parseSessionHash(): string | null {
+  const m = window.location.hash.match(SESSION_HASH_RE);
+  return m ? m[1] : null;
+}
+
+/* ─── Top-level Mobile Page ─── */
+export function MobilePage({ username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: { username: string; onLogout: () => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void }) {
+  const [openSession, setOpenSession] = useState<SessionMeta | null>(null);
+  const [sshConfig, setSshConfig] = useState<SshConfig>({ host: "", port: 22, user: "" });
+
+  useEffect(() => { getSshConfig().then(setSshConfig).catch(() => {}); }, []);
+
+  // On mount: if URL already has #/s/{id}, load that session directly
+  useEffect(() => {
+    const sid = parseSessionHash();
+    if (!sid) return;
+    getSession(sid)
+      .then(s => setOpenSession(s))
+      .catch(() => { history.replaceState(null, "", window.location.pathname); });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep state in sync when hash changes externally (e.g. browser forward/back beyond our handlers)
+  useEffect(() => {
+    const onHashChange = () => {
+      const sid = parseSessionHash();
+      if (!sid) setOpenSession(null);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  const openDetail = (s: SessionMeta) => {
+    history.pushState(null, "", `#/s/${s.id}`);
+    setOpenSession(s);
+  };
+
+  const closeDetail = () => {
+    history.replaceState(null, "", window.location.pathname);
+    setOpenSession(null);
+  };
+
+  if (openSession) return <DetailView session={openSession} sshConfig={sshConfig} onBack={closeDetail} username={username} onLogout={onLogout} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
+  return <ListView username={username} onLogout={onLogout} onOpen={openDetail} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
+}
+
+/* ─── Shared micro styles ─── */
+const inp: React.CSSProperties = {
+  width: "100%", boxSizing: "border-box",
+  background: "var(--bg-base)", border: "1px solid var(--border-strong)",
+  borderRadius: 8, padding: "10px 12px", color: "var(--text-bright)", fontSize: 15, outline: "none",
+};
+const btn: React.CSSProperties = {
+  border: "1px solid var(--border)", borderRadius: 8,
+  padding: "10px 16px", fontSize: 14, cursor: "pointer", textAlign: "center",
+};
