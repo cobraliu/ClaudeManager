@@ -1,0 +1,3780 @@
+import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from "react";
+import { createPortal } from "react-dom";
+import hljs from "highlight.js/lib/common";
+import { marked, renderMarkdown } from "../lib/markdown";
+import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
+import { WsClient } from "../lib/wsClient";
+
+const POLL_MS = 1500;
+const DEFAULT_TAIL = 100;
+// crypto.randomUUID() requires a secure context (HTTPS/localhost).
+// Fall back to Math.random on plain HTTP local-network access.
+const _randomId = (): string =>
+  typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+const JSON_FORMAT_THRESHOLD = 4096;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function isCompactSummaryText(text: string): boolean {
+  return text.trimStart().startsWith("This session is being continued from a previous conversation");
+}
+
+function getTextFromContent(content: RawContentBlock[] | string): string {
+  if (typeof content === "string") return content;
+  return content.filter((b) => b.type === "text").map((b) => b.text || "").join("");
+}
+
+function getBlocks(content: RawContentBlock[] | string): RawContentBlock[] {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  return content || [];
+}
+
+function toolSummary(name: string, input: Record<string, unknown>): string {
+  if (name === "Agent" && input.description) return String(input.description);
+  if ("command" in input) return String(input.command).split("\n")[0].slice(0, 120);
+  if ("file_path" in input) return String(input.file_path);
+  if ("pattern" in input) {
+    const path = input.path ? ` in ${input.path}` : "";
+    return `${input.pattern}${path}`;
+  }
+  if ("query" in input) return String(input.query).slice(0, 80);
+  if ("url" in input) return String(input.url).slice(0, 80);
+  if ("old_string" in input) return String(input.file_path || "");
+  if ("content" in input && "file_path" in input) return String(input.file_path);
+  return name;
+}
+
+function toolIcon(name: string): string {
+  switch (name) {
+    case "Bash": return "⌨";
+    case "Read": return "📄";
+    case "Write": return "✏";
+    case "Edit": case "MultiEdit": return "✂";
+    case "Glob": return "🔍";
+    case "Grep": return "🔎";
+    case "WebFetch": case "WebSearch": return "🌐";
+    case "TodoWrite": case "TodoRead": return "📋";
+    case "Task": return "⎇";
+    case "Agent": return "🤖";
+    default: return "⚙";
+  }
+}
+
+function diffStats(name: string, input: Record<string, unknown>): { add: number; del: number } | null {
+  if (name === "Edit" || name === "MultiEdit") {
+    if ("old_string" in input && "new_string" in input) {
+      const raw = lcsLineDiff(
+        String(input.old_string || "").split("\n"),
+        String(input.new_string || "").split("\n"),
+      );
+      return {
+        del: raw.filter((l) => l.type === "removed").length,
+        add: raw.filter((l) => l.type === "added").length,
+      };
+    }
+  }
+  if (name === "Write" && "content" in input) {
+    return { add: String(input.content || "").split("\n").length, del: 0 };
+  }
+  return null;
+}
+
+function toolResultText(result: { content: string; isError: boolean } | undefined): string | null {
+  if (!result?.content) return null;
+  const t = result.content.trim();
+  return t.length > 3 ? t : null;
+}
+
+function formatTs(iso: string | undefined): string {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    const time = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    const isToday = d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth()
+      && d.getDate() === now.getDate();
+    if (isToday) return time;
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${time}`;
+  } catch { return ""; }
+}
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function _innerXml(text: string, tag: string): string {
+  const re = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`);
+  return text.match(re)?.[1].trim() || "";
+}
+
+function TaskNotificationBlock({ text, ts }: { text: string; ts?: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const status = _innerXml(text, "status").toLowerCase();
+  const summary = _innerXml(text, "summary");
+  const taskId = _innerXml(text, "task-id");
+  const toolUseId = _innerXml(text, "tool-use-id");
+  const outputFile = _innerXml(text, "output-file");
+
+  const colors = status === "failed"
+    ? { bg: "#3d1f1f", border: "#7a3838", text: "#ffb4b4", badge: "#c94a4a", icon: "✗" }
+    : status === "completed" || status === "success"
+    ? { bg: "#1f3d2a", border: "#3d7a52", text: "#b4ffc8", badge: "#3fa050", icon: "✓" }
+    : { bg: "#2a3142", border: "#3f4a66", text: "#cfd8ec", badge: "#4a72b8", icon: "●" };
+
+  return (
+    <div style={{ padding: "4px 16px", display: "flex", justifyContent: "center" }}>
+      <div style={{
+        maxWidth: 760, width: "100%",
+        background: colors.bg,
+        border: `1px solid ${colors.border}`,
+        borderLeft: `4px solid ${colors.badge}`,
+        borderRadius: 6,
+        overflow: "hidden",
+      }}>
+        <div
+          onClick={() => setExpanded(e => !e)}
+          style={{
+            padding: "8px 12px",
+            display: "flex", alignItems: "center", gap: 8,
+            cursor: "pointer",
+            color: colors.text,
+            fontSize: 12,
+          }}
+        >
+          <span style={{
+            display: "inline-flex", alignItems: "center", justifyContent: "center",
+            width: 18, height: 18, borderRadius: 9,
+            background: colors.badge, color: "#fff",
+            fontSize: 11, flexShrink: 0,
+          }}>{colors.icon}</span>
+          <span style={{ fontWeight: 600, flexShrink: 0 }}>Background Task</span>
+          <span style={{
+            fontSize: 10, padding: "1px 7px", borderRadius: 10,
+            background: colors.badge, color: "#fff", flexShrink: 0,
+            textTransform: "uppercase", letterSpacing: 0.5,
+          }}>{status || "—"}</span>
+          <span style={{ flex: 1, color: colors.text, opacity: 0.9, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {summary}
+          </span>
+          <span style={{ fontSize: 10, color: colors.text, opacity: 0.6, flexShrink: 0 }}>
+            {expanded ? "▾" : "▸"}
+          </span>
+        </div>
+        {expanded && (
+          <div style={{
+            padding: "8px 12px 10px",
+            borderTop: `1px solid ${colors.border}`,
+            fontSize: 11, lineHeight: 1.6,
+            color: colors.text, opacity: 0.85,
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+          }}>
+            {taskId && <div><span style={{ opacity: 0.6 }}>task-id:</span> {taskId}</div>}
+            {toolUseId && <div><span style={{ opacity: 0.6 }}>tool-use-id:</span> {toolUseId}</div>}
+            {outputFile && <div style={{ wordBreak: "break-all" }}><span style={{ opacity: 0.6 }}>output:</span> {outputFile}</div>}
+          </div>
+        )}
+        {ts && <div style={{ fontSize: 9, color: colors.text, opacity: 0.5, padding: "0 12px 5px" }}>{ts}</div>}
+      </div>
+    </div>
+  );
+}
+
+function SystemReminderBlock({ text, ts }: { text: string; ts?: string }) {
+  const [expanded, setExpanded] = useState(false);
+  // Strip the wrapping <system-reminder>...</system-reminder> if present.
+  const inner = _innerXml(text, "system-reminder") || text.replace(/^<system-reminder>|<\/system-reminder>$/g, "").trim();
+  const isLong = inner.length > 220;
+  const preview = isLong ? inner.slice(0, 220).replace(/\s+\S*$/, "") + "…" : inner;
+
+  return (
+    <div style={{ padding: "4px 16px", display: "flex", justifyContent: "center" }}>
+      <div style={{
+        maxWidth: 760, width: "100%",
+        background: "#3a2f1a",
+        border: "1px solid #6b5524",
+        borderLeft: "4px solid #d4a843",
+        borderRadius: 6,
+        padding: "8px 12px",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{
+            display: "inline-flex", alignItems: "center", justifyContent: "center",
+            width: 18, height: 18, borderRadius: 9,
+            background: "#d4a843", color: "#2a2010",
+            fontSize: 12, fontWeight: 700, flexShrink: 0,
+          }}>!</span>
+          <span style={{ fontSize: 12, fontWeight: 600, color: "#f5d990", flex: 1 }}>System Reminder</span>
+          {isLong && (
+            <button
+              onClick={() => setExpanded(e => !e)}
+              style={{
+                background: "transparent", border: "1px solid #6b5524",
+                color: "#f5d990", fontSize: 10, padding: "1px 8px", borderRadius: 10,
+                cursor: "pointer",
+              }}
+            >
+              {expanded ? "Collapse" : "Show full"}
+            </button>
+          )}
+        </div>
+        <div style={{
+          fontSize: 12, lineHeight: 1.55, color: "#f3e3b8",
+          whiteSpace: "pre-wrap", wordBreak: "break-word",
+        }}>
+          {expanded || !isLong ? inner : preview}
+        </div>
+        {ts && <div style={{ fontSize: 9, color: "#f5d990", opacity: 0.6, marginTop: 4 }}>{ts}</div>}
+      </div>
+    </div>
+  );
+}
+
+function SlashCommandBubble({ cmd, args, ts }: { cmd: string; args: string; ts?: string }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "flex-end", padding: "2px 16px" }}>
+      <div style={{ maxWidth: "85%", display: "inline-flex", alignItems: "flex-start", gap: 6, padding: "5px 10px", background: "rgba(88,166,255,0.08)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 10, fontSize: 12.5 }}>
+        <span style={{ fontFamily: "monospace", color: "var(--accent-blue)", fontWeight: 600, flexShrink: 0 }}>{cmd}</span>
+        {args && <span style={{ color: "var(--text-secondary)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{args}</span>}
+        {ts && <span style={{ fontSize: 9, color: "var(--text-faint)", marginLeft: 4, flexShrink: 0, alignSelf: "flex-end" }}>{ts}</span>}
+      </div>
+    </div>
+  );
+}
+
+function parseSlashCommand(text: string): { cmd: string; args: string } | null {
+  const m = text.match(/^<command-name>([^<]+)<\/command-name>[\s\S]*?<command-args>([\s\S]*?)<\/command-args>/);
+  if (!m) return null;
+  return { cmd: m[1].trim(), args: (m[2] || "").trim() };
+}
+
+// Claude CLI uses `\r` (not `\n`) as the line separator in queue-merged user input
+// and inside queued_command attachments. Browsers don't render `\r` as a line break
+// under `white-space: pre-wrap`, so without this normalization multi-line prompts
+// collapse onto one line in the chat bubble.
+function normalizeBreaks(s: string): string {
+  return s.replace(/\r\n?/g, "\n");
+}
+
+function UserBubble({ text, ts, onRewind }: { text: string; ts?: string; onRewind?: () => void }) {
+  const [hovered, setHovered] = useState(false);
+  text = normalizeBreaks(text);
+  return (
+    <div
+      style={{ padding: "0 16px 2px", textAlign: "right" }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <div style={{ display: "inline-flex", alignItems: "flex-end", gap: 6, maxWidth: "75%" }}>
+        {onRewind && hovered && (
+          <button
+            onClick={onRewind}
+            title="Rewind to here"
+            style={{
+              background: "transparent", border: "none", cursor: "pointer",
+              color: "var(--text-faint)", fontSize: 13, padding: "2px 4px",
+              borderRadius: 4, opacity: 0.7, flexShrink: 0,
+              transition: "opacity 0.12s",
+            }}
+            onMouseEnter={e => (e.currentTarget.style.opacity = "1")}
+            onMouseLeave={e => (e.currentTarget.style.opacity = "0.7")}
+          >
+            ↩
+          </button>
+        )}
+        <div style={{
+          padding: "9px 14px",
+          borderRadius: "14px 14px 3px 14px",
+          background: "#1c3a5e",
+          border: "1px solid #1d4f8a",
+          color: "#cce5ff",
+          fontSize: "var(--conv-font, 13px)",
+          lineHeight: 1.6,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          textAlign: "left",
+        }}>
+          {text}
+        </div>
+      </div>
+      {ts && <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 2, paddingRight: 2 }}>{ts}</div>}
+    </div>
+  );
+}
+
+function ThinkingBlock({ thinking, isActive }: { thinking: string; isActive?: boolean }) {
+  const [expanded, setExpanded] = useState(!!isActive);
+  useEffect(() => { if (isActive) setExpanded(true); }, [isActive]);
+
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        style={{
+          display: "flex", alignItems: "center", gap: 6, background: "none",
+          border: "none", cursor: "pointer", padding: "3px 0", color: isActive ? "#c9a227" : "var(--text-muted)",
+          fontSize: "var(--conv-font, 12px)", fontStyle: "italic",
+        }}
+      >
+        <span className={isActive ? "thinking-pulse" : ""} style={{ color: "var(--accent-amber)" }}>✦</span>
+        <span>{isActive ? "Thinking…" : expanded ? "Thinking" : "Thinking…"}</span>
+        <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)" }}>{expanded ? "▲" : "▶"}</span>
+      </button>
+      {expanded && (
+        <div style={{
+          marginTop: 4, padding: "8px 12px",
+          background: "var(--bg-deep)", borderRadius: 6,
+          border: `1px solid ${isActive ? "#2a2010" : "var(--bg-hover)"}`,
+          color: "var(--text-muted)", fontSize: "var(--conv-font-sm, 11.5px)",
+          fontStyle: "italic", lineHeight: 1.6,
+          whiteSpace: "pre-wrap", wordBreak: "break-word",
+          maxHeight: 320, overflowY: "auto",
+        }}>
+          {thinking.slice(0, 6000)}{thinking.length > 6000 ? "\n…" : ""}
+          {isActive && <span className="thinking-cursor">▌</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ThinkingRedacted({ isActive, label }: { isActive?: boolean; label?: string }) {
+  const text = label ?? (isActive ? "Thinking…" : "Thought");
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <div style={{
+        display: "flex", alignItems: "center", gap: 6,
+        color: "var(--text-faintest)", fontSize: "var(--conv-font, 12px)", fontStyle: "italic",
+      }}>
+        <span className={isActive ? "thinking-pulse" : ""} style={{ color: isActive ? "var(--accent-amber)" : "var(--text-faint)" }}>✦</span>
+        <span>{text}</span>
+        {!isActive && <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-muted)", background: "var(--bg-surface)", borderRadius: 3, padding: "0 5px" }}>content not stored</span>}
+      </div>
+    </div>
+  );
+}
+
+// ── File-extension → hljs language ───────────────────────────────────────────
+
+const EXT_TO_LANG: Record<string, string> = {
+  ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
+  py: "python", go: "go", rs: "rust", rb: "ruby", java: "java", kt: "kotlin",
+  json: "json", yaml: "yaml", yml: "yaml", toml: "ini",
+  sh: "bash", bash: "bash", zsh: "bash",
+  css: "css", html: "html", xml: "xml", svg: "xml",
+  sql: "sql", md: "markdown", c: "c", cpp: "cpp", h: "cpp",
+};
+
+function extLang(filePath: string): string {
+  return EXT_TO_LANG[filePath.split(".").pop()?.toLowerCase() ?? ""] ?? "";
+}
+
+// Search for `needle` in `haystack` and return the 1-indexed starting line, or null if not found.
+// ── Line-level LCS diff ───────────────────────────────────────────────────────
+
+type RawDiffLine = { type: "removed" | "added" | "unchanged"; text: string };
+
+function lcsLineDiff(oldLines: string[], newLines: string[]): RawDiffLine[] {
+  const m = oldLines.length, n = newLines.length;
+  // Guard: skip LCS for very large inputs to avoid O(m*n) OOM
+  if (m * n > 250_000) {
+    return [
+      ...oldLines.map((t) => ({ type: "removed" as const, text: t })),
+      ...newLines.map((t) => ({ type: "added" as const, text: t })),
+    ];
+  }
+  const dp = Array.from({ length: m + 1 }, () => new Int32Array(n + 1));
+  for (let i = m - 1; i >= 0; i--)
+    for (let j = n - 1; j >= 0; j--)
+      dp[i][j] =
+        oldLines[i] === newLines[j]
+          ? dp[i + 1][j + 1] + 1
+          : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const result: RawDiffLine[] = [];
+  let i = 0, j = 0;
+  while (i < m || j < n) {
+    if (i < m && j < n && oldLines[i] === newLines[j]) {
+      result.push({ type: "unchanged", text: oldLines[i++] }); j++;
+    } else if (i < m && (j >= n || dp[i + 1][j] >= dp[i][j + 1])) {
+      result.push({ type: "removed", text: oldLines[i++] });
+    } else {
+      result.push({ type: "added", text: newLines[j++] });
+    }
+  }
+  return result;
+}
+
+// ── Side-by-side diff view ────────────────────────────────────────────────────
+
+interface SideRow {
+  leftNo?: number; leftText?: string; leftType: "removed" | "unchanged" | "empty";
+  rightNo?: number; rightText?: string; rightType: "added" | "unchanged" | "empty";
+  isEllipsis?: boolean; ellipsisCount?: number;
+}
+
+function buildSideRows(raw: RawDiffLine[], context = 3): SideRow[] {
+  // First compute line numbers
+  let oldNo = 1, newNo = 1;
+  const numbered = raw.map((l) => {
+    if (l.type === "removed") return { ...l, oldNo: oldNo++ };
+    if (l.type === "added") return { ...l, newNo: newNo++ };
+    return { ...l, oldNo: oldNo++, newNo: newNo++ };
+  }) as Array<RawDiffLine & { oldNo?: number; newNo?: number }>;
+
+  // Which lines to show
+  const show = new Uint8Array(numbered.length);
+  for (let i = 0; i < numbered.length; i++) {
+    if (numbered[i].type !== "unchanged") {
+      const lo = Math.max(0, i - context);
+      const hi = Math.min(numbered.length - 1, i + context);
+      for (let k = lo; k <= hi; k++) show[k] = 1;
+    }
+  }
+
+  // Pair up removed + added in change blocks → side-by-side rows
+  const rows: SideRow[] = [];
+  let ci = 0;
+  while (ci < numbered.length) {
+    const l = numbered[ci];
+    if (!show[ci]) {
+      // Collapsed section
+      let count = 0;
+      while (ci < numbered.length && !show[ci]) { count++; ci++; }
+      rows.push({ leftType: "empty", rightType: "empty", isEllipsis: true, ellipsisCount: count });
+      continue;
+    }
+    if (l.type === "unchanged") {
+      rows.push({
+        leftNo: l.oldNo, leftText: l.text, leftType: "unchanged",
+        rightNo: l.newNo, rightText: l.text, rightType: "unchanged",
+      });
+      ci++;
+    } else {
+      // Collect a block of removes then adds
+      const removes: typeof l[] = [];
+      const adds: typeof l[] = [];
+      const blockStart = ci;
+      while (ci < numbered.length && show[ci] && numbered[ci].type === "removed") {
+        removes.push(numbered[ci++]);
+      }
+      while (ci < numbered.length && show[ci] && numbered[ci].type === "added") {
+        adds.push(numbered[ci++]);
+      }
+      // If we collected nothing (shouldn't happen) just advance
+      if (removes.length === 0 && adds.length === 0) { ci = blockStart + 1; continue; }
+      const maxLen = Math.max(removes.length, adds.length);
+      for (let k = 0; k < maxLen; k++) {
+        const rem = removes[k];
+        const add = adds[k];
+        rows.push({
+          leftNo: rem?.oldNo, leftText: rem?.text, leftType: rem ? "removed" : "empty",
+          rightNo: add?.newNo, rightText: add?.text, rightType: add ? "added" : "empty",
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+const CELL: React.CSSProperties = {
+  padding: "1px 8px", fontFamily: '"Ubuntu Sans Mono", monospace',
+  fontSize: "var(--conv-font-sm, 11.5px)",
+  lineHeight: "1.55", whiteSpace: "pre-wrap", wordBreak: "break-all",
+  verticalAlign: "top",
+};
+const LINENO: React.CSSProperties = {
+  padding: "1px 6px", color: "var(--text-faintest)", textAlign: "right",
+  userSelect: "none", fontSize: 10, verticalAlign: "top", minWidth: 28,
+};
+
+function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
+  const rows = useMemo(() => {
+    const raw = lcsLineDiff(oldStr.split("\n"), newStr.split("\n"));
+    return buildSideRows(raw, 3);
+  }, [oldStr, newStr]);
+
+  return (
+    <div style={{ overflowX: "auto", maxHeight: 420, overflowY: "auto", background: "var(--bg-base)", borderRadius: 4, border: "1px solid var(--border)" }}>
+      <table style={{ borderCollapse: "collapse", width: "100%", tableLayout: "fixed" }}>
+        <colgroup>
+          <col style={{ width: 32 }} /><col style={{ width: "50%" }} />
+          <col style={{ width: 32 }} /><col style={{ width: "50%" }} />
+        </colgroup>
+        <tbody>
+          {rows.map((row, i) => {
+            if (row.isEllipsis) {
+              return (
+                <tr key={i}>
+                  <td colSpan={4} style={{ padding: "2px 10px", textAlign: "center", color: "var(--text-faintest)", fontSize: 10, background: "var(--bg-base)", fontFamily: "monospace" }}>
+                    ···{row.ellipsisCount} unchanged···
+                  </td>
+                </tr>
+              );
+            }
+            const lBg = row.leftType === "removed" ? "var(--diff-del-bg)" : row.leftType === "empty" ? "var(--bg-deep)" : "transparent";
+            const rBg = row.rightType === "added" ? "var(--diff-add-bg)" : row.rightType === "empty" ? "var(--bg-deep)" : "transparent";
+            const lColor = row.leftType === "removed" ? "var(--diff-del-text)" : "var(--text-muted)";
+            const rColor = row.rightType === "added" ? "var(--diff-add-text)" : "var(--text-muted)";
+            const lPrefix = row.leftType === "removed" ? "−" : row.leftType === "unchanged" ? " " : "";
+            const rPrefix = row.rightType === "added" ? "+" : row.rightType === "unchanged" ? " " : "";
+            const leftNo = row.leftNo;
+            const rightNo = row.rightNo;
+            return (
+              <tr key={i}>
+                <td style={{ ...LINENO, background: lBg }}>{leftNo ?? ""}</td>
+                <td style={{ ...CELL, background: lBg, color: lColor, borderRight: "1px solid var(--bg-surface)" }}>
+                  {row.leftType !== "empty" && (
+                    <><span style={{ color: row.leftType === "removed" ? "var(--diff-del-prefix)" : "var(--text-faintest)", userSelect: "none" }}>{lPrefix}</span>{row.leftText}</>
+                  )}
+                </td>
+                <td style={{ ...LINENO, background: rBg }}>{rightNo ?? ""}</td>
+                <td style={{ ...CELL, background: rBg, color: rColor }}>
+                  {row.rightType !== "empty" && (
+                    <><span style={{ color: row.rightType === "added" ? "var(--diff-add-prefix)" : "var(--text-faintest)", userSelect: "none" }}>{rPrefix}</span>{row.rightText}</>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Code highlighting helpers ─────────────────────────────────────────────────
+
+function tryFormatJson(text: string): string | null {
+  const t = text.trim();
+  if (t[0] !== "{" && t[0] !== "[") return null;
+  try {
+    return JSON.stringify(JSON.parse(t), null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function yamlScalar(s: string, indent: number): string {
+  if (s === "") return '""';
+  if (s.includes("\n")) {
+    const chomp = s.endsWith("\n") ? "" : "-";
+    const pad = "  ".repeat(indent + 1);
+    return `|${chomp}\n` + s.replace(/\n$/, "").split("\n").map((l) => pad + l).join("\n");
+  }
+  const plain = !/^[\s\-\[\]{},!|>&%@`'"?#]/.test(s) &&
+    !s.includes(": ") && !s.includes(" #") &&
+    !/^(true|false|null|~)$/.test(s) && !/^\d/.test(s) &&
+    s !== "yes" && s !== "no" && s !== "on" && s !== "off";
+  if (plain) return s;
+  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n") + '"';
+}
+
+function yamlValue(val: unknown, indent: number): string {
+  const pad = "  ".repeat(indent);
+  if (val === null) return "null";
+  if (typeof val === "boolean" || typeof val === "number") return String(val);
+  if (typeof val === "string") return yamlScalar(val, indent);
+  if (Array.isArray(val)) {
+    if (val.length === 0) return "[]";
+    return val.map((v) => {
+      const child = yamlValue(v, indent + 1);
+      if (typeof v === "object" && v !== null) {
+        const lines = child.split("\n");
+        return `${pad}- ${lines[0].trimStart()}${lines.length > 1 ? "\n" + lines.slice(1).join("\n") : ""}`;
+      }
+      return `${pad}- ${child}`;
+    }).join("\n");
+  }
+  if (typeof val === "object") {
+    const entries = Object.entries(val as Record<string, unknown>);
+    if (entries.length === 0) return "{}";
+    return entries.map(([k, v]) => {
+      const needsQ = k === "" || /[:\s#\[\]{},"'|>&*!%@`?]/.test(k) || /^\d/.test(k);
+      const key = needsQ ? '"' + k.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"' : k;
+      if (typeof v === "object" && v !== null) {
+        if (Array.isArray(v) && v.length === 0) return `${pad}${key}: []`;
+        if (!Array.isArray(v) && Object.keys(v as object).length === 0) return `${pad}${key}: {}`;
+        return `${pad}${key}:\n${yamlValue(v, indent + 1)}`;
+      }
+      return `${pad}${key}: ${yamlValue(v, indent)}`;
+    }).join("\n");
+  }
+  return String(val);
+}
+
+function tryJsonToYaml(text: string): string | null {
+  const t = text.trim();
+  if (t[0] !== "{" && t[0] !== "[") return null;
+  try {
+    return yamlValue(JSON.parse(t), 0);
+  } catch {
+    return null;
+  }
+}
+
+function highlightCode(text: string, lang: string): string {
+  try {
+    if (lang && hljs.getLanguage(lang)) {
+      return hljs.highlight(text, { language: lang }).value;
+    }
+    return hljs.highlightAuto(text, ["json", "bash", "python", "typescript", "javascript", "yaml", "xml", "sql"]).value;
+  } catch {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+}
+
+const PRE_STYLE: React.CSSProperties = {
+  margin: 0, padding: "6px 8px",
+  background: "var(--bg-deep)", borderRadius: 4,
+  fontFamily: '"Ubuntu Sans Mono", monospace',
+  fontSize: "var(--conv-font-sm, 11.5px)",
+  lineHeight: 1.5, overflowX: "auto",
+  whiteSpace: "pre",
+};
+
+function FormatModal({ text, lang, allowMarkdown = false, onClose }: { text: string; lang: string; allowMarkdown?: boolean; onClose: () => void }) {
+  const [mdMode, setMdMode] = useState(false);
+  const codeHtml = useMemo(() => {
+    const formatted = lang === "json" ? (tryFormatJson(text) ?? text) : text;
+    return highlightCode(formatted, lang);
+  }, [text, lang]);
+  const mdHtml = useMemo(() => renderMarkdown(text), [text]);
+
+  const tabBtn = (active: boolean, label: string, onClick: () => void) => (
+    <button onClick={onClick} style={{
+      fontSize: 11, padding: "2px 10px", borderRadius: 4,
+      border: "none", cursor: "pointer",
+      background: active ? "var(--bg-hover)" : "transparent",
+      color: active ? "var(--text-primary)" : "var(--text-muted)",
+      fontWeight: active ? 600 : 400,
+    }}>{label}</button>
+  );
+
+  return createPortal(
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.78)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 32 }}
+      onClick={onClose}
+    >
+      <div
+        style={{ background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: 10, maxWidth: "85vw", width: "100%", maxHeight: "82vh", display: "flex", flexDirection: "column" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 14px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            {tabBtn(!mdMode, "Code", () => setMdMode(false))}
+            {allowMarkdown && tabBtn(mdMode, "Markdown", () => setMdMode(true))}
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: 20, lineHeight: 1, padding: "0 2px" }}>×</button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px" }}>
+          {mdMode ? (
+            <div
+              className="conv-markdown"
+              dangerouslySetInnerHTML={{ __html: mdHtml }}
+              style={{ color: "var(--text-primary)", fontSize: 13, lineHeight: 1.7 }}
+            />
+          ) : (
+            <pre style={{ ...PRE_STYLE, fontSize: 12.5, maxHeight: "none", background: "none" }}>
+              <code className="hljs" dangerouslySetInnerHTML={{ __html: codeHtml }} />
+            </pre>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function CopyButton({ getText }: { getText: () => string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    navigator.clipboard.writeText(getText()).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    });
+  };
+  return (
+    <button
+      onClick={handleCopy}
+      title="Copy"
+      style={{
+        position: "absolute", top: 5, right: 6,
+        background: "var(--bg-hover)", border: "1px solid var(--border)",
+        borderRadius: 4, color: copied ? "#3fb950" : "var(--text-faint)",
+        fontSize: 11, fontFamily: "monospace", padding: "1px 7px",
+        cursor: "pointer", lineHeight: 1.6, opacity: 0.85,
+        transition: "opacity 0.12s, color 0.12s",
+      }}
+      onMouseEnter={e => (e.currentTarget.style.opacity = "1")}
+      onMouseLeave={e => (e.currentTarget.style.opacity = "0.85")}
+    >
+      {copied ? "✓" : "⧉"}
+    </button>
+  );
+}
+
+// Detect cat -n style numbered output: lines like "   42\tcontent"
+const CAT_N_RE = /^ *\d+\t/;
+function isNumberedOutput(text: string): boolean {
+  const lines = text.split("\n").filter(l => l.length > 0).slice(0, 5);
+  return lines.length >= 2 && lines.every(l => CAT_N_RE.test(l));
+}
+
+function NumberedLines({ text, isError, showAll, isLarge, lang }: { text: string; isError: boolean; showAll: boolean; isLarge: boolean; lang?: string }) {
+  const display = isLarge && !showAll ? text.slice(0, 2000) : text;
+  const lines = display.split("\n");
+  // Pre-compute widest line number so every row's gutter has the same fixed width
+  const maxNumLen = lines.reduce((max, line) => {
+    const tab = line.indexOf("\t");
+    return tab === -1 ? max : Math.max(max, line.slice(0, tab).trim().length);
+  }, 4);
+  const gutterW = `${maxNumLen}ch`;
+  const useLang = lang && hljs.getLanguage(lang) ? lang : null;
+  return (
+    <div style={{
+      ...PRE_STYLE, padding: "6px 0",
+      color: isError ? "#f87171" : "var(--text-primary)",
+      maxHeight: showAll ? 600 : 300, overflowY: "auto",
+    }}>
+      {lines.map((line, i) => {
+        const tab = line.indexOf("\t");
+        if (tab === -1) {
+          return <div key={i} style={{ padding: "0 8px", whiteSpace: "pre" }}>{line || "\u00a0"}</div>;
+        }
+        const num = line.slice(0, tab);
+        const content = line.slice(tab + 1);
+        const html = useLang
+          ? hljs.highlight(content, { language: useLang, ignoreIllegals: true }).value
+          : content.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return (
+          <div key={i} style={{ display: "flex" }}>
+            <span style={{
+              flexShrink: 0, minWidth: gutterW, paddingLeft: "8px", paddingRight: "10px",
+              textAlign: "right", color: "var(--text-faint)", userSelect: "none",
+              whiteSpace: "nowrap",
+            }}>{num.trim()}</span>
+            <span
+              className={useLang ? "hljs" : undefined}
+              style={{ flex: 1, minWidth: 0, whiteSpace: "pre", paddingRight: "8px", background: "none" }}
+              dangerouslySetInnerHTML={{ __html: html }}
+            />
+          </div>
+        );
+      })}
+      {isLarge && !showAll && <div style={{ padding: "0 8px", color: "var(--text-faint)" }}>…</div>}
+    </div>
+  );
+}
+
+function CodeBlock({ text, lang, isError = false, allowMarkdown = false }: { text: string; lang: string; isError?: boolean; allowMarkdown?: boolean }) {
+  const [showAll, setShowAll] = useState(false);
+  const [showModal, setShowModal] = useState(false);
+  const isLarge = text.length > JSON_FORMAT_THRESHOLD;
+  const numbered = isNumberedOutput(text);
+
+  const html = useMemo(() => {
+    if (numbered) return "";
+    if (isLarge && !showAll) {
+      const preview = text.slice(0, 2000);
+      return preview.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+    const display = lang === "json" ? (tryFormatJson(text) ?? text) : text;
+    return highlightCode(display, lang);
+  }, [text, lang, isLarge, showAll, numbered]);
+
+  const btnStyle: React.CSSProperties = {
+    background: "var(--bg-surface)", border: "1px solid var(--border)",
+    borderRadius: 4, color: "var(--text-secondary)", fontSize: 10.5, fontFamily: "monospace",
+    padding: "2px 10px", cursor: "pointer",
+  };
+
+  return (
+    <div style={{ position: "relative" }}>
+      <CopyButton getText={() => text} />
+      {numbered
+        ? <NumberedLines text={text} isError={isError} showAll={showAll} isLarge={isLarge} lang={lang} />
+        : <pre style={{ ...PRE_STYLE, color: isError ? "#f87171" : "var(--text-primary)", maxHeight: showAll ? 600 : 300, overflowY: "auto" }}>
+            <code className="hljs" dangerouslySetInnerHTML={{ __html: html }} />
+            {isLarge && !showAll && <span style={{ color: "var(--text-faint)" }}>{"\n…"}</span>}
+          </pre>}
+
+      {isLarge && (
+        <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+          <button onClick={() => setShowAll((v) => !v)} style={btnStyle}>
+            {showAll ? "▲ Collapse" : "All"}
+          </button>
+          <button onClick={() => setShowModal(true)} style={{ ...btnStyle, color: "var(--accent-blue)" }}>
+            Pretty ↗
+          </button>
+        </div>
+      )}
+      {showModal && <FormatModal text={text} lang={lang} allowMarkdown={allowMarkdown} onClose={() => setShowModal(false)} />}
+    </div>
+  );
+}
+
+function AssistantMarkdown({ text }: { text: string }) {
+  const html = useMemo(() => renderMarkdown(text), [text]);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.querySelectorAll<HTMLPreElement>("pre.conv-code-block").forEach((pre) => {
+      if (pre.querySelector(".md-copy-btn")) return;
+      const code = pre.querySelector("code");
+      if (!code) return;
+      pre.style.position = "relative";
+      const btn = document.createElement("button");
+      btn.className = "md-copy-btn";
+      btn.textContent = "⧉";
+      btn.title = "Copy";
+      btn.style.cssText = [
+        "position:absolute", "top:5px", "right:6px",
+        "background:var(--bg-hover)", "border:1px solid var(--border)",
+        "border-radius:4px", "color:var(--text-faint)",
+        "font-size:11px", "font-family:monospace", "padding:1px 7px",
+        "cursor:pointer", "line-height:1.6", "opacity:0.85",
+        "transition:opacity 0.12s,color 0.12s",
+      ].join(";");
+      btn.addEventListener("mouseenter", () => { btn.style.opacity = "1"; });
+      btn.addEventListener("mouseleave", () => { btn.style.opacity = "0.85"; });
+      btn.addEventListener("click", () => {
+        navigator.clipboard.writeText(code.textContent ?? "").then(() => {
+          btn.textContent = "✓";
+          btn.style.color = "#3fb950";
+          setTimeout(() => { btn.textContent = "⧉"; btn.style.color = "var(--text-faint)"; }, 1200);
+        });
+      });
+      pre.appendChild(btn);
+    });
+  }, [html]);
+
+  return (
+    <div
+      ref={ref}
+      className="conv-markdown"
+      dangerouslySetInnerHTML={{ __html: html }}
+      style={{ padding: "2px 16px", color: "var(--text-primary)", fontSize: "var(--conv-font, 13px)", lineHeight: 1.7 }}
+    />
+  );
+}
+
+// ── Q&A reply block ───────────────────────────────────────────────────────────
+
+/** Extract numbered questions (lines matching "N. ...?" or "N) ...?") from text. */
+function parseQuestions(text: string): string[] {
+  const qs: string[] = [];
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*\d+[.)]\s+(.+\?)\s*$/);
+    if (m) qs.push(m[1].trim());
+  }
+  return qs;
+}
+
+const _dismissedQA = new Set<string>(); // entry UUIDs whose Q&A block was submitted
+
+function QAReplyBlock({ entryId, questions, onSubmit }: {
+  entryId: string;
+  questions: string[];
+  onSubmit: (text: string) => void;
+}) {
+  const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const [answers, setAnswers] = useState<string[]>(() => questions.map(() => ""));
+  const [dismissed, setDismissed] = useState(false);
+
+  if (dismissed || _dismissedQA.has(entryId)) return null;
+
+  const setAnswer = (i: number, val: string) => {
+    setAnswers(prev => { const n = [...prev]; n[i] = val; return n; });
+  };
+
+  const submit = () => {
+    const text = questions
+      .map((q, i) => `${i + 1}. ${q}\n   ${answers[i].trim() || "(skipped)"}`)
+      .join("\n\n");
+    _dismissedQA.add(entryId);
+    setDismissed(true);
+    onSubmit(text);
+  };
+
+  return (
+    <div style={{
+      margin: "6px 16px 2px",
+      padding: "10px 12px 12px",
+      border: "1px solid var(--bg-hover)",
+      borderRadius: 8,
+      background: "var(--bg-surface)",
+    }}>
+      <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        Answer the following
+      </div>
+      {questions.map((q, i) => (
+        <div key={i} style={{ marginBottom: i < questions.length - 1 ? 10 : 12 }}>
+          <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 4, lineHeight: 1.5 }}>
+            <span style={{ color: "var(--text-faint)", marginRight: 5 }}>{i + 1}.</span>{q}
+          </div>
+          <input
+            ref={el => { inputRefs.current[i] = el; }}
+            type="text"
+            value={answers[i]}
+            onChange={e => setAnswer(i, e.target.value)}
+            onKeyDown={e => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                if (i < questions.length - 1) inputRefs.current[i + 1]?.focus();
+                else submit();
+              } else if (e.key === "Tab") {
+                e.preventDefault();
+                const next = e.shiftKey ? i - 1 : i + 1;
+                if (next >= 0 && next < questions.length) inputRefs.current[next]?.focus();
+              }
+            }}
+            placeholder="Enter answer… (Enter for next)"
+            style={{
+              width: "100%", boxSizing: "border-box",
+              background: "var(--bg-base)", border: "1px solid var(--text-faintest)",
+              borderRadius: 4, padding: "5px 8px",
+              color: "var(--text-body)", fontSize: 12, outline: "none",
+            }}
+          />
+        </div>
+      ))}
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <button
+          onClick={submit}
+          style={{
+            fontSize: 12, padding: "4px 16px",
+            background: "#1e3a5f", color: "#93c5fd",
+            border: "1px solid rgba(88,166,255,0.35)", borderRadius: 4, cursor: "pointer",
+          }}
+        >
+          Submit ↵
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── AskUserQuestion display (read-only, for history) ─────────────────────────
+
+function AskUserQuestionDisplay({ questions, answer }: {
+  questions: AskQuestion[];
+  answer: string | null; // null = unanswered; non-null = the answer that was sent
+}) {
+  // Parse answer back to selected labels per question.
+  // Claude Code formats the tool_result as:
+  //   User has answered your questions: "Q1"="A1", "Q2"="A2", ...
+  // Extract answer values in order (order matches questions array).
+  const answeredLabels = useMemo((): Set<string>[] => {
+    const sets = questions.map(() => new Set<string>());
+    if (!answer) return sets;
+    const pairRe = /"[^"]*"="([^"]+)"/g;
+    let m: RegExpExecArray | null;
+    let qi = 0;
+    while ((m = pairRe.exec(answer)) !== null && qi < sets.length) {
+      for (const part of m[1].split(",").map(s => s.trim())) {
+        if (part) sets[qi].add(part);
+      }
+      qi++;
+    }
+    // Fallback for single-question plain text
+    if (qi === 0 && questions.length === 1) {
+      for (const part of answer.split(",").map(s => s.trim())) {
+        if (part) sets[0].add(part);
+      }
+    }
+    return sets;
+  }, [answer, questions]);
+
+  return (
+    <div style={{
+      margin: "4px 16px 2px",
+      border: "1px solid var(--border-subtle)",
+      borderRadius: 8,
+      background: "var(--bg-deep)",
+      overflow: "hidden",
+      opacity: answer !== null ? 0.85 : 1,
+    }}>
+      {/* Header */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 6,
+        padding: "6px 10px",
+        borderBottom: "1px solid var(--border-subtle)",
+      }}>
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+          <circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" />
+        </svg>
+        <span style={{ fontSize: 10.5, color: "var(--text-muted)", flex: 1 }}>
+          {questions.length === 1 ? (questions[0]?.header || "Agent Question") : "Agent Question"}
+        </span>
+        {answer !== null && (
+          <span style={{ fontSize: 10, color: "var(--accent-green)", display: "flex", alignItems: "center", gap: 3 }}>
+            <span>✓</span> Answered
+          </span>
+        )}
+      </div>
+
+      {/* Questions */}
+      <div style={{ padding: "8px 10px 10px", display: "flex", flexDirection: "column", gap: 10 }}>
+        {questions.map((q, qi) => {
+          const chosenWithPreview = q.options.filter(
+            o => answeredLabels[qi]?.has(o.label) && o.preview,
+          );
+          return (
+            <div key={qi}>
+              {questions.length > 1 && q.header && (
+                <div style={{ fontSize: 10, color: "var(--accent-blue)", fontWeight: 600, marginBottom: 2 }}>{q.header}</div>
+              )}
+              <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 6, lineHeight: 1.5 }}>{q.question}</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
+                {q.options.map(opt => {
+                  const chosen = answeredLabels[qi]?.has(opt.label);
+                  return (
+                    <div
+                      key={opt.label}
+                      title={opt.description}
+                      style={{
+                        padding: "3px 9px",
+                        borderRadius: 4,
+                        fontSize: 11,
+                        border: `1px solid ${chosen ? "var(--accent-blue)" : "var(--border)"}`,
+                        background: chosen ? "rgba(83,155,245,0.12)" : "transparent",
+                        color: chosen ? "var(--accent-blue)" : "var(--text-faint)",
+                        fontWeight: chosen ? 600 : 400,
+                      }}
+                    >
+                      {chosen && <span style={{ marginRight: 4 }}>✓</span>}
+                      {opt.label}
+                    </div>
+                  );
+                })}
+                {answer !== null && (() => {
+                  const custom = [...(answeredLabels[qi] ?? [])].filter(l => !q.options.find(o => o.label === l));
+                  if (custom.length === 0) return null;
+                  return (
+                    <>
+                      <span style={{ color: "var(--border-strong)", fontSize: 13, userSelect: "none", padding: "0 2px" }}>|</span>
+                      <div style={{
+                        padding: "3px 9px", borderRadius: 4, fontSize: 11,
+                        border: "1px solid var(--accent-blue)",
+                        background: "rgba(83,155,245,0.08)",
+                        color: "var(--accent-blue)",
+                      }}>
+                        {custom.join(", ")}
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+              {/* Preview of the chosen option(s), so the historical decision keeps its context */}
+              {chosenWithPreview.map(opt => (
+                <pre
+                  key={opt.label}
+                  style={{
+                    marginTop: 6, marginBottom: 0,
+                    padding: "6px 8px",
+                    background: "var(--bg-deep)",
+                    border: "1px solid var(--border-subtle)",
+                    borderRadius: 4,
+                    fontSize: 10.5, lineHeight: 1.35,
+                    color: "var(--text-secondary)",
+                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                    overflow: "auto",
+                    whiteSpace: "pre",
+                  }}
+                >{opt.preview}</pre>
+              ))}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── AskUserQuestion interactive block ────────────────────────────────────────
+
+interface AskOption { label: string; description?: string; preview?: string }
+interface AskQuestion { header?: string; question: string; multiSelect?: boolean; options: AskOption[] }
+
+// Persist dismissed block IDs in sessionStorage so page refreshes don't re-show
+// answered questions while Claude Code is still processing the response.
+const _AUQ_SS_KEY = "cm_auq_dismissed";
+function _auqLoadDismissed(): Set<string> {
+  try { return new Set(JSON.parse(sessionStorage.getItem(_AUQ_SS_KEY) || "[]")); }
+  catch { return new Set(); }
+}
+function _auqPersist(set: Set<string>) {
+  try { sessionStorage.setItem(_AUQ_SS_KEY, JSON.stringify([...set])); } catch {}
+}
+const _dismissedAUQ = _auqLoadDismissed();
+
+// ── TodoWrite / TodoRead ──────────────────────────────────────────────────────
+
+interface TodoItem { id?: string; content: string; status: "pending" | "in_progress" | "completed"; priority?: "high" | "medium" | "low" }
+
+function TodoListBlock({ block, result }: {
+  block: RawContentBlock;
+  result?: { content: string; isError: boolean };
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const input = (block.input as Record<string, unknown>) || {};
+  const name = (block.name as string) || "TodoWrite";
+
+  // TodoRead: show result todos if available; TodoWrite: show input todos
+  let todos: TodoItem[] = [];
+  if (name === "TodoRead" && result?.content) {
+    try { todos = JSON.parse(result.content); } catch { todos = []; }
+  } else if (Array.isArray(input.todos)) {
+    todos = input.todos as TodoItem[];
+  }
+
+  const done = todos.filter((t) => t.status === "completed").length;
+  const active = todos.filter((t) => t.status === "in_progress").length;
+  const total = todos.length;
+
+  const statusIcon = (s: TodoItem["status"]) =>
+    s === "completed" ? "✓" : s === "in_progress" ? "▶" : "○";
+  const statusColor = (s: TodoItem["status"]) =>
+    s === "completed" ? "var(--accent-green)" : s === "in_progress" ? "var(--accent-amber)" : "var(--text-faint)";
+
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          width: "100%", background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+          borderRadius: expanded ? "6px 6px 0 0" : 6, padding: "6px 10px",
+          cursor: "pointer", gap: 8, textAlign: "left",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0 }}>
+          <span style={{ fontSize: "var(--conv-font-sm, 11px)", marginRight: 1 }}>📋</span>
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font, 12.5px)", fontWeight: 700, color: "var(--text-bright)", flexShrink: 0 }}>
+            {name}
+          </span>
+          {total > 0 && (
+            <>
+              {/* Progress bar */}
+              <div style={{ width: 48, height: 4, borderRadius: 2, background: "var(--bg-hover)", overflow: "hidden", flexShrink: 0, position: "relative" }}>
+                {done > 0 && <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${(done / total) * 100}%`, background: "var(--accent-green)", borderRadius: 2 }} />}
+                {active > 0 && <div style={{ position: "absolute", left: `${(done / total) * 100}%`, top: 0, height: "100%", width: `${(active / total) * 100}%`, background: "#f59e0b66", borderRadius: 2 }} />}
+              </div>
+              <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11px)", color: "var(--text-muted)" }}>{done}/{total}</span>
+              {active > 0 && <span style={{ fontSize: 10, color: "var(--accent-amber)", background: "#f59e0b18", border: "1px solid #f59e0b40", borderRadius: 3, padding: "0 5px" }}>{active} active</span>}
+            </>
+          )}
+        </div>
+        <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+      {expanded && (
+        <div style={{
+          background: "var(--bg-base)", border: "1px solid var(--bg-hover)", borderTop: "none",
+          borderRadius: "0 0 6px 6px", padding: "6px 10px", display: "flex", flexDirection: "column", gap: 1,
+        }}>
+          {todos.length === 0 ? (
+            <div style={{ fontSize: "var(--conv-font-sm, 11px)", color: "var(--text-faint)", padding: "2px 0" }}>No todos</div>
+          ) : todos.map((todo, i) => (
+            <div key={todo.id ?? i} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "3px 0" }}>
+              <span style={{ fontSize: "var(--conv-font-sm, 11px)", color: statusColor(todo.status), flexShrink: 0, marginTop: 1, fontFamily: "monospace" }}>
+                {statusIcon(todo.status)}
+              </span>
+              <span style={{
+                fontSize: "var(--conv-font, 12.5px)", lineHeight: 1.5, flex: 1,
+                color: todo.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
+                textDecoration: todo.status === "completed" ? "line-through" : "none",
+              }}>
+                {todo.content}
+              </span>
+              {todo.priority && (
+                <span style={{ fontSize: 9, flexShrink: 0, padding: "1px 5px", borderRadius: 3, fontFamily: "monospace", fontWeight: 700, letterSpacing: "0.3px",
+                  background: todo.priority === "high" ? "#7f1d1d40" : todo.priority === "medium" ? "#78350f40" : "var(--bg-surface)",
+                  color: todo.priority === "high" ? "#fca5a5" : todo.priority === "medium" ? "#fcd34d" : "var(--text-faint)",
+                }}>
+                  {todo.priority[0].toUpperCase()}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── TaskCreate / TaskUpdate — task group ─────────────────────────────────────
+
+const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskStop", "TaskOutput"]);
+
+interface TaskUpdateLog { status?: string; blockedBy?: string[]; subject?: string; description?: string }
+interface TaskState {
+  id: string;
+  subject: string;
+  description?: string;
+  status: "pending" | "in_progress" | "completed" | "failed";
+  updates: TaskUpdateLog[];
+}
+
+function buildTaskStates(blocks: RawContentBlock[]): TaskState[] {
+  const tasks: TaskState[] = [];
+  let nextId = 1;
+  for (const b of blocks) {
+    const name = b.name as string;
+    const inp = (b.input as Record<string, unknown>) || {};
+    if (name === "TaskCreate") {
+      tasks.push({
+        id: String(nextId++),
+        subject: String(inp.subject ?? inp.title ?? `Task ${tasks.length + 1}`),
+        description: inp.description ? String(inp.description) : undefined,
+        status: "pending",
+        updates: [],
+      });
+    } else if (name === "TaskUpdate") {
+      const tid = String(inp.taskId ?? "");
+      const task = tasks.find((t) => t.id === tid);
+      if (task) {
+        const log: TaskUpdateLog = {};
+        if (inp.status) { task.status = inp.status as TaskState["status"]; log.status = String(inp.status); }
+        if (inp.subject) { task.subject = String(inp.subject); log.subject = String(inp.subject); }
+        if (inp.description) { task.description = String(inp.description); log.description = String(inp.description); }
+        if (Array.isArray(inp.addBlockedBy) && inp.addBlockedBy.length > 0) {
+          log.blockedBy = (inp.addBlockedBy as unknown[]).map(String);
+        }
+        if (Object.keys(log).length > 0) task.updates.push(log);
+      }
+    }
+  }
+  return tasks;
+}
+
+function TaskUpdateEntry({ log }: { log: TaskUpdateLog }) {
+  const [descExpanded, setDescExpanded] = useState(false);
+  const DESC_PREVIEW = 120;
+
+  const statusColor =
+    log.status === "completed" ? "#4ade80"
+    : log.status === "failed" ? "#f87171"
+    : log.status === "in_progress" ? "#60a5fa"
+    : "var(--text-faint)";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 11, lineHeight: 1.4 }}>
+      {log.status && (
+        <div style={{ color: statusColor, fontFamily: "monospace" }}>→ {log.status}</div>
+      )}
+      {log.blockedBy && log.blockedBy.length > 0 && (
+        <div style={{ color: "#fb923c" }}>blocked by: #{log.blockedBy.join(", #")}</div>
+      )}
+      {log.subject && (
+        <div style={{ color: "var(--text-secondary)", wordBreak: "break-word" }}>
+          <span style={{ color: "var(--text-faint)", marginRight: 4 }}>subject:</span>{log.subject}
+        </div>
+      )}
+      {log.description && (
+        <div style={{ color: "var(--text-faint)", wordBreak: "break-word" }}>
+          <span style={{ marginRight: 4 }}>desc:</span>
+          {log.description.length <= DESC_PREVIEW || descExpanded
+            ? log.description
+            : log.description.slice(0, DESC_PREVIEW) + "…"}
+          {log.description.length > DESC_PREVIEW && (
+            <button
+              onClick={() => setDescExpanded(e => !e)}
+              style={{ marginLeft: 4, fontSize: 10, color: "var(--accent-blue)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+            >
+              {descExpanded ? "less" : "more"}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TaskGroupBlock({ blocks }: { blocks: RawContentBlock[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const tasks = buildTaskStates(blocks);
+
+  const done = tasks.filter((t) => t.status === "completed").length;
+  const active = tasks.filter((t) => t.status === "in_progress").length;
+  const failed = tasks.filter((t) => t.status === "failed").length;
+  const total = tasks.length;
+
+  const updateOps = blocks.filter((b) => b.name === "TaskUpdate").length;
+
+  const statusIcon = (s: TaskState["status"]) =>
+    s === "completed" ? "✓" : s === "in_progress" ? "▶" : s === "failed" ? "✗" : "○";
+  const statusColor = (s: TaskState["status"]) =>
+    s === "completed" ? "var(--accent-green)"
+    : s === "in_progress" ? "var(--accent-amber)"
+    : s === "failed" ? "var(--accent-red)"
+    : "var(--text-faint)";
+
+  const summary = total > 0
+    ? `${total} task${total > 1 ? "s" : ""}${done > 0 ? ` · ${done}/${total} done` : ""}${active > 0 ? ` · ${active} active` : ""}${failed > 0 ? ` · ${failed} failed` : ""}`
+    : updateOps > 0
+      ? `${updateOps} update${updateOps !== 1 ? "s" : ""}`
+      : `${blocks.length} op${blocks.length !== 1 ? "s" : ""}`;
+
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          width: "100%", background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+          borderRadius: expanded ? "6px 6px 0 0" : 6, padding: "6px 10px",
+          cursor: "pointer", gap: 8, textAlign: "left",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0 }}>
+          <span style={{ fontSize: "var(--conv-font-sm, 11px)", marginRight: 1 }}>⎇</span>
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font, 12.5px)", fontWeight: 700, color: "var(--text-bright)", flexShrink: 0 }}>Tasks</span>
+          {total > 0 && (
+            <div style={{ width: 48, height: 4, borderRadius: 2, background: "var(--bg-hover)", overflow: "hidden", flexShrink: 0, position: "relative" }}>
+              {done > 0 && <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${(done / total) * 100}%`, background: "var(--accent-green)", borderRadius: 2 }} />}
+              {active > 0 && <div style={{ position: "absolute", left: `${(done / total) * 100}%`, top: 0, height: "100%", width: `${(active / total) * 100}%`, background: "#f59e0b66", borderRadius: 2 }} />}
+              {failed > 0 && <div style={{ position: "absolute", right: 0, top: 0, height: "100%", width: `${(failed / total) * 100}%`, background: "#f8714866", borderRadius: 2 }} />}
+            </div>
+          )}
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11px)", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {summary}
+          </span>
+        </div>
+        <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+      {expanded && (
+        <div style={{
+          background: "var(--bg-base)", border: "1px solid var(--bg-hover)", borderTop: "none",
+          borderRadius: "0 0 6px 6px", padding: "6px 10px", display: "flex", flexDirection: "column", gap: 1,
+        }}>
+          {tasks.length === 0 ? (
+            blocks.map((b, i) => {
+              const inp = (b.input as Record<string, unknown>) || {};
+              if (b.name === "TaskUpdate") {
+                const tid = String(inp.taskId ?? "?");
+                const log: TaskUpdateLog = {};
+                if (inp.status) log.status = String(inp.status);
+                if (inp.subject) log.subject = String(inp.subject);
+                if (inp.description) log.description = String(inp.description);
+                if (Array.isArray(inp.addBlockedBy) && inp.addBlockedBy.length > 0)
+                  log.blockedBy = (inp.addBlockedBy as unknown[]).map(String);
+                return (
+                  <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "4px 0", borderBottom: "1px solid var(--bg-hover)" }}>
+                    <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0, marginTop: 3, fontFamily: "monospace", minWidth: 14, textAlign: "right" }}>
+                      #{tid}
+                    </span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <TaskUpdateEntry log={log} />
+                    </div>
+                  </div>
+                );
+              }
+              return (
+                <div key={i} style={{ fontSize: "var(--conv-font-sm, 11px)", color: "var(--text-muted)", padding: "2px 0", fontFamily: "monospace" }}>
+                  {b.name as string}
+                </div>
+              );
+            })
+          ) : tasks.map((task) => (
+            <div key={task.id} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "4px 0", borderBottom: "1px solid var(--bg-hover)" }}>
+              <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0, marginTop: 3, fontFamily: "monospace", minWidth: 14, textAlign: "right" }}>
+                {task.id}
+              </span>
+              <span style={{ fontSize: "var(--conv-font-sm, 11px)", color: statusColor(task.status), flexShrink: 0, marginTop: 2, fontFamily: "monospace" }}>
+                {statusIcon(task.status)}
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{
+                  fontSize: "var(--conv-font, 12.5px)", lineHeight: 1.5,
+                  color: task.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
+                  textDecoration: task.status === "completed" ? "line-through" : "none",
+                  wordBreak: "break-word",
+                }}>
+                  {task.subject}
+                </div>
+                {task.description && task.status !== "completed" && (
+                  <div style={{ fontSize: "var(--conv-font-sm, 11px)", color: "var(--text-faint)", lineHeight: 1.4, marginTop: 1, wordBreak: "break-word" }}>
+                    {task.description}
+                  </div>
+                )}
+                {task.updates.length > 0 && (
+                  <div style={{ marginTop: 4, borderLeft: "2px solid var(--bg-hover)", paddingLeft: 6, display: "flex", flexDirection: "column", gap: 3 }}>
+                    {task.updates.map((u, ui) => (
+                      <TaskUpdateEntry key={ui} log={u} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── ExitPlanMode — plan approval ──────────────────────────────────────────────
+
+const _PLAN_SS_KEY = "cm_plan_dismissed";
+function _planLoadDismissed(): Set<string> {
+  try { return new Set(JSON.parse(sessionStorage.getItem(_PLAN_SS_KEY) || "[]")); }
+  catch { return new Set(); }
+}
+function _planPersist(set: Set<string>) {
+  try { sessionStorage.setItem(_PLAN_SS_KEY, JSON.stringify([...set])); } catch {}
+}
+const _dismissedPlan = _planLoadDismissed();
+
+function PlanHistoryBlock({ planText, approved, feedback }: {
+  planText?: string;
+  approved: boolean;
+  feedback?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const hasPlan = !!planText;
+
+  return (
+    <div style={{ margin: "2px 16px", border: `1px solid ${approved ? "#166534" : "#7f1d1d"}`, borderRadius: 8, overflow: "hidden", background: "var(--bg-surface)" }}>
+      <button
+        onClick={() => hasPlan && setExpanded(!expanded)}
+        style={{
+          width: "100%", display: "flex", alignItems: "center", gap: 8,
+          padding: "7px 14px", background: approved ? "#0a1f0a" : "#1a0808",
+          border: "none", cursor: hasPlan ? "pointer" : "default", textAlign: "left",
+        }}
+      >
+        <span style={{ color: approved ? "#4ade80" : "#f87171", fontSize: 14 }}>{approved ? "✓" : "✗"}</span>
+        <span style={{ fontWeight: 600, fontSize: 13, color: approved ? "#86efac" : "#fca5a5", flex: 1 }}>
+          Plan {approved ? "approved" : "rejected"}
+        </span>
+        {feedback && <span style={{ fontSize: 11, color: "var(--text-muted)", fontStyle: "italic", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 200 }}>{feedback}</span>}
+        {hasPlan && <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>}
+      </button>
+      {expanded && planText && (
+        <div
+          className="conv-markdown"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(planText) }}
+          style={{ padding: "12px 16px", maxHeight: "55vh", overflowY: "auto", fontSize: 13, lineHeight: 1.65, borderTop: `1px solid ${approved ? "#166534" : "#7f1d1d"}` }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Tool Approval Block ──────────────────────────────────────────────────────
+function ToolApprovalBlock({ sessionId, toolName, toolInput, onDone }: {
+  sessionId: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  onDone: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  if (dismissed) return null;
+
+  const decide = async (decision: "allow" | "deny") => {
+    setBusy(true);
+    try { await approveToolRequest(sessionId, decision); } catch {}
+    setDismissed(true);
+    onDone();
+  };
+
+  const toolIcons: Record<string, string> = {
+    Bash: "⚡", Write: "✏️", Edit: "✏️", MultiEdit: "✏️",
+    Read: "📄", WebFetch: "🌐", WebSearch: "🔍",
+  };
+  const icon = toolIcons[toolName] ?? "🔧";
+
+  // Format the key detail for display
+  const detail = (() => {
+    if (toolName === "Bash") return String(toolInput.command ?? "");
+    if (toolName === "Write" || toolName === "Read") return String(toolInput.file_path ?? "");
+    if (toolName === "Edit" || toolName === "MultiEdit") return String(toolInput.file_path ?? "");
+    if (toolName === "WebFetch") return String(toolInput.url ?? "");
+    if (toolName === "WebSearch") return String(toolInput.query ?? "");
+    const first = Object.values(toolInput)[0];
+    return first != null ? String(first) : "";
+  })();
+
+  return (
+    <div style={{
+      margin: "8px 16px", borderRadius: 10,
+      border: "1px solid rgba(234,179,8,0.35)",
+      background: "rgba(234,179,8,0.06)",
+      overflow: "hidden",
+    }}>
+      <div style={{ padding: "10px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 15 }}>{icon}</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-body)" }}>
+            Claude wants to {toolName === "Bash" ? "run a command" : toolName === "WebFetch" ? "fetch a URL" : toolName === "WebSearch" ? "search the web" : `use ${toolName}`}
+          </span>
+        </div>
+        {detail && (
+          <code style={{
+            display: "block", fontSize: 12, fontFamily: "monospace",
+            background: "var(--bg-main)", padding: "6px 10px", borderRadius: 6,
+            color: "var(--text-secondary)", wordBreak: "break-all",
+            maxHeight: 120, overflowY: "auto", whiteSpace: "pre-wrap",
+          }}>
+            {detail.length > 500 ? detail.slice(0, 500) + "…" : detail}
+          </code>
+        )}
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            disabled={busy}
+            onClick={() => decide("allow")}
+            style={{
+              flex: 1, padding: "7px 0", borderRadius: 7, fontSize: 13, fontWeight: 600,
+              background: "rgba(34,197,94,0.15)", color: "#4ade80",
+              border: "1px solid rgba(34,197,94,0.35)", cursor: busy ? "not-allowed" : "pointer",
+            }}
+          >
+            ✓ Allow
+          </button>
+          <button
+            disabled={busy}
+            onClick={() => decide("deny")}
+            style={{
+              flex: 1, padding: "7px 0", borderRadius: 7, fontSize: 13, fontWeight: 600,
+              background: "rgba(239,68,68,0.1)", color: "#f87171",
+              border: "1px solid rgba(239,68,68,0.3)", cursor: busy ? "not-allowed" : "pointer",
+            }}
+          >
+            ✕ Deny
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlanApprovalBlock({ blockId, planText, onSubmit }: {
+  blockId: string;
+  planText?: string;
+  onSubmit: (text: string) => void;
+}) {
+  const [dismissed, setDismissed] = useState(false);
+  type Mode = "normal" | "edit" | "reject";
+  const [mode, setMode] = useState<Mode>("normal");
+  const [editedPlan, setEditedPlan] = useState(planText ?? "");
+  const [feedback, setFeedback] = useState("");
+
+  if (dismissed || _dismissedPlan.has(blockId)) return null;
+
+  const dismiss = (text: string) => {
+    _dismissedPlan.add(blockId);
+    _planPersist(_dismissedPlan);
+    setDismissed(true);
+    onSubmit(text);
+  };
+
+  const baseBtn: React.CSSProperties = {
+    fontSize: 12, padding: "5px 14px", borderRadius: 5, cursor: "pointer", fontWeight: 600, border: "1px solid transparent",
+  };
+
+  return (
+    <div style={{ margin: "4px 16px 8px", border: "1px solid #4c1d95", borderRadius: 8, overflow: "hidden", background: "var(--bg-surface)" }}>
+      {/* Header */}
+      <div style={{ padding: "7px 14px", borderBottom: "1px solid #2a1f3d", display: "flex", alignItems: "center", gap: 8, background: "#160c2a" }}>
+        <span style={{ color: "#8b5cf6", fontSize: 14 }}>✓</span>
+        <span style={{ fontWeight: 600, fontSize: 13, color: "#c4b5fd" }}>Plan ready for approval</span>
+        <span style={{ fontSize: 10, color: "#6d28d9", marginLeft: "auto", fontFamily: "monospace" }}>ExitPlanMode</span>
+      </div>
+      {/* Plan content (only show if planText is provided and not in edit mode) */}
+      {planText && mode !== "edit" && (
+        <div
+          className="conv-markdown"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(planText) }}
+          style={{ padding: "12px 16px", maxHeight: "55vh", overflowY: "auto", fontSize: 13, lineHeight: 1.65, borderBottom: "1px solid #2a1f3d" }}
+        />
+      )}
+      {/* Edit mode: editable textarea */}
+      {mode === "edit" && (
+        <div style={{ padding: "10px 14px 6px" }}>
+          <textarea
+            value={editedPlan}
+            onChange={(e) => setEditedPlan(e.target.value)}
+            autoFocus
+            style={{
+              width: "100%", minHeight: 200, boxSizing: "border-box",
+              background: "var(--bg-base)", border: "1px solid #4c1d95", borderRadius: 4,
+              color: "var(--text-primary)", fontSize: 12.5, padding: "8px 12px",
+              resize: "vertical", outline: "none", fontFamily: "monospace", lineHeight: 1.6,
+            }}
+          />
+        </div>
+      )}
+      {/* Reject mode: feedback textarea */}
+      {mode === "reject" && (
+        <div style={{ padding: "10px 14px 6px" }}>
+          <textarea
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            placeholder="Tell Claude what to change…"
+            autoFocus
+            style={{
+              width: "100%", minHeight: 72, boxSizing: "border-box",
+              background: "var(--bg-base)", border: "1px solid #7f1d1d", borderRadius: 4,
+              color: "var(--text-primary)", fontSize: 12.5, padding: "6px 10px",
+              resize: "vertical", outline: "none", fontFamily: "inherit", lineHeight: 1.5,
+            }}
+          />
+        </div>
+      )}
+      {/* Actions */}
+      <div style={{ padding: "8px 14px", display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        {mode === "normal" && (
+          <>
+            <button onClick={() => setMode("reject")} style={{ ...baseBtn, background: "#3a1a1a", color: "#f87171", borderColor: "#7f1d1d" }}>Reject</button>
+            {planText && <button onClick={() => setMode("edit")} style={{ ...baseBtn, background: "#1e0f44", color: "#c4b5fd", borderColor: "#4c1d95" }}>Edit</button>}
+            <button onClick={() => dismiss("Approved")} style={{ ...baseBtn, background: "#1a3a1a", color: "#4ade80", borderColor: "#166534" }}>Approve ✓</button>
+          </>
+        )}
+        {mode === "edit" && (
+          <>
+            <button onClick={() => setMode("normal")} style={{ ...baseBtn, background: "var(--bg-hover)", color: "var(--text-secondary)", borderColor: "var(--border)" }}>Cancel</button>
+            <button onClick={() => dismiss(editedPlan.trim() || "Approved")} style={{ ...baseBtn, background: "#1a3a1a", color: "#4ade80", borderColor: "#166534" }}>Approve edited ✓</button>
+          </>
+        )}
+        {mode === "reject" && (
+          <>
+            <button onClick={() => setMode("normal")} style={{ ...baseBtn, background: "var(--bg-hover)", color: "var(--text-secondary)", borderColor: "var(--border)" }}>Back</button>
+            <button onClick={() => dismiss(feedback.trim() || "Rejected")} style={{ ...baseBtn, background: "#3a1a1a", color: "#f87171", borderColor: "#7f1d1d" }}>Reject plan</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
+  blockId: string;
+  questions: AskQuestion[];
+  onSubmitAnswers: (answers: unknown[]) => void;
+}) {
+  const total = questions.length;
+  // step: which question we're on (wizard mode for multi-question)
+  const [step, setStep] = useState(0);
+  // per-question: selected option labels
+  const [selections, setSelections] = useState<Set<string>[]>(() => questions.map(() => new Set()));
+  // per-question: custom "Other / Type Something" free-text
+  const [customs, setCustoms] = useState<string[]>(() => questions.map(() => ""));
+  // per-question: user-forced multi-select override (for originally single-select questions)
+  const [multiOverrides, setMultiOverrides] = useState<boolean[]>(() => questions.map(() => false));
+  const [dismissed, setDismissed] = useState(false);
+  const otherRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+
+  const q = questions[Math.min(step, total - 1)];
+  const isLast = step === total - 1;
+  const effectiveMulti = (q.multiSelect ?? false) || multiOverrides[step];
+  const canToggleMode = !(q.multiSelect ?? false); // only when originally single-select
+
+  const curSelections = selections[step] ?? new Set<string>();
+  const curCustom = customs[step] ?? "";
+  const hasAnswer = curSelections.size > 0 || curCustom.trim().length > 0;
+  const allAnswered = questions.every((_, i) => (selections[i]?.size ?? 0) > 0 || (customs[i]?.trim().length ?? 0) > 0);
+
+  const questionHtml = useMemo(() => renderMarkdown(q.question), [q.question]);
+
+  if (dismissed || _dismissedAUQ.has(blockId)) return null;
+
+  const toggleOption = (label: string) => {
+    setSelections(prev => {
+      const next = prev.map(s => new Set(s));
+      if (effectiveMulti) {
+        if (next[step].has(label)) next[step].delete(label); else next[step].add(label);
+      } else {
+        next[step] = new Set([label]);
+      }
+      return next;
+    });
+  };
+
+  const setCustom = (val: string) => {
+    setCustoms(prev => { const n = [...prev]; n[step] = val; return n; });
+  };
+
+  // Build answer for ONE question:
+  //   single-select/text → string
+  //   multi-select       → array of explicit TUI action objects, one per row, in order
+  const buildAnswer = (qi: number, sels: Set<string>, custom: string) => {
+    const q_i = questions[qi];
+    const isMulti = (q_i.multiSelect ?? false) || multiOverrides[qi];
+    if (isMulti) {
+      return [
+        ...q_i.options.map(opt => ({ type: "option" as const, click: sels.has(opt.label) })),
+        { type: "type_something" as const, value: custom.trim() },
+        { type: "submit" as const },
+      ];
+    }
+    if (custom.trim()) return custom.trim();
+    return [...sels][0] ?? q_i.options[0]?.label ?? "";
+  };
+
+  const _dismiss = () => {
+    _dismissedAUQ.add(blockId);
+    _auqPersist(_dismissedAUQ);
+    setDismissed(true);
+  };
+
+  const doSubmit = () => {
+    _dismiss();
+    const answers = Array.from({ length: total }, (_, i) =>
+      buildAnswer(i, selections[i] ?? new Set(), customs[i] ?? "")
+    );
+    onSubmitAnswers(answers);
+  };
+
+  const doDecline = () => {
+    _dismiss();
+    onSubmitAnswers(questions.map(q_i => q_i.options[0]?.label ?? ""));
+  };
+
+  // auto-resize "Other" textarea
+  const resizeOther = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  };
+
+  // Click handler for option buttons
+  const handleOptionClick = (label: string) => {
+    if (!effectiveMulti && total === 1 && curCustom.trim() === "") {
+      // Single-question single-select: immediate submit
+      _dismiss();
+      onSubmitAnswers([label]);
+      return;
+    }
+    toggleOption(label);
+    // Single-select non-last step: auto-advance the wizard UI only (answer sent on Submit)
+    if (!effectiveMulti && step < total - 1) {
+      setTimeout(() => setStep(s => s + 1), 120);
+    }
+  };
+
+  return (
+    <div style={{
+      margin: "6px 16px 2px",
+      border: "1px solid var(--border)",
+      borderRadius: 8,
+      background: "var(--bg-surface)",
+      overflow: "hidden",
+    }}>
+      {/* Header bar */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 8,
+        padding: "8px 12px",
+        borderBottom: "1px solid var(--border-subtle)",
+        background: "var(--bg-deep)",
+      }}>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" />
+        </svg>
+        <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-secondary)", flex: 1 }}>
+          {total === 1 ? (q.header || "Select") : "Select"}
+        </span>
+        {/* Step indicator dots for multi-question */}
+        {total > 1 && (
+          <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+            {questions.map((_, i) => {
+              const done = selections[i].size > 0 || (customs[i]?.trim().length ?? 0) > 0;
+              const active = i === step;
+              return (
+                <button
+                  key={i}
+                  onClick={() => setStep(i)}
+                  style={{
+                    width: active ? 16 : 7, height: 7,
+                    borderRadius: 4, border: "none", padding: 0, cursor: "pointer",
+                    background: active ? "var(--accent-blue)" : done ? "var(--accent-green)" : "var(--border-strong)",
+                    transition: "width 0.15s, background 0.15s",
+                  }}
+                />
+              );
+            })}
+            <span style={{ fontSize: 10, color: "var(--text-faint)", marginLeft: 2 }}>{step + 1}/{total}</span>
+          </div>
+        )}
+        {/* Single/multi toggle */}
+        {canToggleMode && (
+          <button
+            onClick={() => setMultiOverrides(prev => { const n = [...prev]; n[step] = !n[step]; return n; })}
+            title="Toggle single/multi-select"
+            style={{
+              fontSize: 10, padding: "2px 7px", borderRadius: 3,
+              border: `1px solid ${effectiveMulti ? "var(--accent-amber)" : "var(--border)"}`,
+              background: effectiveMulti ? "rgba(198,144,38,0.12)" : "transparent",
+              color: effectiveMulti ? "var(--accent-amber)" : "var(--text-muted)",
+              cursor: "pointer",
+            }}
+          >
+            {effectiveMulti ? "Multi" : "Single"}
+          </button>
+        )}
+      </div>
+
+      {/* Question body */}
+      <div style={{ padding: "12px 14px 14px" }}>
+        {/* Per-question sub-header (multi-question only) */}
+        {total > 1 && q.header && (
+          <div style={{ fontSize: 11, color: "var(--accent-blue)", fontWeight: 600, marginBottom: 4 }}>{q.header}</div>
+        )}
+        {/* Question text */}
+        <div
+          className="conv-markdown"
+          dangerouslySetInnerHTML={{ __html: questionHtml }}
+          style={{ fontSize: 13, color: "var(--text-primary)", marginBottom: 10, lineHeight: 1.6 }}
+        />
+
+        {(() => {
+          // When any option has a preview, force the vertical-card layout even for
+          // single-select — inline chips can't show preview/description meaningfully.
+          const hasPreview = q.options.some(o => o.preview);
+          const useCards = effectiveMulti || hasPreview;
+          if (!useCards) return null;
+          const isCheckbox = effectiveMulti;
+          return (
+            <>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 8 }}>
+                {q.options.map((opt) => {
+                  const selected = curSelections.has(opt.label);
+                  return (
+                    <button
+                      key={opt.label}
+                      onClick={() => handleOptionClick(opt.label)}
+                      style={{
+                        textAlign: "left", padding: "7px 10px",
+                        border: `1px solid ${selected ? "var(--accent-blue)" : "var(--border)"}`,
+                        borderRadius: 5, cursor: "pointer",
+                        background: selected ? "rgba(83,155,245,0.12)" : "var(--bg-base)",
+                        color: selected ? "var(--accent-blue)" : "var(--text-body)",
+                        transition: "border-color 0.12s, background 0.12s",
+                      }}
+                    >
+                      <div style={{ fontSize: 12, fontWeight: selected ? 600 : 400, display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{
+                          display: "inline-flex", alignItems: "center", justifyContent: "center",
+                          width: 13, height: 13, borderRadius: isCheckbox ? 3 : 999, flexShrink: 0,
+                          border: `1.5px solid ${selected ? "var(--accent-blue)" : "var(--border-strong)"}`,
+                          background: selected ? "var(--accent-blue)" : "transparent",
+                          fontSize: 9, color: "#fff",
+                        }}>
+                          {selected ? (isCheckbox ? "✓" : "●") : ""}
+                        </span>
+                        {opt.label}
+                      </div>
+                      {opt.description && (
+                        <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2, paddingLeft: 19 }}>{opt.description}</div>
+                      )}
+                      {opt.preview && (
+                        <pre style={{
+                          marginTop: 6, marginBottom: 0, marginLeft: 19,
+                          padding: "6px 8px",
+                          background: "var(--bg-deep)",
+                          border: "1px solid var(--border-subtle)",
+                          borderRadius: 4,
+                          fontSize: 10.5, lineHeight: 1.35,
+                          color: "var(--text-secondary)",
+                          fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                          overflow: "auto",
+                          whiteSpace: "pre",
+                        }}>{opt.preview}</pre>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+              {/* Custom text area — multi-line, full width */}
+              <div
+                style={{
+                  border: `1px solid ${curCustom.trim() ? "var(--accent-blue)" : "var(--border)"}`,
+                  borderRadius: 5, overflow: "hidden",
+                  background: "var(--bg-base)",
+                  transition: "border-color 0.12s",
+                  marginBottom: 8,
+                }}
+                onClick={() => otherRef.current?.focus()}
+              >
+                <div style={{ fontSize: 11, color: "var(--text-muted)", padding: "5px 8px 0 8px" }}>Other / Custom</div>
+                <textarea
+                  ref={otherRef as React.RefObject<HTMLTextAreaElement>}
+                  rows={1}
+                  value={curCustom}
+                  onChange={e => { setCustom(e.target.value); resizeOther(e.target); }}
+                  onInput={e => resizeOther(e.currentTarget)}
+                  placeholder="Enter custom answer…"
+                  style={{
+                    display: "block", width: "100%", resize: "none", overflow: "hidden",
+                    background: "transparent", border: "none", outline: "none",
+                    padding: "3px 8px 6px", color: "var(--text-body)", fontSize: 12,
+                    fontFamily: "inherit", lineHeight: 1.5,
+                  }}
+                />
+              </div>
+            </>
+          );
+        })()}
+        {!effectiveMulti && !q.options.some(o => o.preview) && (
+          /* Single-select: inline chips + custom input at end separated by | */
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 5, alignItems: "center", marginBottom: 10 }}>
+            {q.options.map((opt) => {
+              const selected = curSelections.has(opt.label);
+              return (
+                <button
+                  key={opt.label}
+                  onClick={() => handleOptionClick(opt.label)}
+                  title={opt.description}
+                  style={{
+                    padding: "5px 10px",
+                    border: `1px solid ${selected ? "var(--accent-blue)" : "var(--border)"}`,
+                    borderRadius: 4, cursor: "pointer",
+                    background: selected ? "rgba(83,155,245,0.12)" : "var(--bg-base)",
+                    color: selected ? "var(--accent-blue)" : "var(--text-body)",
+                    fontSize: 12, fontWeight: selected ? 600 : 400,
+                    transition: "border-color 0.12s, background 0.12s",
+                  }}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+            <span style={{ color: "var(--border-strong)", fontSize: 14, userSelect: "none" }}>|</span>
+            <input
+              ref={otherRef as React.RefObject<HTMLInputElement>}
+              type="text"
+              value={curCustom}
+              onChange={e => setCustom(e.target.value)}
+              placeholder="Custom…"
+              style={{
+                background: "transparent", border: "none", outline: "none",
+                borderBottom: `1px solid ${curCustom.trim() ? "var(--accent-blue)" : "var(--border)"}`,
+                color: "var(--text-body)", fontSize: 12, padding: "4px 2px",
+                minWidth: 72, flex: "1 1 72px",
+                fontFamily: "inherit",
+              }}
+            />
+          </div>
+        )}
+
+        {/* Action row */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10 }}>
+          <button
+            onClick={doDecline}
+            style={{
+              fontSize: 11, padding: "4px 12px",
+              background: "transparent", color: "var(--text-faint)",
+              border: "1px solid var(--border-subtle)", borderRadius: 4,
+            }}
+          >
+            Skip
+          </button>
+          <div style={{ display: "flex", gap: 6 }}>
+            {step > 0 && (
+              <button
+                onClick={() => setStep(s => s - 1)}
+                style={{
+                  fontSize: 11, padding: "4px 12px",
+                  background: "transparent", color: "var(--text-secondary)",
+                  border: "1px solid var(--border)", borderRadius: 4,
+                }}
+              >
+                ← Prev
+              </button>
+            )}
+            {!isLast ? (
+              <button
+                onClick={() => setStep(s => s + 1)}
+                disabled={!hasAnswer}
+                style={{
+                  fontSize: 12, padding: "4px 16px",
+                  background: hasAnswer ? "#1e3a5f" : "var(--bg-base)",
+                  color: hasAnswer ? "#93c5fd" : "var(--text-faint)",
+                  border: `1px solid ${hasAnswer ? "rgba(88,166,255,0.35)" : "var(--border)"}`,
+                  borderRadius: 4, cursor: hasAnswer ? "pointer" : "not-allowed",
+                }}
+              >
+                Next →
+              </button>
+            ) : (
+              // On last step: show submit for multi-select, multi-question, or when custom text is entered
+              (effectiveMulti || total > 1 || curCustom.trim()) && (
+                <button
+                  onClick={doSubmit}
+                  disabled={!allAnswered}
+                  style={{
+                    fontSize: 12, padding: "4px 16px",
+                    background: allAnswered ? "#1e3a5f" : "var(--bg-base)",
+                    color: allAnswered ? "#93c5fd" : "var(--text-faint)",
+                    border: `1px solid ${allAnswered ? "rgba(88,166,255,0.35)" : "var(--border)"}`,
+                    borderRadius: 4, cursor: allAnswered ? "pointer" : "not-allowed",
+                  }}
+                >
+                  Submit ↵
+                </button>
+              )
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── SubAgent log modal ────────────────────────────────────────────────────────
+
+type SubLogEntry =
+  | { kind: "text"; text: string }
+  | { kind: "tool"; id: string; name: string; input: Record<string, unknown>; result?: { content: string; isError: boolean } };
+
+function SubAgentToolRow({ name, input, result }: {
+  name: string;
+  input: Record<string, unknown>;
+  result?: { content: string; isError: boolean };
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const isDone = !!result;
+  const isError = result?.isError;
+  const summary = toolSummary(name, input);
+  const icon = toolIcon(name);
+  const dotColor = !isDone ? "var(--accent-amber)" : isError ? "var(--accent-red)" : "var(--accent-green)";
+  const resultText = result ? (result.content.length > 8000 ? result.content.slice(0, 8000) + "\n…(truncated)" : result.content) : "";
+
+  return (
+    <div style={{ padding: "1px 0" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          width: "100%", background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+          borderRadius: expanded ? "6px 6px 0 0" : 6, padding: "5px 10px", cursor: "pointer", gap: 8, textAlign: "left",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flex: 1, minWidth: 0 }}>
+          <span style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0, background: dotColor, display: "inline-block" }} />
+          <span style={{ fontSize: "var(--conv-font-sm, 11px)" }}>{icon}</span>
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font, 12px)", fontWeight: 700, color: "var(--text-bright)", flexShrink: 0 }}>{name}</span>
+          {summary !== name && (
+            <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11px)", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+              {summary}
+            </span>
+          )}
+        </div>
+        <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+
+      {expanded && (
+        <div style={{
+          background: "var(--bg-deep)", border: "1px solid var(--bg-hover)", borderTop: "none",
+          borderRadius: "0 0 6px 6px", padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6,
+        }}>
+          {/* Input */}
+          <div>
+            <div style={{ fontSize: "var(--conv-font-xxs, 9px)", fontWeight: 700, fontFamily: "monospace", color: "var(--text-faint)", letterSpacing: "0.5px", marginBottom: 3 }}>
+              {name === "Edit" || name === "MultiEdit" ? "DIFF" : name === "Write" ? "CONTENT" : "IN"}
+            </div>
+            {name === "Edit" && "old_string" in input && "new_string" in input ? (
+              <DiffView oldStr={String(input.old_string ?? "")} newStr={String(input.new_string ?? "")} />
+            ) : name === "MultiEdit" && Array.isArray(input.edits) ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {(input.edits as Array<{ old_string?: string; new_string?: string }>).map((edit, idx) => (
+                  <DiffView key={idx} oldStr={String(edit.old_string ?? "")} newStr={String(edit.new_string ?? "")} />
+                ))}
+              </div>
+            ) : name === "Write" && "content" in input ? (
+              <CodeBlock text={String(input.content ?? "")} lang={extLang(String(input.file_path ?? ""))} />
+            ) : "command" in input ? (
+              <CodeBlock text={String(input.command)} lang="bash" />
+            ) : (
+              <CodeBlock text={yamlValue(input, 0)} lang="yaml" />
+            )}
+          </div>
+          {/* Output */}
+          {resultText && (
+            <div>
+              <div style={{ fontSize: "var(--conv-font-xxs, 9px)", fontWeight: 700, fontFamily: "monospace", color: isError ? "var(--accent-red)" : "var(--text-faint)", letterSpacing: "0.5px", marginBottom: 3 }}>
+                {isError ? "ERR" : "OUT"}
+              </div>
+              <CodeBlock text={resultText} lang={tryFormatJson(resultText) ? "json" : (name === "Read" ? extLang(String(input.file_path ?? "")) : "")} isError={isError} allowMarkdown={!isError} />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SubAgentModal({ sessionId, agentId, isDone, onClose }: {
+  sessionId: string;
+  agentId: string;
+  isDone: boolean;
+  onClose: () => void;
+}) {
+  const [lines, setLines] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  const fetchLines = useCallback(async () => {
+    try {
+      const res = await getSubAgentLines(sessionId, agentId, 0);
+      setLines(res.lines);
+    } catch { /* ignore */ } finally {
+      setLoading(false);
+    }
+  }, [sessionId, agentId]);
+
+  useEffect(() => {
+    fetchLines();
+    if (!isDone) {
+      const id = setInterval(fetchLines, 1500);
+      return () => clearInterval(id);
+    }
+  }, [fetchLines, isDone]);
+
+  useEffect(() => {
+    if (!isDone) bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [lines, isDone]);
+
+  const entries = useMemo((): SubLogEntry[] => {
+    // Pass 1: collect tool_results from user messages (tool_result blocks)
+    const toolResults = new Map<string, { content: string; isError: boolean }>();
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        const msg = obj.message as Record<string, unknown> | undefined;
+        if (!msg || msg.role !== "user") continue;
+        const blocks = Array.isArray(msg.content) ? msg.content as Array<Record<string, unknown>> : [];
+        for (const b of blocks) {
+          if (b.type === "tool_result" && b.tool_use_id) {
+            const c = b.content;
+            const text = typeof c === "string" ? c : Array.isArray(c) ? (c as Array<Record<string, unknown>>).map(x => String(x.text ?? "")).join("") : "";
+            toolResults.set(String(b.tool_use_id), { content: text, isError: !!b.is_error });
+          }
+        }
+      } catch { /* skip */ }
+    }
+
+    // Pass 2: build ordered entries from assistant messages
+    const result: SubLogEntry[] = [];
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        const msg = obj.message as Record<string, unknown> | undefined;
+        if (!msg || msg.role !== "assistant") continue;
+        const stopReason = msg.stop_reason as string | null | undefined;
+        if (stopReason === null || stopReason === undefined) continue; // skip streaming
+        const blocks = Array.isArray(msg.content) ? msg.content as Array<Record<string, unknown>> : [];
+        for (const b of blocks) {
+          if (b.type === "text" && String(b.text ?? "").trim()) {
+            result.push({ kind: "text", text: String(b.text) });
+          } else if (b.type === "tool_use" && b.id) {
+            result.push({
+              kind: "tool",
+              id: String(b.id),
+              name: String(b.name ?? "tool"),
+              input: (b.input ?? {}) as Record<string, unknown>,
+              result: toolResults.get(String(b.id)),
+            });
+          }
+        }
+      } catch { /* skip */ }
+    }
+    return result;
+  }, [lines]);
+
+  return createPortal(
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 9999,
+        background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center",
+      }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          background: "var(--bg-base)", border: "1px solid var(--border)",
+          borderRadius: 10, width: "min(820px, 96vw)", maxHeight: "85vh",
+          display: "flex", flexDirection: "column", overflow: "hidden",
+        }}
+      >
+        {/* Header */}
+        <div style={{
+          padding: "10px 16px", borderBottom: "1px solid var(--border)",
+          display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-bright)" }}>Sub-agent log</span>
+            {!isDone && <span className="streaming-dot" title="Watching…" />}
+            {isDone && <span style={{ fontSize: 10, color: "var(--accent-green)", fontFamily: "monospace" }}>done</span>}
+          </div>
+          <button
+            onClick={onClose}
+            style={{ background: "none", border: "none", color: "var(--text-muted)", fontSize: 18, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}
+          >×</button>
+        </div>
+        {/* Content */}
+        <div style={{ overflowY: "auto", padding: "10px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
+          {loading ? (
+            <div style={{ color: "var(--text-muted)", fontSize: 12, padding: 8 }}>Loading…</div>
+          ) : entries.length === 0 ? (
+            <div style={{ color: "var(--text-muted)", fontSize: 12, padding: 8 }}>{isDone ? "No output recorded." : "Waiting for output…"}</div>
+          ) : entries.map((e, i) =>
+            e.kind === "text" ? (
+              <div
+                key={i}
+                className="conv-markdown"
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(e.text) }}
+                style={{ fontSize: 12.5, color: "var(--text-primary)", lineHeight: 1.7, padding: "2px 4px" }}
+              />
+            ) : (
+              <SubAgentToolRow key={i} name={e.name} input={e.input} result={e.result} />
+            )
+          )}
+          <div ref={bottomRef} />
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function ToolCallBlock({
+  block,
+  result,
+  sessionId,
+  agentId,
+}: {
+  block: RawContentBlock;
+  result?: { content: string; isError: boolean };
+  sessionId?: string;
+  agentId?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [showAgentLog, setShowAgentLog] = useState(false);
+  const [useYaml, setUseYaml] = useState(true);
+
+  const name = (block.name as string) || "tool";
+  const input = (block.input as Record<string, unknown>) || {};
+  const summary = toolSummary(name, input);
+  const icon = toolIcon(name);
+  const diff = diffStats(name, input);
+  const isDone = !!result;
+  const isError = result?.isError;
+  const resultText = toolResultText(result);
+  const isAgent = name === "Agent" && !!sessionId && !!agentId;
+  const yamlConversion = name === "Read" && resultText ? tryJsonToYaml(resultText) : null;
+
+  const dotColor = !isDone ? "var(--accent-amber)" : isError ? "var(--accent-red)" : "var(--accent-green)";
+
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      {/* Header bar */}
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          width: "100%", background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+          borderRadius: 6, padding: "6px 10px", cursor: "pointer", gap: 8,
+          textAlign: "left",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0 }}>
+          <span style={{
+            width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
+            background: dotColor, boxShadow: isDone ? `0 0 4px ${dotColor}60` : "none",
+            display: "inline-block",
+          }} />
+          <span style={{ fontSize: "var(--conv-font-sm, 11px)", marginRight: 2 }}>{icon}</span>
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font, 12.5px)", fontWeight: 700, color: "var(--text-bright)", flexShrink: 0 }}>
+            {name}
+          </span>
+          {summary !== name && (
+            <span style={{
+              fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11.5px)", color: "var(--text-muted)",
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
+            }}>
+              {summary}
+            </span>
+          )}
+        </div>
+        <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+
+      {/* Collapsed extras */}
+      {!expanded && diff && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 12px", fontSize: "var(--conv-font-sm, 11px)", fontFamily: "monospace" }}>
+          <span style={{ color: "var(--accent-red)" }}>−{diff.del}</span>
+          <span style={{ color: "var(--accent-green)" }}>+{diff.add}</span>
+        </div>
+      )}
+      {!expanded && !diff && resultText && (
+        <div style={{ padding: "2px 12px", fontSize: "var(--conv-font-sm, 11px)", fontFamily: "monospace", color: "var(--text-faint)", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
+          {resultText.slice(0, 100)}
+        </div>
+      )}
+      {/* Agent: Watch button in collapsed state (only if running and we have an agentId) */}
+      {!expanded && isAgent && !isDone && (
+        <div style={{ padding: "2px 12px" }}>
+          <button
+            onClick={e => { e.stopPropagation(); setShowAgentLog(true); }}
+            style={{
+              fontSize: "var(--conv-font-xs, 10px)", padding: "2px 8px",
+              background: "var(--accent-amber)", color: "#000",
+              border: "none", borderRadius: 3, cursor: "pointer", fontFamily: "monospace", fontWeight: 600,
+            }}
+          >
+            Watch ▶
+          </button>
+        </div>
+      )}
+      {/* Agent log modal (can open from collapsed or expanded state) */}
+      {showAgentLog && isAgent && (
+        <SubAgentModal
+          sessionId={sessionId!}
+          agentId={agentId!}
+          isDone={isDone}
+          onClose={() => setShowAgentLog(false)}
+        />
+      )}
+
+      {/* Expanded detail */}
+      {expanded && (
+        <div style={{
+          marginTop: 2, background: "var(--bg-base)", border: "1px solid var(--bg-hover)",
+          borderTop: "none", borderRadius: "0 0 6px 6px",
+          padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6,
+        }}>
+          {/* Agent tool: custom prompt + markdown output */}
+          {name === "Agent" ? (
+            <>
+              {/* Subagent type badge + prompt + log button */}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                  <div style={{ fontSize: "var(--conv-font-xxs, 9px)", fontWeight: 700, fontFamily: "monospace", color: "var(--text-faint)", letterSpacing: "0.5px" }}>TASK</div>
+                  {!!input.subagent_type && (
+                    <span style={{ fontSize: "var(--conv-font-xs, 10px)", background: "var(--bg-hover)", color: "var(--text-secondary)", borderRadius: 3, padding: "1px 6px", fontFamily: "monospace" }}>
+                      {String(input.subagent_type)}
+                    </span>
+                  )}
+                  {!!input.run_in_background && (
+                    <span style={{ fontSize: "var(--conv-font-xs, 10px)", background: "var(--bg-hover)", color: "var(--text-muted)", borderRadius: 3, padding: "1px 6px" }}>background</span>
+                  )}
+                  {isAgent && (
+                    <button
+                      onClick={e => { e.stopPropagation(); setShowAgentLog(true); }}
+                      style={{
+                        marginLeft: "auto", fontSize: "var(--conv-font-xs, 10px)", padding: "2px 8px",
+                        background: isDone ? "var(--bg-hover)" : "var(--accent-amber)",
+                        color: isDone ? "var(--text-secondary)" : "#000",
+                        border: "none", borderRadius: 3, cursor: "pointer", fontFamily: "monospace", fontWeight: 600,
+                      }}
+                    >
+                      {isDone ? "View Log" : "Watch ▶"}
+                    </button>
+                  )}
+                </div>
+                <div
+                  className="conv-markdown"
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(String(input.prompt ?? "")) }}
+                  style={{ fontSize: "var(--conv-font, 12px)", color: "var(--text-primary)", lineHeight: 1.65, maxHeight: 300, overflowY: "auto" }}
+                />
+              </div>
+              {/* Output rendered as markdown */}
+              {resultText && (
+                <div>
+                  <div style={{ fontSize: "var(--conv-font-xxs, 9px)", fontWeight: 700, fontFamily: "monospace", color: isError ? "var(--accent-red)" : "var(--text-faint)", letterSpacing: "0.5px", marginBottom: 4 }}>
+                    {isError ? "ERR" : "RESULT"}
+                  </div>
+                  {isError ? (
+                    <CodeBlock text={resultText} lang="" isError />
+                  ) : (
+                    <div
+                      className="conv-markdown"
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(resultText) }}
+                      style={{ fontSize: "var(--conv-font, 12.5px)", color: "var(--text-primary)", lineHeight: 1.7, maxHeight: 500, overflowY: "auto" }}
+                    />
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              {/* Input */}
+              <div>
+                <div style={{ fontSize: "var(--conv-font-xxs, 9px)", fontWeight: 700, fontFamily: "monospace", color: "var(--text-faint)", letterSpacing: "0.5px", marginBottom: 3 }}>
+                  {name === "Edit" || name === "MultiEdit" ? "DIFF" : name === "Write" ? "CONTENT" : "IN"}
+                </div>
+                {(name === "Edit") && "old_string" in input && "new_string" in input ? (
+                  <DiffView
+                    oldStr={String(input.old_string ?? "")}
+                    newStr={String(input.new_string ?? "")}
+                  />
+                ) : name === "MultiEdit" && Array.isArray(input.edits) ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {(input.edits as Array<{ old_string?: string; new_string?: string }>).map((edit, idx) => (
+                      <div key={idx}>
+                        {(input.edits as unknown[]).length > 1 && (
+                          <div style={{ fontSize: "var(--conv-font-xxs, 9px)", color: "var(--text-faint)", fontFamily: "monospace", marginBottom: 2 }}>Edit {idx + 1}</div>
+                        )}
+                        <DiffView
+                          oldStr={String(edit.old_string ?? "")}
+                          newStr={String(edit.new_string ?? "")}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                ) : name === "Write" && "content" in input ? (
+                  <CodeBlock text={String(input.content ?? "")} lang={extLang(String(input.file_path ?? ""))} />
+                ) : "command" in input ? (
+                  <CodeBlock text={String(input.command)} lang="bash" />
+                ) : (
+                  <CodeBlock text={yamlValue(input, 0)} lang="yaml" />
+                )}
+              </div>
+              {/* Output */}
+              {resultText && (
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                    <div style={{ fontSize: "var(--conv-font-xxs, 9px)", fontWeight: 700, fontFamily: "monospace", color: isError ? "var(--accent-red)" : "var(--text-faint)", letterSpacing: "0.5px" }}>
+                      {isError ? "ERR" : "OUT"}
+                    </div>
+                    {yamlConversion && !isError && (
+                      <button
+                        onClick={() => setUseYaml((v) => !v)}
+                        style={{ fontSize: "var(--conv-font-xxs, 9px)", padding: "1px 5px", borderRadius: 3, border: "1px solid var(--border)", background: "var(--bg-surface)", color: "var(--text-muted)", cursor: "pointer", fontFamily: "monospace" }}
+                      >
+                        {useYaml ? "JSON" : "YAML"}
+                      </button>
+                    )}
+                  </div>
+                  <CodeBlock
+                    text={useYaml && yamlConversion ? yamlConversion : resultText}
+                    lang={useYaml && yamlConversion ? "yaml" : (tryFormatJson(resultText) ? "json" : (name === "Read" ? extLang(String(input.file_path ?? "")) : ""))}
+                    isError={isError}
+                    allowMarkdown={!isError && !yamlConversion}
+                  />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CompactBoundaryBlock({ entry, summary, isNew }: { entry: RawMessage; summary?: string; isNew?: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const [rawMode, setRawMode] = useState(false);
+  const meta = (entry as unknown as Record<string, unknown>).compactMetadata as {
+    trigger?: string;
+    preTokens?: number;
+    postTokens?: number;
+    durationMs?: number;
+  } | undefined;
+
+  const trigger = meta?.trigger === "manual" ? "manual" : "auto";
+  const ts = formatTs(entry.timestamp);
+  const summaryHtml = useMemo(() => summary ? renderMarkdown(summary) : "", [summary]);
+
+  return (
+    <div style={{ padding: "6px 16px" }}>
+      {/* Divider line */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ flex: 1, height: 1, background: isNew ? "var(--diff-add-bg)" : "var(--bg-hover)", transition: "background 1s" }} />
+        <button
+          onClick={() => summary && setExpanded(!expanded)}
+          className={isNew ? "compact-new" : undefined}
+          style={{
+            display: "flex", alignItems: "center", gap: 6,
+            background: "var(--bg-surface)",
+            border: `1px solid ${isNew ? "var(--accent-green)" : "var(--border)"}`,
+            borderRadius: 20, padding: "3px 10px 3px 8px",
+            cursor: summary ? "pointer" : "default",
+            color: "var(--text-muted)",
+            fontSize: 11.5, whiteSpace: "nowrap",
+            transition: "border-color 1s",
+          }}
+        >
+          <span style={{ fontSize: 13 }}>⊞</span>
+          <span style={{ fontWeight: 600, color: isNew ? "var(--accent-green)" : undefined, transition: "color 1s" }}>Compact</span>
+          {meta && (
+            <span style={{ color: "var(--text-faint)", fontSize: 10.5 }}>
+              {trigger} · {(meta.preTokens ?? 0).toLocaleString()} tok
+              {meta.postTokens ? `→${meta.postTokens.toLocaleString()}` : ""}
+            </span>
+          )}
+          {ts && <span style={{ color: "var(--text-faintest)", fontSize: 10 }}>{ts}</span>}
+          {summary && (
+            <span style={{ fontSize: 10, color: "var(--text-faint)", marginLeft: 2 }}>
+              {expanded ? "▲" : "▼"}
+            </span>
+          )}
+        </button>
+        <div style={{ flex: 1, height: 1, background: isNew ? "var(--diff-add-bg)" : "var(--bg-hover)", transition: "background 1s" }} />
+      </div>
+
+      {/* Expanded summary */}
+      {expanded && summary && (
+        <div style={{
+          marginTop: 6,
+          border: "1px solid var(--border)",
+          borderRadius: 8,
+          background: "var(--bg-base)",
+          overflow: "hidden",
+        }}>
+          {/* Toolbar */}
+          <div style={{
+            display: "flex", justifyContent: "flex-end",
+            borderBottom: "1px solid var(--border)",
+            padding: "3px 8px", gap: 2,
+          }}>
+            {(["preview", "raw"] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => setRawMode(mode === "raw")}
+                style={{
+                  fontSize: 10.5, padding: "2px 8px",
+                  borderRadius: 4, border: "none", cursor: "pointer",
+                  background: (rawMode ? mode === "raw" : mode === "preview") ? "var(--border)" : "transparent",
+                  color: (rawMode ? mode === "raw" : mode === "preview") ? "var(--text-primary)" : "var(--text-muted)",
+                  fontWeight: (rawMode ? mode === "raw" : mode === "preview") ? 600 : 400,
+                }}
+              >
+                {mode === "preview" ? "Preview" : "Raw"}
+              </button>
+            ))}
+          </div>
+          {rawMode ? (
+            <div style={{
+              padding: "10px 14px",
+              color: "var(--text-secondary)",
+              fontSize: 12,
+              lineHeight: 1.65,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              maxHeight: 400,
+              overflowY: "auto",
+              fontFamily: "monospace",
+            }}>
+              {summary}
+            </div>
+          ) : (
+            <div
+              className="conv-markdown"
+              dangerouslySetInnerHTML={{ __html: summaryHtml }}
+              style={{
+                padding: "10px 14px",
+                color: "var(--text-primary)",
+                fontSize: 13,
+                lineHeight: 1.7,
+                maxHeight: 400,
+                overflowY: "auto",
+              }}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Message entry renderer ────────────────────────────────────────────────────
+
+// ── Turn usage badge ──────────────────────────────────────────────────────────
+
+function fmt(n: number | undefined): string {
+  if (!n) return "0";
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+function TurnUsage({ model, usage }: { model?: string; usage?: RawUsage }) {
+  if (!model && !usage) return null;
+  const inp = (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0) + (usage?.cache_creation_input_tokens ?? 0);
+  const out = usage?.output_tokens ?? 0;
+  const cached = usage?.cache_read_input_tokens ?? 0;
+  const created = usage?.cache_creation_input_tokens ?? 0;
+  const modelShort = model?.replace("claude-", "").replace(/-\d{8}$/, "") ?? "";
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      {modelShort && (
+        <span style={{ fontSize: 10, color: "var(--text-faintest)", fontFamily: "monospace", background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px" }}>
+          {modelShort}
+        </span>
+      )}
+      {usage && (
+        <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "monospace" }}>
+          <span title="input tokens">↑</span><span style={{ color: "var(--text-muted)" }}>{fmt(inp)}</span>
+          {cached > 0 && <span style={{ color: "var(--text-faintest)" }} title="cache read"> ♻{fmt(cached)}</span>}
+          {created > 0 && <span style={{ color: "var(--text-faintest)" }} title="cache write"> +{fmt(created)}</span>}
+          {" · "}<span title="output tokens">↓</span><span style={{ color: "var(--text-muted)" }}>{fmt(out)}</span>
+        </span>
+      )}
+    </div>
+  );
+}
+
+const INTERRUPTED_TEXT = "[Request interrupted by user]";
+
+function MessageEntry({
+  entry,
+  toolResults,
+  compactSummaries,
+  isActiveThinking = false,
+  isNewCompact = false,
+  sessionId,
+  subagentsByDesc,
+  chatOnly = false,
+  hideAuqDisplay = false,
+  hideExitPlanBlock = false,
+  onRewindMessage,
+}: {
+  entry: RawMessage;
+  toolResults: Map<string, { content: string; isError: boolean }>;
+  compactSummaries: Map<string, string>;
+  isActiveThinking?: boolean;
+  isNewCompact?: boolean;
+  sessionId?: string;
+  subagentsByDesc?: Map<string, string>;
+  chatOnly?: boolean;
+  hideAuqDisplay?: boolean;
+  hideExitPlanBlock?: boolean;
+  onRewindMessage?: (uuid: string) => void;
+}) {
+  // compact_boundary system entry
+  if (entry.type === "system" && (entry as unknown as Record<string, unknown>).subtype === "compact_boundary") {
+    const summary = compactSummaries.get(entry.uuid || "");
+    return <CompactBoundaryBlock entry={entry} summary={summary} isNew={isNewCompact} />;
+  }
+
+  // local_command system entry — slash command executed locally (e.g. /model, /clear)
+  if (entry.type === "system" && (entry as unknown as Record<string, unknown>).subtype === "local_command") {
+    const content = String((entry as unknown as Record<string, unknown>).content || "");
+    const cmdMatch = content.match(/<command-name>([^<]+)<\/command-name>/);
+    const argsMatch = content.match(/<command-args>([^<]*)<\/command-args>/);
+    const stdoutMatch = content.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/);
+    const cmd = cmdMatch?.[1].trim() || "";
+    const args = argsMatch?.[1].trim() || "";
+    // Strip ANSI escape codes from stdout
+    const rawStdout = stdoutMatch?.[1] || "";
+    const stdout = rawStdout.replace(/\[[0-9;]*m/g, "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+    if (!stdout) return null;
+    const label = cmd ? `${cmd}${args ? " " + args : ""}` : "";
+    return (
+      <div style={{ display: "flex", justifyContent: "center", padding: "2px 16px" }}>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 10px", background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 20, fontSize: 11, color: "var(--text-muted)", maxWidth: "80%" }}>
+          {label && <span style={{ fontFamily: "monospace", color: "var(--accent-blue)", flexShrink: 0 }}>{label}</span>}
+          {label && <span style={{ color: "var(--text-faintest)" }}>→</span>}
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{stdout}</span>
+        </div>
+      </div>
+    );
+  }
+
+  // queue-operation enqueue — user prompt typed while Claude was responding.
+  // Claude CLI logs these as a separate top-level entry, then promotes them to a
+  // real user message on the next turn. Show them in chat as soon as they land.
+  if (entry.type === "queue-operation") {
+    const op = (entry as unknown as Record<string, unknown>).operation;
+    const content = String((entry as unknown as Record<string, unknown>).content ?? "").trim();
+    if (op !== "enqueue" || !content) return null;
+    const ets = formatTs(entry.timestamp);
+    if (content.startsWith("<task-notification>")) return <TaskNotificationBlock text={content} ts={ets} />;
+    if (content.startsWith("<system-reminder>")) return <SystemReminderBlock text={content} ts={ets} />;
+    return <UserBubble text={content} ts={ets} />;
+  }
+
+  // queued_command attachment — user prompt submitted mid-response, OR a system-
+  // injected envelope (task-notification / system-reminder) Claude CLI queues as
+  // pseudo-input. Route the envelopes to dedicated blocks; everything else stays
+  // as a regular user bubble.
+  if (entry.type === "attachment") {
+    const att = (entry as unknown as Record<string, unknown>).attachment as Record<string, unknown> | undefined;
+    if (att?.type === "queued_command") {
+      const text = String(att.prompt ?? "").trim();
+      if (!text) return null;
+      const ets = formatTs(entry.timestamp);
+      const mode = String(att.commandMode ?? "");
+      if (mode === "task-notification" || text.startsWith("<task-notification>")) {
+        return <TaskNotificationBlock text={text} ts={ets} />;
+      }
+      if (mode === "system-reminder" || text.startsWith("<system-reminder>")) {
+        return <SystemReminderBlock text={text} ts={ets} />;
+      }
+      return <UserBubble text={text} ts={ets} />;
+    }
+    return null;
+  }
+
+  const msg = entry.message;
+  if (!msg) return null;
+
+  const blocks = getBlocks(msg.content as RawContentBlock[] | string);
+  const ts = formatTs(entry.timestamp);
+
+  if (msg.role === "user") {
+    const textBlocks = blocks.filter((b) => b.type === "text" && b.text?.trim());
+    if (textBlocks.length === 0) return null;
+    const text = textBlocks.map((b) => b.text || "").join("\n").trim();
+    // Skip auto-generated interruption messages
+    if (text === INTERRUPTED_TEXT) return null;
+    // Route system-injected envelopes (Claude CLI writes these into the user
+    // channel but they're not user input) to dedicated visual blocks.
+    if (text.startsWith("<task-notification>")) return <TaskNotificationBlock text={text} ts={ts} />;
+    if (text.startsWith("<system-reminder>")) return <SystemReminderBlock text={text} ts={ts} />;
+    const slash = text.startsWith("<command-name>") ? parseSlashCommand(text) : null;
+    if (slash) return <SlashCommandBubble cmd={slash.cmd} args={slash.args} ts={ts} />;
+    const handleRewind = chatOnly && onRewindMessage && entry.uuid
+      ? () => onRewindMessage(entry.uuid!)
+      : undefined;
+    return <UserBubble text={text} ts={ts} onRewind={handleRewind} />;
+  }
+
+  if (msg.role === "assistant") {
+    const segments: React.ReactElement[] = [];
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      if (b.type === "thinking") {
+        if (b.thinking) {
+          segments.push(<ThinkingBlock key={i} thinking={b.thinking} isActive={isActiveThinking} />);
+        } else if ((b as unknown as Record<string, unknown>).signature) {
+          segments.push(<ThinkingRedacted key={i} isActive={isActiveThinking} />);
+        }
+      } else if (b.type === "text" && b.text?.trim()) {
+        segments.push(<AssistantMarkdown key={i} text={b.text} />);
+      } else if (b.type === "tool_use" && b.id) {
+        if (b.name === "AskUserQuestion") {
+          // Show read-only display unless the interactive block is already rendered below
+          if (!hideAuqDisplay) {
+            const inp = b.input as Record<string, unknown>;
+            const rawQs = Array.isArray(inp?.questions) ? inp.questions as AskQuestion[] : [];
+            // AskUserQuestion never writes tool_result to JSONL.
+            // "Answered" is inferred: if there are messages after this one (not last),
+            // or chatOnly is true and session has moved on, the question was answered.
+            // We show the answer text only when available in toolResults (rare but possible in some versions).
+            const result = toolResults.get(b.id);
+            const answerText = result ? result.content : null;
+            if (rawQs.length > 0) {
+              segments.push(<AskUserQuestionDisplay key={i} questions={rawQs} answer={answerText} />);
+            }
+          }
+        } else if (b.name === "TodoWrite" || b.name === "TodoRead") {
+          const result = toolResults.get(b.id);
+          segments.push(<TodoListBlock key={i} block={b} result={result} />);
+        } else if (TASK_TOOL_NAMES.has(b.name as string)) {
+          // Collect all consecutive Task* blocks into one group
+          const taskBlocks: RawContentBlock[] = [b];
+          while (i + 1 < blocks.length && blocks[i + 1].type === "tool_use" && TASK_TOOL_NAMES.has(blocks[i + 1].name as string)) {
+            i++;
+            taskBlocks.push(blocks[i]);
+          }
+          segments.push(<TaskGroupBlock key={i} blocks={taskBlocks} />);
+        } else if (b.name === "ExitPlanMode") {
+          const result = toolResults.get(b.id);
+          if (result) {
+            const approved = !result.content.toLowerCase().includes("reject");
+            const planInput = (b.input as Record<string, unknown>) || {};
+            const planText = planInput.plan ? String(planInput.plan) : undefined;
+            const feedback = !approved ? result.content.trim() : undefined;
+            segments.push(<PlanHistoryBlock key={i} planText={planText} approved={approved} feedback={feedback} />);
+          } else if (!hideExitPlanBlock) {
+            // Pending and we're NOT already showing PlanApprovalBlock below — show a neutral indicator
+            segments.push(
+              <div key={i} style={{ padding: "2px 16px" }}>
+                <div style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, padding: "3px 10px", borderRadius: 5, background: "#160c2a", border: "1px solid #4c1d95", color: "#c4b5fd" }}>
+                  <span>📋</span>
+                  <span>Awaiting plan approval…</span>
+                </div>
+              </div>
+            );
+          }
+          // If hideExitPlanBlock=true, suppress entirely (PlanApprovalBlock renders below)
+        } else {
+          const result = toolResults.get(b.id);
+          const desc = b.name === "Agent" ? String((b.input as Record<string, unknown>)?.description ?? "") : "";
+          const agentId = desc && subagentsByDesc ? subagentsByDesc.get(desc) : undefined;
+          segments.push(<ToolCallBlock key={i} block={b} result={result} sessionId={sessionId} agentId={agentId} />);
+        }
+      }
+    }
+    if (segments.length === 0) return null;
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        {segments}
+        {(msg.usage || ts) && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "1px 16px 2px", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", flex: 1 }}>
+              {msg.usage && <TurnUsage model={msg.model} usage={msg.usage} />}
+            </div>
+            {ts && <span style={{ fontSize: 10, color: "var(--text-faintest)", flexShrink: 0 }}>{ts}</span>}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return null;
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
+
+/** Unified AUQ data — supports both screen-parsed and hook formats. */
+interface PendingAuqData {
+  // Screen-parsed format (parse_auq_from_screen)
+  question?: string;
+  header?: string;
+  multiSelect?: boolean;
+  allowFreeform?: boolean;
+  options?: { label: string; description?: string }[];
+  // Hook format (raw tool_input from Claude Code)
+  questions?: Array<{
+    question: string;
+    options?: Array<string | { label?: string; value?: string }>;
+    multiSelect?: boolean;
+    header?: string;
+  }>;
+}
+
+function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
+  if (data.questions && data.questions.length > 0) {
+    return data.questions.map(q => ({
+      question: q.question ?? "",
+      header: q.header,
+      multiSelect: q.multiSelect,
+      options: (q.options ?? []).map(o =>
+        typeof o === "string" ? { label: o } : { label: o.label ?? o.value ?? String(o) }
+      ),
+    }));
+  }
+  return [{
+    question: data.question ?? "",
+    header: data.header,
+    multiSelect: data.multiSelect,
+    options: data.options ?? [],
+  }];
+}
+
+interface Props {
+  sessionId: string;
+  tool?: "claude" | "cursor";
+  isStreaming?: boolean;
+  chatOnly?: boolean;
+  /** Screen-parsed AUQ data from status poll — shown when JSONL hasn't been written yet. */
+  pendingAuqData?: PendingAuqData | null;
+  /** Tool approval data from hooks — shown when Claude is waiting for permission. */
+  pendingApproveData?: { tool_name: string; tool_input: Record<string, unknown> } | null;
+  /** When true, poll JSONL aggressively until an unanswered AUQ block appears. */
+  isWaitingForAuq?: boolean;
+  /** Ref that receives a function to send Ctrl+C (interrupt current response). */
+  stopRef?: React.MutableRefObject<(() => void) | null>;
+  /** Ref that receives a function to immediately refresh the JSONL message list. */
+  refreshRef?: React.MutableRefObject<(() => void) | null>;
+}
+
+interface OptimisticMsg {
+  id: string;
+  text: string;
+  sentAt: number;
+}
+
+type WsStatus = "connecting" | "connected" | "disconnected" | "error";
+
+// Per-session input draft cache — survives mode switches and session switches,
+// cleared on page refresh. Keyed by sessionId.
+const _inputDrafts = new Map<string, string>();
+
+export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+  const [messages, setMessages] = useState<RawMessage[]>([]);
+  const [tail, setTail] = useState(DEFAULT_TAIL);
+  const [total, setTotal] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [input, setInput] = useState(() => _inputDrafts.get(sessionId) ?? "");
+  const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
+  const [optimisticMsgs, setOptimisticMsgs] = useState<OptimisticMsg[]>([]);
+  const [newCompactUuids, setNewCompactUuids] = useState<Set<string>>(new Set());
+  const [subagents, setSubagents] = useState<SubAgentMeta[]>([]);
+  const wsRef = useRef<WsClient | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
+  const loadMoreAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const seenCompactUuidsRef = useRef<Set<string>>(new Set());
+  // Input height resizable via top-edge grip (drag up to enlarge).
+  const [inputHeight, setInputHeight] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem("convInputHeight") || "", 10);
+    return isFinite(v) && v >= 44 ? v : 44;
+  });
+  const inputResizeRef = useRef<{ startY: number; startH: number } | null>(null);
+
+  // ── Derived data ─────────────────────────────────────────────────────────
+
+  const subagentsByDesc = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const s of subagents) map.set(s.description, s.agentId);
+    return map;
+  }, [subagents]);
+
+  const toolResults = useMemo(() => {
+    const map = new Map<string, { content: string; isError: boolean }>();
+    for (const m of messages) {
+      if (m.type !== "user" || !m.message) continue;
+      const blocks = getBlocks(m.message.content as RawContentBlock[] | string);
+      for (const b of blocks) {
+        if (b.type === "tool_result" && b.tool_use_id) {
+          const content = typeof b.content === "string"
+            ? b.content
+            : Array.isArray(b.content)
+              ? (b.content as RawContentBlock[]).map((c) => c.text || "").join("")
+              : "";
+          map.set(b.tool_use_id, { content, isError: !!b.is_error });
+        }
+      }
+    }
+    return map;
+  }, [messages]);
+
+  // Claude only pauses to wait for an AUQ answer when the AUQ tool_use is the
+  // very last JSONL entry. Any subsequent entry — tool_result (answered),
+  // ai-title / permission-mode / last-prompt (session resumed past it), or any
+  // further assistant turn — means Claude has moved on and the AUQ is no longer
+  // answerable. So treating "last entry has unanswered AUQ" as the active signal
+  // covers skipped/abandoned/resumed cases without a backend probe.
+  const hasUnansweredAuq = useMemo(() => {
+    if (messages.length === 0) return false;
+    const last = messages[messages.length - 1];
+    if (last.type !== "assistant" || !last.message) return false;
+    const blocks = getBlocks(last.message.content as RawContentBlock[] | string);
+    for (const b of blocks) {
+      if (b.type === "tool_use" && b.name === "AskUserQuestion" && b.id && !toolResults.has(b.id)) {
+        return true;
+      }
+    }
+    return false;
+  }, [messages, toolResults]);
+
+  // Build map: compact_boundary uuid → compact summary text
+  const compactSummaries = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const m of messages) {
+      if (m.type !== "user" || !m.message || !m.parentUuid) continue;
+      const text = getTextFromContent(m.message.content as RawContentBlock[] | string);
+      if (isCompactSummaryText(text)) {
+        map.set(m.parentUuid, text);
+      }
+    }
+    return map;
+  }, [messages]);
+
+  // UUIDs of user messages that are compact summaries (suppressed from display)
+  const compactSummaryUuids = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of messages) {
+      if (m.type !== "user" || !m.message || !m.uuid) continue;
+      const text = getTextFromContent(m.message.content as RawContentBlock[] | string);
+      if (isCompactSummaryText(text)) set.add(m.uuid);
+    }
+    return set;
+  }, [messages]);
+
+  const displayEntries = useMemo(() => {
+    const filtered = messages.filter((m) => {
+      if (m.isMeta) return false;
+      if (m.type === "user" || m.type === "assistant") {
+        if (compactSummaryUuids.has(m.uuid || "")) return false;
+        // Skip local-command caveat and stdout-echo XML wrappers; keep
+        // <command-name> entries — those are the user's actual slash-command
+        // invocation (e.g. /goal …) and we render them as a chip below.
+        if (m.type === "user" && m.message) {
+          const c = m.message.content;
+          if (typeof c === "string" && /^<(local-command-caveat|local-command-stdout)>/.test(c)) return false;
+        }
+        return true;
+      }
+      if (m.type === "system") {
+        const sub = (m as unknown as Record<string, unknown>).subtype;
+        if (sub === "compact_boundary") return true;
+        if (sub === "local_command") {
+          const content = String((m as unknown as Record<string, unknown>).content || "");
+          const match = content.match(/<local-command-stdout>([^<]*)<\/local-command-stdout>/);
+          return !!(match && match[1].trim());
+        }
+        return false;
+      }
+      if (m.type === "attachment") {
+        const att = (m as unknown as Record<string, unknown>).attachment as Record<string, unknown> | undefined;
+        if (att?.type !== "queued_command") return false;
+        // Claude CLI writes the user's queued prompt as BOTH a queue-operation
+        // enqueue (when typed) and a queued_command attachment (when consumed
+        // on the next turn). The two carry identical text — render only one
+        // bubble. Prefer the earlier queue-operation; suppress the attachment.
+        const prompt = String(att.prompt ?? "").trim();
+        if (prompt) {
+          for (const n of messages) {
+            if (n === m) continue;
+            const r = n as unknown as Record<string, unknown>;
+            if (r.type === "queue-operation" && r.operation === "enqueue" && typeof r.content === "string") {
+              const c = (r.content as string).trim();
+              if (c === prompt || c.includes(prompt)) return false;
+            }
+          }
+        }
+        return true;
+      }
+      // Queued prompts the user typed while Claude was responding. Claude CLI writes
+      // these as {type:"queue-operation", operation:"enqueue", content:"..."} before
+      // promoting them to real user messages on the next turn.
+      //
+      // Claude CLI merges queue contents: if you type while there's already a queued
+      // prompt, the next enqueue contains the previous one concatenated with the new
+      // text (separated by \r). Suppress earlier enqueues that are fully contained in
+      // a later one so the same words don't render twice. Also suppress if the same
+      // text has already been promoted to a real user message later in the file.
+      if (m.type === "queue-operation") {
+        const r = m as unknown as Record<string, unknown>;
+        if (r.operation !== "enqueue" || typeof r.content !== "string") return false;
+        const content = r.content.trim();
+        if (!content) return false;
+        const idx = messages.indexOf(m);
+        // Queue-merge dedup: if a LATER queue-op enqueue's content already contains
+        // this one (Claude CLI joins consecutive enqueues with \r), drop this one
+        // so the same words don't render twice.
+        for (let j = idx + 1; j < messages.length; j++) {
+          const n = messages[j] as unknown as Record<string, unknown>;
+          if (n.type === "queue-operation" && n.operation === "enqueue" && typeof n.content === "string") {
+            if (n.content.includes(content)) return false;
+          }
+        }
+        // Promotion dedup: when Claude CLI promotes a queue-op to a regular user-type
+        // entry, that entry has IDENTICAL content. Scan ALL following user-type entries
+        // (not just the first — stop-hook feedback / system messages can land between
+        // the qop and its real promotion). Use EXACT match, not substring: compaction
+        // summaries ("This session is being continued from…") incidentally contain old
+        // queue-op text as substring but are NOT promotions, and treating them as such
+        // silently drops legitimate user prompts.
+        for (let j = idx + 1; j < messages.length; j++) {
+          const n = messages[j] as unknown as Record<string, unknown>;
+          if (n.type !== "user") continue;
+          const um = n.message as Record<string, unknown> | undefined;
+          const uc = um?.content;
+          const text = typeof uc === "string" ? uc :
+            Array.isArray(uc) ? uc.filter((b): b is Record<string, unknown> => typeof b === "object" && b !== null && (b as Record<string, unknown>).type === "text").map((b) => String(b.text || "")).join("") : "";
+          if (text.trim() === content) return false;
+        }
+        return true;
+      }
+      return false;
+    });
+    return filtered;
+  }, [messages, compactSummaryUuids]);
+
+  // ── Task run grouping ─────────────────────────────────────────────────────
+  // Pre-compute runs of consecutive Task* assistant messages so they render as one group.
+
+  const taskRunMap = useMemo(() => {
+    const map = new Map<string, { blocks: RawContentBlock[]; isStart: boolean }>();
+    let i = 0;
+    while (i < displayEntries.length) {
+      const entry = displayEntries[i];
+      const uid = entry.uuid || String(i);
+      // Check if this is a task-only assistant message (single Task* tool_use, no text/thinking)
+      const taskBlock = (() => {
+        if (entry.type !== "assistant" || !entry.message) return null;
+        const bs = getBlocks(entry.message.content as RawContentBlock[] | string);
+        if (bs.some(b => (b.type === "text" && b.text?.trim()) || b.type === "thinking")) return null;
+        const tb = bs.filter(b => b.type === "tool_use" && TASK_TOOL_NAMES.has(b.name as string));
+        return tb.length === 1 ? tb[0] : null;
+      })();
+
+      if (!taskBlock) { i++; continue; }
+
+      const runBlocks: RawContentBlock[] = [taskBlock];
+      const runUids: string[] = [uid];
+      let j = i + 1;
+
+      while (j < displayEntries.length) {
+        const next = displayEntries[j];
+        const nextUid = next.uuid || String(j);
+        // Skip tool_result-only user messages between task calls
+        if (next.type === "user" && next.message) {
+          const nb = getBlocks(next.message.content as RawContentBlock[] | string);
+          if (nb.length > 0 && nb.every(b => b.type === "tool_result")) { j++; continue; }
+        }
+        // Accept next task-only assistant message
+        const nextBlock = (() => {
+          if (next.type !== "assistant" || !next.message) return null;
+          const bs = getBlocks(next.message.content as RawContentBlock[] | string);
+          if (bs.some(b => (b.type === "text" && b.text?.trim()) || b.type === "thinking")) return null;
+          const tb = bs.filter(b => b.type === "tool_use" && TASK_TOOL_NAMES.has(b.name as string));
+          return tb.length === 1 ? tb[0] : null;
+        })();
+        if (nextBlock) { runBlocks.push(nextBlock); runUids.push(nextUid); j++; continue; }
+        break;
+      }
+
+      runUids.forEach((id, k) => map.set(id, { blocks: runBlocks, isStart: k === 0 }));
+      i = j;
+    }
+    return map;
+  }, [displayEntries]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Scroll anchor: restore position after prepending older messages ────────
+  useLayoutEffect(() => {
+    const anchor = loadMoreAnchorRef.current;
+    if (!anchor) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    loadMoreAnchorRef.current = null;
+    el.scrollTop = el.scrollHeight - anchor.scrollHeight + anchor.scrollTop;
+  }, [messages]);
+
+  // ── Scroll helpers ────────────────────────────────────────────────────────
+
+  const isAtBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+
+  const scrollToBottom = useCallback((smooth = false) => {
+    if (!stickToBottom.current) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+  }, []);
+
+  const autoLoadRef = useRef({ canLoad: false, loading: false });
+  autoLoadRef.current = { canLoad: total > tail, loading: loadingMore };
+  const loadMoreRef = useRef<() => void>(() => {});
+
+  const handleScroll = useCallback(() => {
+    stickToBottom.current = isAtBottom();
+    const el = scrollRef.current;
+    if (el && autoLoadRef.current.canLoad && !autoLoadRef.current.loading && el.scrollTop < 150) {
+      loadMoreRef.current();
+    }
+  }, []);
+
+  // ── Polling ───────────────────────────────────────────────────────────────
+
+  const fetchMessages = useCallback(async (currentTail: number) => {
+    try {
+      const data = await getRawMessages(sessionId, currentTail);
+      setMessages(data.messages);
+      setTotal(data.total);
+      setLoadingMore(false);
+      // Track newly-appeared compact_boundary entries so we can flash them.
+      const freshUuids: string[] = [];
+      for (const m of data.messages) {
+        if (m.type === "system" && (m as unknown as Record<string, unknown>).subtype === "compact_boundary" && m.uuid) {
+          if (!seenCompactUuidsRef.current.has(m.uuid)) {
+            seenCompactUuidsRef.current.add(m.uuid);
+            freshUuids.push(m.uuid);
+          }
+        }
+      }
+      if (freshUuids.length > 0) {
+        setNewCompactUuids((prev) => {
+          const next = new Set(prev);
+          freshUuids.forEach((id) => next.add(id));
+          return next;
+        });
+        // Clear the flash after 3 seconds.
+        setTimeout(() => {
+          setNewCompactUuids((prev) => {
+            const next = new Set(prev);
+            freshUuids.forEach((id) => next.delete(id));
+            return next;
+          });
+        }, 3000);
+      }
+      // Reconcile: pair each pending optimistic bubble with a real user-input
+      // entry in the JSONL. Exact text-equality is unreliable because Claude
+      // wraps slash commands (<command-name>…</command-name>) and may append
+      // system-reminder blocks, so we also pair by chronology: real entries
+      // whose timestamp falls at/after the optimistic's sentAt (with a small
+      // clock-skew slack) consume the earliest unmatched optimistic, in order.
+      const now = Date.now();
+      const realUserEntries: { text: string; ts: number }[] = [];
+      for (const m of data.messages) {
+        let text: string | null = null;
+        if (m.type === "user" && m.message) {
+          text = getTextFromContent(m.message.content as RawContentBlock[] | string).trim();
+        } else if (m.type === "attachment") {
+          const att = (m as unknown as Record<string, unknown>).attachment as Record<string, unknown> | undefined;
+          if (att?.type === "queued_command" && att.prompt) text = String(att.prompt).trim();
+        } else if (m.type === "queue-operation") {
+          // Claude CLI logs user input typed mid-response as queue-operation enqueue.
+          const r = m as unknown as Record<string, unknown>;
+          if (r.operation === "enqueue" && typeof r.content === "string") text = r.content.trim();
+        }
+        if (text === null) continue;
+        const tsParsed = m.timestamp ? Date.parse(m.timestamp) : NaN;
+        realUserEntries.push({ text, ts: Number.isNaN(tsParsed) ? 0 : tsParsed });
+      }
+      setOptimisticMsgs((prev) => {
+        if (prev.length === 0) return prev;
+        const sortedOpt = [...prev].sort((a, b) => a.sentAt - b.sentAt);
+        const sortedReal = [...realUserEntries].sort((a, b) => a.ts - b.ts);
+        const consumedRealIdx = new Set<number>();
+        const resolvedOptIds = new Set<string>();
+        // Pass 1: exact text match (preferred — disambiguates rapid sends).
+        for (const o of sortedOpt) {
+          for (let i = 0; i < sortedReal.length; i++) {
+            if (consumedRealIdx.has(i)) continue;
+            if (sortedReal[i].text === o.text) {
+              consumedRealIdx.add(i);
+              resolvedOptIds.add(o.id);
+              break;
+            }
+          }
+        }
+        // Pass 2: chronological pairing — the earliest unmatched real entry
+        // with ts >= sentAt (− 5s slack) resolves the earliest unmatched
+        // optimistic. Handles wrapped slash commands and reminder injection.
+        for (const o of sortedOpt) {
+          if (resolvedOptIds.has(o.id)) continue;
+          for (let i = 0; i < sortedReal.length; i++) {
+            if (consumedRealIdx.has(i)) continue;
+            if (sortedReal[i].ts >= o.sentAt - 5000) {
+              consumedRealIdx.add(i);
+              resolvedOptIds.add(o.id);
+              break;
+            }
+          }
+        }
+        return prev.filter((o) => !resolvedOptIds.has(o.id) && now - o.sentAt < 120_000);
+      });
+      requestAnimationFrame(() => scrollToBottom(false));
+    } catch { /* ignore */ }
+  }, [sessionId, scrollToBottom]);
+
+  useEffect(() => {
+    setMessages([]);
+    setTotal(0);
+    stickToBottom.current = true;
+    // input is intentionally NOT cleared here — the draft cache restores it on remount
+    setTail(DEFAULT_TAIL);
+    setOptimisticMsgs([]);
+    setNewCompactUuids(new Set());
+    seenCompactUuidsRef.current = new Set();
+    setSubagents([]);
+  }, [sessionId]);
+
+  // Fetch sub-agents list periodically (stops growing once session ends)
+  useEffect(() => {
+    let cancelled = false;
+    const fetch = async () => {
+      try {
+        const list = await getSubAgents(sessionId);
+        if (!cancelled) setSubagents(list);
+      } catch { /* ignore */ }
+    };
+    fetch();
+    const id = setInterval(fetch, 10_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [sessionId]);
+
+  useEffect(() => {
+    fetchMessages(tail);
+    pollRef.current = setInterval(() => fetchMessages(tail), POLL_MS);
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, [fetchMessages, tail]);
+
+  const loadMore = useCallback(() => {
+    const el = scrollRef.current;
+    if (el) loadMoreAnchorRef.current = { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop };
+    setLoadingMore(true);
+    const next = tail + 100;
+    setTail(next);
+    stickToBottom.current = false;
+  }, [tail]);
+  loadMoreRef.current = loadMore;
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (chatOnly) return; // terminated sessions: no WS needed
+    let ws: WsClient | null = null;
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let retryDelay = 1500;
+    let wsConnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = async () => {
+      if (cancelled) return;
+      if (wsConnectTimer) { clearTimeout(wsConnectTimer); wsConnectTimer = null; }
+      try {
+        setWsStatus("connecting");
+        // Timeout so a hung fetch doesn't block retry indefinitely
+        const res = await Promise.race([
+          attachSession(sessionId),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("attach timeout")), 12000)),
+        ]);
+        if (cancelled) return;
+        ws?.close();
+        ws = new WsClient({
+          url: res.ws_url,
+          autoReconnect: false, // ConversationPane handles retry with fresh attachSession
+          onOpen: () => {
+            if (wsConnectTimer) { clearTimeout(wsConnectTimer); wsConnectTimer = null; }
+            if (!cancelled) {
+              setWsStatus("connected");
+              retryDelay = 1500; // reset backoff on successful connect
+            }
+          },
+          onOutput: () => { /* display handled by polling */ },
+          onState: (state) => {
+            if (state.status === "terminated" && !cancelled) setWsStatus("disconnected");
+          },
+          onPromptRejected: (_reason, text) => {
+            if (cancelled) return;
+            // Drop the most recent optimistic message — it never made it to Claude.
+            setOptimisticMsgs((prev) => {
+              const idx = [...prev].reverse().findIndex(m => m.text === text);
+              if (idx === -1) return prev;
+              const realIdx = prev.length - 1 - idx;
+              return [...prev.slice(0, realIdx), ...prev.slice(realIdx + 1)];
+            });
+            // Restore the text into the input box so the user can edit/retry.
+            // Don't clobber what they may have started typing in the meantime.
+            setInput((cur) => cur ? cur : text);
+            if (text) _inputDrafts.set(sessionId, text);
+          },
+          onClose: () => {
+            if (wsConnectTimer) { clearTimeout(wsConnectTimer); wsConnectTimer = null; }
+            if (!cancelled) {
+              setWsStatus("connecting");
+              retryTimer = setTimeout(() => { retryTimer = null; connect(); }, retryDelay);
+              retryDelay = Math.min(retryDelay * 2, 30000);
+            }
+          },
+        });
+        // If WS onopen hasn't fired within 10s, force a retry via the onClose path
+        wsConnectTimer = setTimeout(() => { wsConnectTimer = null; ws?.close(); }, 10000);
+        wsRef.current = ws;
+      } catch {
+        if (wsConnectTimer) { clearTimeout(wsConnectTimer); wsConnectTimer = null; }
+        if (!cancelled) {
+          setWsStatus("connecting");
+          retryTimer = setTimeout(() => { retryTimer = null; connect(); }, retryDelay);
+          retryDelay = Math.min(retryDelay * 2, 30000);
+        }
+      }
+    };
+
+    connect();
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (wsConnectTimer) { clearTimeout(wsConnectTimer); wsConnectTimer = null; }
+      ws?.close();
+      wsRef.current = null;
+    };
+  }, [sessionId]);
+
+  // ── Input / control ───────────────────────────────────────────────────────
+
+  const sendPrompt = useCallback(() => {
+    const text = input.trim();
+    if (!text || !wsRef.current || wsStatus !== "connected") return;
+    if (hasUnansweredAuq) return;  // Ink would eat the keystrokes — see hasUnansweredAuq comment.
+    // wsStatus is a React state set from onClose, so it lags real readyState
+    // by a render. Without this check, a silently-closed WS lets us create
+    // the optimistic bubble, clear the input, then drop the WS send — the
+    // user sees "sending..." for 120s and loses their draft.
+    if (!wsRef.current.isOpen()) return;
+    // Optimistic: show immediately before JSONL poll confirms it
+    setOptimisticMsgs((prev) => [
+      ...prev,
+      { id: _randomId(), text, sentAt: Date.now() },
+    ]);
+    setInput("");
+    _inputDrafts.delete(sessionId);
+    wsRef.current.sendPrompt(text);
+    stickToBottom.current = true;
+    requestAnimationFrame(() => scrollToBottom(false));
+  }, [input, wsStatus, hasUnansweredAuq, scrollToBottom]);
+
+  const stopResponse = useCallback(() => {
+    if (!wsRef.current) return;
+    wsRef.current.sendInput("\x03");
+  }, []);
+  useEffect(() => { if (stopRef) stopRef.current = stopResponse; }, [stopRef, stopResponse]);
+  useEffect(() => { if (refreshRef) refreshRef.current = () => fetchMessages(tail); }, [refreshRef, fetchMessages, tail]);
+
+  // When the backend signals Claude is waiting for AUQ but JSONL hasn't been
+  // written yet, poll every 800ms until the AUQ block appears (max 30s).
+  useEffect(() => {
+    if (!isWaitingForAuq || hasUnansweredAuq) return;
+    fetchMessages(tail);
+    let elapsed = 0;
+    const id = setInterval(() => {
+      elapsed += 800;
+      if (elapsed >= 30000) { clearInterval(id); return; }
+      fetchMessages(tail);
+    }, 800);
+    return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isWaitingForAuq, hasUnansweredAuq]);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      sendPrompt();
+    }
+  };
+
+  const [rewinding, setRewinding] = useState(false);
+  const handleRewindMessage = useCallback(async (uuid: string) => {
+    if (!window.confirm("Rewind to this message? Code file changes made after this point will be reverted and subsequent conversation will be deleted.")) return;
+    setRewinding(true);
+    try {
+      await rewindSession(sessionId, uuid);
+      await fetchMessages(tail);
+    } catch (e) {
+      alert("Rewind failed: " + String(e));
+    } finally {
+      setRewinding(false);
+    }
+  }, [sessionId, tail, fetchMessages]);
+
+  const wsColor = wsStatus === "connected" ? "var(--accent-green)" : wsStatus === "connecting" ? "var(--accent-amber)" : "var(--accent-red)";
+  const wsLabel = wsStatus === "connected" ? "Connected" : wsStatus === "connecting" ? "Reconnecting…" : "Disconnected";
+  const canLoadMore = total > tail;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
+      {/* Load more banner */}
+      {canLoadMore && (
+        <div style={{
+          padding: "5px 12px", background: "var(--bg-surface)",
+          borderBottom: "1px solid var(--bg-hover)",
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+          flexShrink: 0, fontSize: 12, color: "var(--text-muted)",
+        }}>
+          <span>{total - tail} earlier entries not shown</span>
+          <button
+            onClick={loadMore}
+            disabled={loadingMore}
+            style={{ background: "var(--border)", color: loadingMore ? "var(--text-faint)" : "var(--text-secondary)", fontSize: 11, padding: "3px 12px", border: "1px solid var(--text-faintest)", borderRadius: 4, cursor: loadingMore ? "default" : "pointer", opacity: loadingMore ? 0.5 : 1 }}
+          >
+            {loadingMore ? "Loading…" : "↑ Load more"}
+          </button>
+        </div>
+      )}
+
+      {/* Scroll area */}
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        style={{ flex: 1, overflowY: "auto", paddingTop: 8, paddingBottom: 8, minHeight: 0 }}
+      >
+        {displayEntries.length === 0 && optimisticMsgs.length === 0 ? (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", minHeight: 120, color: "var(--text-faint)", fontSize: 13 }}>
+            No conversation yet
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {displayEntries.map((entry, i) => {
+              // The last assistant entry gets isActiveThinking when Claude is streaming
+              const isLast = i === displayEntries.length - 1;
+              const prevIsLast = i === displayEntries.length - 2;
+              const uid = entry.uuid || String(i);
+
+              // Task run grouping: render whole run at the start entry, suppress the rest
+              const taskRun = taskRunMap.get(uid);
+              if (taskRun) {
+                if (!taskRun.isStart) return null;
+                return <TaskGroupBlock key={uid} blocks={taskRun.blocks} />;
+              }
+              // Account for optimistic msg appearing after: last *real* assistant entry
+              const isActiveThinking = isStreaming && entry.type === "assistant" && (isLast || (prevIsLast && optimisticMsgs.length > 0));
+              // During compaction: the entry before the active assistant is the compact_boundary system message
+              // (possibly with a compact-summary user message in between, so check 2 entries back)
+              const prevEntry = i > 0 ? displayEntries[i - 1] as unknown as Record<string, unknown> : null;
+              const pp = i >= 2 ? displayEntries[i - 2] as unknown as Record<string, unknown> : null;
+              const isCompacting = isActiveThinking && (prevEntry?.subtype === "compact_boundary" || pp?.subtype === "compact_boundary");
+              if (isCompacting) {
+                return <ThinkingRedacted key={uid} isActive label="Compacting…" />;
+              }
+              // After the last complete assistant message, detect interactive reply blocks.
+              // When stop_reason === "tool_use" Claude Code has definitely stopped and is
+              // waiting for a tool result — show the block immediately without waiting for
+              // isStreaming to clear (which takes ~2-4 s due to PTY idle + poll lag).
+              const stopReason = entry.message?.stop_reason;
+              const isWaitingForTool = stopReason === "tool_use";
+              if (
+                entry.type === "assistant" &&
+                isLast &&
+                (!isStreaming || isWaitingForTool) &&
+                optimisticMsgs.length === 0 &&
+                entry.message
+              ) {
+                const blocks = getBlocks(entry.message.content as RawContentBlock[] | string);
+                const sendAnswer = (text: string) => {
+                  setInput("");
+                  _inputDrafts.delete(sessionId);
+                  wsRef.current?.sendPrompt(text);
+                  stickToBottom.current = true;
+                  requestAnimationFrame(() => scrollToBottom(true));
+                };
+
+                // AskUserQuestion tool_use block (unanswered) — shown in all modes
+                const auqBlock = blocks.find(b => b.type === "tool_use" && b.name === "AskUserQuestion" && !toolResults.has(b.id!));
+                if (auqBlock) {
+                  const inp = auqBlock.input as Record<string, unknown>;
+                  const rawQs = Array.isArray(inp?.questions) ? inp.questions as AskQuestion[] : [];
+                  if (rawQs.length > 0) {
+                    return (
+                      <React.Fragment key={uid}>
+                        {/* hideAuqDisplay=true: interactive block below already shows the question */}
+                        <MessageEntry
+                          entry={entry}
+                          toolResults={toolResults}
+                          compactSummaries={compactSummaries}
+                          isActiveThinking={isActiveThinking}
+                          isNewCompact={newCompactUuids.has(entry.uuid || "")}
+                          sessionId={sessionId}
+                          subagentsByDesc={subagentsByDesc}
+                          chatOnly={chatOnly}
+                          hideAuqDisplay
+                          onRewindMessage={handleRewindMessage}
+                        />
+                        <AskUserQuestionBlock
+                          blockId={auqBlock.id!}
+                          questions={rawQs}
+                          onSubmitAnswers={(answers) => {
+                            submitAuqAnswers(sessionId, answers, rawQs);
+                          }}
+                        />
+                      </React.Fragment>
+                    );
+                  }
+                }
+
+                // ExitPlanMode (unanswered) — show plan approval card
+                const exitPlanBlock = blocks.find(b => b.type === "tool_use" && b.name === "ExitPlanMode" && !toolResults.has(b.id!));
+                if (exitPlanBlock && !chatOnly) {
+                  const planInput = (exitPlanBlock.input as Record<string, unknown>) || {};
+                  const planText = planInput.plan ? String(planInput.plan) : undefined;
+                  return (
+                    <React.Fragment key={uid}>
+                      {/* hideExitPlanBlock=true: PlanApprovalBlock below handles the UI */}
+                      <MessageEntry
+                        entry={entry}
+                        toolResults={toolResults}
+                        compactSummaries={compactSummaries}
+                        isActiveThinking={isActiveThinking}
+                        isNewCompact={newCompactUuids.has(entry.uuid || "")}
+                        sessionId={sessionId}
+                        subagentsByDesc={subagentsByDesc}
+                        chatOnly={chatOnly}
+                        hideExitPlanBlock
+                        onRewindMessage={handleRewindMessage}
+                      />
+                      <PlanApprovalBlock
+                        blockId={exitPlanBlock.id!}
+                        planText={planText}
+                        onSubmit={sendAnswer}
+                      />
+                    </React.Fragment>
+                  );
+                }
+
+                // Numbered text questions
+                const fullText = blocks.filter(b => b.type === "text").map(b => b.text || "").join("\n");
+                const questions = parseQuestions(fullText);
+                if (questions.length >= 2) {
+                  return (
+                    <React.Fragment key={uid}>
+                      <MessageEntry
+                        entry={entry}
+                        toolResults={toolResults}
+                        compactSummaries={compactSummaries}
+                        isActiveThinking={isActiveThinking}
+                        isNewCompact={newCompactUuids.has(entry.uuid || "")}
+                        sessionId={sessionId}
+                        subagentsByDesc={subagentsByDesc}
+                        chatOnly={chatOnly}
+                        onRewindMessage={handleRewindMessage}
+                      />
+                      <QAReplyBlock
+                        entryId={uid}
+                        questions={questions}
+                        onSubmit={sendAnswer}
+                      />
+                    </React.Fragment>
+                  );
+                }
+              }
+              return (
+                <MessageEntry
+                  key={uid}
+                  entry={entry}
+                  toolResults={toolResults}
+                  compactSummaries={compactSummaries}
+                  isActiveThinking={isActiveThinking}
+                  isNewCompact={newCompactUuids.has(entry.uuid || "")}
+                  sessionId={sessionId}
+                  subagentsByDesc={subagentsByDesc}
+                  chatOnly={chatOnly}
+                  onRewindMessage={handleRewindMessage}
+                />
+              );
+            })}
+            {/* Optimistic messages: shown immediately, disappear once JSONL confirms */}
+            {optimisticMsgs.map((o) => (
+              <div key={o.id} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", padding: "0 16px 2px", opacity: 0.65 }}>
+                <div style={{
+                  maxWidth: "75%", padding: "9px 14px",
+                  borderRadius: "14px 14px 3px 14px",
+                  background: "#1c3a5e", border: "1px dashed #1d4f8a",
+                  color: "#cce5ff", fontSize: 13, lineHeight: 1.6,
+                  whiteSpace: "pre-wrap", wordBreak: "break-word",
+                }}>
+                  {o.text}
+                </div>
+                <span style={{ fontSize: 10, color: "var(--text-faintest)", marginTop: 2, paddingRight: 2 }}>sending…</span>
+              </div>
+            ))}
+            {/* Pending AUQ from hook/screen — shown when JSONL hasn't been written yet */}
+            {pendingAuqData && !hasUnansweredAuq && optimisticMsgs.length === 0 && (() => {
+              const qs = _normalizePendingAuq(pendingAuqData);
+              if (qs.length === 0 || !qs[0].question) return null;
+              return (
+                <AskUserQuestionBlock
+                  blockId={"__pending_auq__:" + qs[0].question}
+                  questions={qs}
+                  onSubmitAnswers={(answers) => submitAuqAnswers(sessionId, answers, qs)}
+                />
+              );
+            })()}
+            {/* Pending tool approval from hooks — shown when Claude is waiting for permission */}
+            {pendingApproveData && optimisticMsgs.length === 0 && (
+              <ToolApprovalBlock
+                sessionId={sessionId}
+                toolName={pendingApproveData.tool_name}
+                toolInput={pendingApproveData.tool_input}
+                onDone={() => {}}
+              />
+            )}
+            {/* Thinking placeholder: shown when Claude is streaming but no assistant entry visible yet */}
+            {isStreaming && displayEntries.length > 0 && displayEntries[displayEntries.length - 1].type !== "assistant" && (() => {
+              const lastEntry = displayEntries[displayEntries.length - 1] as unknown as Record<string, unknown>;
+              const prevToLast = displayEntries.length >= 2 ? displayEntries[displayEntries.length - 2] as unknown as Record<string, unknown> : null;
+              const isAfterCompact = lastEntry.subtype === "compact_boundary" || prevToLast?.subtype === "compact_boundary";
+              return <ThinkingRedacted isActive label={isAfterCompact ? "Compacting…" : undefined} />;
+            })()}
+          </div>
+        )}
+      </div>
+
+      {/* Stop banner – shown while Claude is generating */}
+      {!chatOnly && isStreaming && wsStatus === "connected" && (
+        <div style={{
+          flexShrink: 0, borderTop: "1px solid var(--border)",
+          background: "var(--bg-surface)",
+          padding: "5px 12px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+        }}>
+          <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Claude is responding…</span>
+          <button
+            onClick={stopResponse}
+            style={{
+              background: "#7f1d1d", color: "#fca5a5",
+              border: "1px solid #991b1b", borderRadius: 5,
+              padding: "3px 12px", fontSize: 11.5, cursor: "pointer",
+              display: "flex", alignItems: "center", gap: 5,
+            }}
+            title="Stop (Ctrl+C)"
+          >
+            <span style={{ fontSize: 10 }}>■</span> Stop
+          </button>
+        </div>
+      )}
+
+      {/* Input bar – hidden in read-only chat mode */}
+      {!chatOnly && <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)", background: "var(--bg-surface)" }}>
+        {/* Top grip: drag up to enlarge the input. The textarea sits at the bottom of
+            the page, so resizing must extend upward, not from a corner. */}
+        <div
+          onMouseDown={(e) => {
+            inputResizeRef.current = { startY: e.clientY, startH: inputHeight };
+            const onMove = (ev: MouseEvent) => {
+              const ref = inputResizeRef.current;
+              if (!ref) return;
+              const next = Math.max(44, Math.min(window.innerHeight * 0.75, ref.startH + (ref.startY - ev.clientY)));
+              setInputHeight(next);
+            };
+            const onUp = () => {
+              inputResizeRef.current = null;
+              localStorage.setItem("convInputHeight", String(Math.round(inputHeight)));
+              window.removeEventListener("mousemove", onMove);
+              window.removeEventListener("mouseup", onUp);
+            };
+            window.addEventListener("mousemove", onMove);
+            window.addEventListener("mouseup", onUp);
+          }}
+          title="Drag to resize input"
+          style={{
+            height: 6, cursor: "ns-resize", display: "flex", alignItems: "center", justifyContent: "center",
+            background: "transparent",
+          }}
+        >
+          <div style={{ width: 40, height: 3, borderRadius: 2, background: "var(--text-faintest)" }} />
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end", padding: "2px 12px 10px" }}>
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={(e) => {
+              const val = e.target.value;
+              setInput(val);
+              if (val) _inputDrafts.set(sessionId, val); else _inputDrafts.delete(sessionId);
+            }}
+            onKeyDown={handleKeyDown}
+            placeholder={
+              hasUnansweredAuq
+                ? "Answer the question above before sending — typing is allowed"
+                : wsStatus === "connected" ? "Type a prompt… (Ctrl+Enter to send)" : wsLabel
+            }
+            disabled={wsStatus !== "connected"}
+            style={{
+              flex: 1, background: "var(--bg-base)",
+              border: "1px solid var(--text-faintest)", borderRadius: 8,
+              padding: "7px 11px", color: "var(--text-body)",
+              fontSize: 13, resize: "none", outline: "none",
+              fontFamily: "inherit", lineHeight: 1.5,
+              height: inputHeight,
+              opacity: wsStatus !== "connected" ? 0.5 : 1,
+            }}
+          />
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flexShrink: 0 }}>
+            <button
+              onClick={sendPrompt}
+              onPointerDown={(e) => e.preventDefault()}
+              disabled={!input.trim() || wsStatus !== "connected" || hasUnansweredAuq}
+              style={{
+                background: !input.trim() || wsStatus !== "connected" || hasUnansweredAuq ? "var(--bg-hover)" : "#238636",
+                color: !input.trim() || wsStatus !== "connected" || hasUnansweredAuq ? "var(--text-faint)" : "#fff",
+                border: "none", borderRadius: 6,
+                width: 34, height: 34, fontSize: 15,
+                cursor: !input.trim() || wsStatus !== "connected" || hasUnansweredAuq ? "default" : "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}
+              title={hasUnansweredAuq ? "Answer the question above first" : "Send (Ctrl+Enter)"}
+            >↑</button>
+            <span style={{ fontSize: 9, color: wsColor }}>{wsLabel}</span>
+          </div>
+        </div>
+      </div>}
+    </div>
+  );
+}
