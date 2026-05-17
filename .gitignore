@@ -1,0 +1,40 @@
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── Frontend ───────────────────────────────────────────
+**/node_modules/
+frontend/dist/
+
+# ── Build artifacts (PyInstaller) ──────────────────────
+build/
+dist/
+
+# ── Runtime data ───────────────────────────────────────
+data/
+config/
+logs/
+nohup.out
+err.txt
+
+# ── Secrets / env ──────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+
+# ── OS junk ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ────────────────────────────────────────────────
+.idea/
+.vscode/
+
+# ── Legacy (pre-restructure) ───────────────────────────
+backend/
