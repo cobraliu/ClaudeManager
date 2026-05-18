@@ -2,13 +2,13 @@
 # ClaudeManager — start / restart the backend server
 #
 # Usage:
-#   bash restart.sh          # port from $CLAUDE_WEB_PORT or 19098
+#   bash restart.sh          # port from $CLAUDE_WEB_PORT or 19099
 #   bash restart.sh 8080     # explicit port
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-PORT="${CLAUDE_WEB_PORT:-19098}"
+PORT="${CLAUDE_WEB_PORT:-19099}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
