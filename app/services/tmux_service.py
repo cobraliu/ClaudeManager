@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import pty
 import select
@@ -10,9 +11,25 @@ import signal
 import struct
 import subprocess
 import termios
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Substrings that uniquely identify Claude CLI's workspace-trust dialog.
+# Multiple candidates for version drift tolerance — any one match is enough.
+_TRUST_DIALOG_PATTERNS = (
+    "Yes, I trust this folder",
+    "Accessing workspace",
+)
+
+
+def _looks_like_trust_dialog(screen: str) -> bool:
+    if not screen:
+        return False
+    return any(p in screen for p in _TRUST_DIALOG_PATTERNS)
 
 
 class TmuxError(RuntimeError):
@@ -183,6 +200,13 @@ class TmuxService:
         except TmuxError:
             pass
 
+        if tool == "claude":
+            threading.Thread(
+                target=self._auto_accept_trust_dialog,
+                args=(session_name,),
+                daemon=True,
+            ).start()
+
     def attach_pty(self, session_name: str, cols: int = 80, rows: int = 24) -> PtyHandle:
         """Attach to a tmux session via a PTY for raw terminal I/O."""
         # Poll until the tmux session exists (guards against create→attach races on Mac).
@@ -334,6 +358,37 @@ class TmuxService:
             return self._run("capture-pane", "-p", "-t", session_name)
         except TmuxError:
             return ""
+
+    def _auto_accept_trust_dialog(self, session_name: str, timeout: float = 8.0) -> None:
+        """Poll the TUI after startup; if Claude's workspace-trust dialog shows,
+        press Enter to accept the default first option ("Yes, I trust this folder").
+
+        Returns silently if no dialog appears within `timeout`. Never raises —
+        failure here must not affect session creation.
+        """
+        time.sleep(0.8)  # let the TUI render before first scan
+        start = time.monotonic()
+        sent = False
+        while time.monotonic() - start < timeout:
+            screen = self.capture_visible_screen(session_name)
+            is_trust = _looks_like_trust_dialog(screen)
+            if is_trust and not sent:
+                try:
+                    self._run("send-keys", "-t", session_name, "Enter")
+                except TmuxError:
+                    return
+                sent = True
+                logger.info("auto-accepted trust dialog for %s", session_name)
+                time.sleep(0.5)
+                continue
+            if sent and not is_trust:
+                return  # dialog cleared — success
+            time.sleep(0.4)
+        if sent:
+            logger.warning(
+                "trust dialog Enter sent but dialog did not clear within %.1fs (%s)",
+                timeout, session_name,
+            )
 
     def search_init_pty(self, pty_handle: "PtyHandle", query: str) -> None:
         """Enter copy-mode, go to top, search forward for query, center result."""
