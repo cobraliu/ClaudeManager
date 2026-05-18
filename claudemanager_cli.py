@@ -18,7 +18,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-DEFAULT_PORT = 19098
+DEFAULT_PORT = 19099
 DEFAULT_HOST = "127.0.0.1"
 
 _ZOOM_STEP = 0.1
