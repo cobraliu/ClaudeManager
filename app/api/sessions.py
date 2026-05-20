@@ -6,6 +6,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -36,8 +37,12 @@ from app.services.cursor_session_reader import (
     list_all_cursor_sessions_global,
 )
 from app.services.git_service import (
-    git_add_commit, git_clone, git_file_diff, git_file_log, git_file_show, git_get_remote, git_init, git_log,
-    git_push, git_search_commits, git_set_remote, git_show_commit, is_git_repo,
+    git_add_commit, git_checkout_branch, git_checkout_remote_branch, git_clone,
+    git_conflict_file_versions, git_file_diff, git_file_log, git_file_show,
+    git_get_remote, git_graph_log, git_init, git_is_dirty, git_list_branches, git_log,
+    git_merge_abort, git_merge_continue, git_merge_start, git_merge_status,
+    git_pull, git_push, git_resolve_file, git_search_commits, git_set_remote,
+    git_show_commit, is_git_repo,
     make_commit_message, make_commit_summary,
 )
 from app.services.session_store import SessionStore
@@ -94,17 +99,23 @@ _tmux: TmuxService | None = None
 # Matches the percentage portion of a "Compacting conversation… 45%" line in TUI.
 _COMPACT_PCT_RE = re.compile(r"(\d{1,3})\s*%")
 # Progress-bar glyphs Claude Code's TUI uses for the compaction bar.  These
-# characters are essentially absent from normal chat text, so requiring one
-# nearby keeps user-typed or assistant-quoted "Compacting conversation…"
-# strings from triggering a false-positive.
+# obscure Unicode rectangles are essentially absent from normal chat text, so
+# requiring one nearby is enough to keep user-typed or assistant-quoted
+# "Compacting conversation…" strings from triggering a false-positive — even
+# without an additional timer-format discriminator.  (Earlier versions of
+# Claude Code paint a "(NNs)" / "(Xm Ys)" elapsed-time counter next to the
+# title, but it isn't always rendered — observed cases where the title shows
+# just "Compacting conversation…" with no timer at all — so we can't rely on
+# it.)
 _COMPACT_BAR_CHARS = ("▰", "▱")
 # How many trailing lines of the TUI pane to scan for the compaction banner.
-# Claude Code renders the progress spinner in its bottom status area, so the
-# string "Compacting conversation…" + bar + percentage land within the last
-# few lines.  Restricting to the tail prevents user-typed prompts or
-# assistant-quoted text scrolled higher in the buffer from tripping the
-# detector.
-_COMPACT_TUI_TAIL_LINES = 10
+# Claude Code renders the spinner near the bottom of the frame, but BELOW it
+# there are several rendered rows: a blank, the "Tip:" line, the multi-line
+# input box (╭ │ ╰), and the status line — typically 7–8 lines.  So the
+# "Compacting conversation…" header sits roughly 8–12 rows above the bottom.
+# A tail of 20 comfortably covers it across terminal sizes.  False-positive
+# risk is bounded by the bar-glyph discriminator applied below.
+_COMPACT_TUI_TAIL_LINES = 20
 # Stale-marker timeout for the PreCompact hook signal.  A real compaction
 # completes well within this window; if the marker hangs around longer it
 # means the hook fired but no compact_boundary was ever written (compaction
@@ -238,10 +249,23 @@ def _is_compacting_via_hook(
             pass
 
     # TUI-side resolution: if we have a fresh screen capture and it doesn't
-    # mention compaction, the hook signal is stale.
+    # show the live compaction status bar, the hook signal is stale. Same
+    # discriminator as path (b): "Compacting conversation…" together with a
+    # ▰/▱ progress-bar glyph in the next line — those glyphs are obscure
+    # Unicode rectangles that don't appear in normal chat text, so quoted /
+    # typed conversation referencing compaction can't keep a stale hook
+    # marker alive.
     if tui_screen is not None:
-        tail = "\n".join(tui_screen.splitlines()[-_COMPACT_TUI_TAIL_LINES:])
-        if "Compacting conversation" not in tail:
+        tail_lines = tui_screen.splitlines()[-_COMPACT_TUI_TAIL_LINES:]
+        active = False
+        for i, ln in enumerate(tail_lines):
+            if "Compacting conversation" not in ln:
+                continue
+            window = "\n".join(tail_lines[i:min(i + 2, len(tail_lines))])
+            if any(ch in window for ch in _COMPACT_BAR_CHARS):
+                active = True
+                break
+        if not active:
             return _drop()
 
     return True
@@ -435,6 +459,7 @@ def _enrich(
                 run_at=t.run_at.isoformat(),
                 status=t.status,
                 created_at=t.created_at.isoformat(),
+                loop_seconds=t.loop_seconds,
             )
             for t in task_map.get(session.id, [])
         ]
@@ -562,6 +587,7 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
                 run_at=t.run_at.isoformat(),
                 status=t.status,
                 created_at=t.created_at.isoformat(),
+                loop_seconds=t.loop_seconds,
             )
             for t in tasks
         ]
@@ -580,7 +606,17 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
                     if screen:
                         tui_auq_data = parse_auq_from_screen(screen)
             elif pid_state[1] == "approve":
-                tui_approve_data = hook_entry.get("approve")
+                # Under --dangerously-skip-permissions (always set by ClaudeManager
+                # in tmux_service.py) Claude CLI still briefly writes the tool name
+                # to ~/.claude/sessions/{pid}.json:waitingFor while it's executing
+                # a tool — even though no approval prompt is actually rendered.
+                # Combined with the hook file's "approve" slot (which is just the
+                # most recent non-AUQ tool call, with no resolved-check), this
+                # produces a ghost approval card. Verify the approval widget is
+                # actually on screen before surfacing it.
+                screen = tmux.capture_visible_screen(s.tmux_session_name)
+                if screen and "Claude wants to use" in screen:
+                    tui_approve_data = hook_entry.get("approve")
         # Fallback path: AUQ from hooks when the PID file didn't flag waiting.
         # We only consider a hook AUQ "pending" if its tool_use_id has no
         # corresponding tool_result in the JSONL yet.
@@ -632,27 +668,33 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
         screen = tui_screen_for_hook
         if screen:
             tail_lines = screen.splitlines()[-_COMPACT_TUI_TAIL_LINES:]
-            tail_text = "\n".join(tail_lines)
-            if "Compacting conversation" in tail_text:
-                for i, ln in enumerate(tail_lines):
-                    if "Compacting conversation" not in ln:
-                        continue
-                    window = tail_lines[i:min(i + 4, len(tail_lines))]
-                    window_text = "\n".join(window)
-                    if not any(ch in window_text for ch in _COMPACT_BAR_CHARS):
-                        continue
-                    pct: str | None = None
-                    for wl in window:
-                        m = _COMPACT_PCT_RE.search(wl)
-                        if m:
-                            val = int(m.group(1))
-                            if 0 <= val <= 100:
-                                pct = f"{val}%"
-                                break
-                    if pct is not None:
-                        is_compacting = True
-                        compacting_progress = pct
-                        break
+            for i, ln in enumerate(tail_lines):
+                if "Compacting conversation" not in ln:
+                    continue
+                # Claude Code paints the live status across two lines: the
+                # title line "· Compacting conversation…" (sometimes with a
+                # "(NNs)" / "(Xm Ys)" timer appended, sometimes not), and
+                # the "▰▰▰▱▱▱ 45%" bar line below it.  We discriminate on the
+                # bar glyph alone — those obscure Unicode rectangles don't
+                # appear in chat text, so the pair {"Compacting conversation"
+                # line + bar glyph in the next line} is enough to rule out
+                # quoted/typed false positives without depending on a timer
+                # that isn't always rendered.
+                window = tail_lines[i:min(i + 2, len(tail_lines))]
+                window_text = "\n".join(window)
+                if not any(ch in window_text for ch in _COMPACT_BAR_CHARS):
+                    continue
+                pct: str | None = None
+                for wl in window:
+                    m = _COMPACT_PCT_RE.search(wl)
+                    if m:
+                        val = int(m.group(1))
+                        if 0 <= val <= 100:
+                            pct = f"{val}%"
+                            break
+                is_compacting = True
+                compacting_progress = pct
+                break
         views.append(SessionStatusView(
             id=s.id,
             status=s.status,
@@ -1064,6 +1106,7 @@ def create_task(session_id: str, body: TaskCreateRequest, user_id: CurrentUser) 
         owner_id=user_id,
         command=body.command,
         run_at=run_at,
+        loop_seconds=body.loop_seconds,
     )
     store.create_task(task)
     return TaskView(
@@ -1072,6 +1115,7 @@ def create_task(session_id: str, body: TaskCreateRequest, user_id: CurrentUser) 
         run_at=task.run_at.isoformat(),
         status=task.status,
         created_at=task.created_at.isoformat(),
+        loop_seconds=task.loop_seconds,
     )
 
 
@@ -1089,6 +1133,7 @@ def list_tasks(session_id: str, user_id: CurrentUser) -> list[TaskView]:
             run_at=t.run_at.isoformat(),
             status=t.status,
             created_at=t.created_at.isoformat(),
+            loop_seconds=t.loop_seconds,
         )
         for t in tasks
     ]
@@ -1288,6 +1333,107 @@ def search_git_commits(session_id: str, user_id: CurrentUser, q: str = Query(def
     return git_search_commits(session.cwd, q.strip())
 
 
+@router.get("/{session_id}/git/branches")
+def list_git_branches(session_id: str, user_id: CurrentUser) -> dict:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        return {"current": "", "local": []}
+    info = git_list_branches(session.cwd)
+    info["dirty"] = git_is_dirty(session.cwd)
+    return info
+
+
+@router.get("/{session_id}/git/graph")
+def get_git_graph(
+    session_id: str,
+    user_id: CurrentUser,
+    scope: str = Query(default="current"),
+    n: int = Query(default=500, ge=1, le=5000),
+) -> list[dict]:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        return []
+    return git_graph_log(session.cwd, scope=scope, n=n)
+
+
+@router.get("/{session_id}/git/active-cwd-sessions")
+def list_active_cwd_sessions(session_id: str, user_id: CurrentUser) -> dict:
+    """Return RUNNING/DETACHED sessions sharing this session's cwd (excluding self).
+    Used by the Revert/checkout confirm dialog to warn about concurrent edits.
+    """
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    sessions = store.list_for_owner(user_id)
+    target_cwd = os.path.realpath(session.cwd)
+    active = []
+    for s in sessions:
+        if s.id == session_id:
+            continue
+        if s.status not in (SessionStatus.RUNNING, SessionStatus.DETACHED):
+            continue
+        try:
+            if os.path.realpath(s.cwd) != target_cwd:
+                continue
+        except OSError:
+            continue
+        active.append({
+            "id": s.id,
+            "name": s.name,
+            "status": s.status.value,
+            "tool": s.tool,
+            "last_activity_at": s.last_activity_at.isoformat() if s.last_activity_at else None,
+        })
+    return {"sessions": active}
+
+
+class GitCheckoutRequest(BaseModel):
+    branch: str = Field(min_length=1, max_length=200)
+    stash: bool = False
+    # remote=True → fetch origin/<branch> and create a local tracking branch first.
+    remote: bool = False
+
+
+@router.post("/{session_id}/git/checkout")
+def checkout_git_branch(
+    session_id: str, body: GitCheckoutRequest, user_id: CurrentUser,
+) -> dict:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        raise HTTPException(status_code=400, detail="not a git repo")
+    if body.remote:
+        result = git_checkout_remote_branch(session.cwd, body.branch, stash=body.stash)
+    else:
+        result = git_checkout_branch(session.cwd, body.branch, stash=body.stash)
+    if not result["ok"]:
+        if result.get("conflict"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "conflict",
+                    "message": "local changes would be overwritten by checkout; commit or stash them first",
+                    "conflicting_files": result.get("conflicting_files", []),
+                },
+            )
+        raise HTTPException(status_code=400, detail=result["output"])
+    return {
+        "ok": True,
+        "branch": body.branch,
+        "output": result["output"],
+        "stashed": result.get("stashed", False),
+    }
+
+
 @router.post("/{session_id}/git/init")
 def init_git_repo(session_id: str, user_id: CurrentUser) -> dict:
     store = _get_store()
@@ -1347,6 +1493,98 @@ def push_to_remote(session_id: str, user_id: CurrentUser) -> dict:
     result = git_push(session.cwd)
     if not result["ok"]:
         raise HTTPException(status_code=500, detail=result["output"])
+    return {"ok": True, "output": result["output"]}
+
+
+@router.post("/{session_id}/git/pull")
+def pull_from_remote(session_id: str, user_id: CurrentUser) -> dict:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        raise HTTPException(status_code=400, detail="not a git repo")
+    result = git_pull(session.cwd)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
+    return {"ok": True, "output": result["output"]}
+
+
+# ── Merge endpoints (VSCode-style conflict resolution) ─────────────────────
+
+class GitMergeStartRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=200)
+    target: str = Field(min_length=1, max_length=200)
+
+
+class GitResolveRequest(BaseModel):
+    path: str = Field(min_length=1)
+    content: str
+
+
+class GitMergeContinueRequest(BaseModel):
+    message: str | None = None
+
+
+def _require_session_repo(session_id: str, user_id: str):
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        raise HTTPException(status_code=400, detail="not a git repo")
+    return session
+
+
+@router.get("/{session_id}/git/merge/status")
+def get_merge_status(session_id: str, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    return git_merge_status(session.cwd)
+
+
+@router.post("/{session_id}/git/merge/start")
+def start_merge(session_id: str, body: GitMergeStartRequest, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    result = git_merge_start(session.cwd, body.source, body.target)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
+    return result
+
+
+@router.get("/{session_id}/git/merge/file")
+def get_merge_conflict_file(session_id: str, path: str, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    if not (Path(session.cwd) / ".git" / "MERGE_HEAD").exists():
+        raise HTTPException(status_code=400, detail="no merge in progress")
+    return git_conflict_file_versions(session.cwd, path)
+
+
+@router.post("/{session_id}/git/merge/resolve")
+def resolve_merge_file(session_id: str, body: GitResolveRequest, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    if not (Path(session.cwd) / ".git" / "MERGE_HEAD").exists():
+        raise HTTPException(status_code=400, detail="no merge in progress")
+    result = git_resolve_file(session.cwd, body.path, body.content)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
+    return {"ok": True, "status": git_merge_status(session.cwd)}
+
+
+@router.post("/{session_id}/git/merge/continue")
+def continue_merge(session_id: str, body: GitMergeContinueRequest, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    result = git_merge_continue(session.cwd, body.message)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
+    return {"ok": True, "output": result["output"]}
+
+
+@router.post("/{session_id}/git/merge/abort")
+def abort_merge(session_id: str, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    result = git_merge_abort(session.cwd)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
     return {"ok": True, "output": result["output"]}
 
 
@@ -1786,6 +2024,111 @@ def get_raw_messages(
 
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/{session_id}/raw-messages/all")
+def get_raw_messages_all(
+    session_id: str,
+    user_id: CurrentUser,
+) -> dict:
+    """Return every JSONL entry, unbounded. Used by Chat export (no tail cap).
+
+    Forward-scans the whole file; the standard `/raw-messages` endpoint is
+    capped at 2000 for the live UI and uses reverse-scan instead.
+    """
+    import json as _json
+    from app.services.claude_session_reader import _find_session_jsonl
+
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    if session.tool == "cursor":
+        from app.services.cursor_session_reader import _find_jsonl as _find_cursor_jsonl
+        chat_sid = session.claude_session_id or find_newest_cursor_session_id(session.cwd)
+        jsonl_path = _find_cursor_jsonl(chat_sid, session.cwd) if chat_sid else None
+    else:
+        chat_sid = session.claude_session_id or find_newest_claude_session_id(session.cwd)
+        jsonl_path = _find_session_jsonl(chat_sid, session.cwd) if chat_sid else None
+
+    if jsonl_path is None:
+        return {"messages": [], "total": 0}
+
+    try:
+        collected: list = []
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    collected.append(_json.loads(line))
+                except _json.JSONDecodeError:
+                    pass
+        total = len(collected)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # Reorder so out-of-order entries (e.g. /compact's local_command flushed
+    # after compact_boundary) appear chronologically. Mirrors the logic in
+    # `/raw-messages`.
+    from datetime import datetime as _dt
+
+    def _parse_ts(d: object) -> float | None:
+        if not isinstance(d, dict):
+            return None
+        raw = d.get("timestamp")
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            return _dt.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    if collected:
+        prev_eff = 0.0
+        eff: list[float] = []
+        for d in collected:
+            ts = _parse_ts(d)
+            if ts is None:
+                eff.append(prev_eff)
+            else:
+                eff.append(ts)
+                prev_eff = ts
+        indexed = list(enumerate(collected))
+        indexed.sort(key=lambda pair: (eff[pair[0]], pair[0]))
+        collected = [d for _, d in indexed]
+
+    if session.tool == "cursor":
+        from app.services.cursor_session_reader import _strip_user_query_tags
+        transformed = []
+        for idx, d in enumerate(collected):
+            role = d.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            raw_content = d.get("message", {}).get("content", [])
+            clean_blocks = []
+            for block in (raw_content if isinstance(raw_content, list) else []):
+                if block.get("type") == "text":
+                    text = _strip_user_query_tags(block.get("text", ""))
+                    if text:
+                        clean_blocks.append({"type": "text", "text": text})
+                else:
+                    clean_blocks.append(block)
+            if not clean_blocks:
+                continue
+            transformed.append({
+                "type": role,
+                "uuid": f"cursor-{idx}",
+                "parentUuid": f"cursor-{idx - 1}" if idx > 0 else None,
+                "timestamp": "",
+                "message": {"role": role, "content": clean_blocks},
+            })
+        collected = transformed
+        total = len(transformed)
+
+    return {"messages": collected, "total": total}
 
 
 class AuqAnswerItem(BaseModel):

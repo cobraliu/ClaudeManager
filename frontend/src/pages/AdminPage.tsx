@@ -11,19 +11,10 @@ import {
   setClaudeBin,
   setProxy,
   restartServer,
-  getSshConfig,
-  updateSshConfig,
-  openShell,
-  getSystemFonts,
-  setTerminalFont,
   type UserInfo,
   type SessionMeta,
-  type SshConfig,
-  type AttachResponse,
-  type FontInfo,
 } from "../api/sessionApi";
 import { SessionCard } from "../components/SessionCard";
-import { TerminalPane } from "../components/TerminalPane";
 
 const PAGE_SIZE = 30;
 
@@ -37,7 +28,6 @@ interface Props {
 export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
   const [users, setUsers] = useState<UserInfo[]>([]);
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
-  const [shellTerminal, setShellTerminal] = useState<{ res: AttachResponse; cwd: string } | null>(null);
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newRole, setNewRole] = useState<"admin" | "user">("user");
@@ -54,13 +44,6 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
   const [restarting, setRestarting] = useState(false);
-  const [sshConfig, setSshConfig] = useState<SshConfig>({ host: "", port: 22, user: "" });
-  const [sshInput, setSshInput] = useState<SshConfig>({ host: "", port: 22, user: "" });
-  const [terminalFont, setTerminalFontVal] = useState("");
-  const [fontList, setFontList] = useState<FontInfo[]>([]);
-  const [fontSearch, setFontSearch] = useState("");
-  const [fontPreview, setFontPreview] = useState<string | null>(null);
-  const [fontLoading, setFontLoading] = useState(false);
 
   const handleRestart = async () => {
     if (!window.confirm("Restart server? All current connections will be disconnected.")) return;
@@ -87,12 +70,6 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
       setClaudeBinInput(c.claude_bin);
       setProxyVal(c.proxy);
       setProxyInput(c.proxy);
-      setTerminalFontVal(c.terminal_font || "");
-    } catch {}
-    try {
-      const ssh = await getSshConfig();
-      setSshConfig(ssh);
-      setSshInput(ssh);
     } catch {}
   }, []);
 
@@ -105,12 +82,6 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
       setSessions(res.items);
     } catch {}
   }, []);
-
-  useEffect(() => {
-    if (tab !== "config" || fontList.length > 0 || fontLoading) return;
-    setFontLoading(true);
-    getSystemFonts().then((f) => { setFontList(f); setFontLoading(false); }).catch(() => setFontLoading(false));
-  }, [tab, fontList.length, fontLoading]);
 
   useEffect(() => {
     refreshUsers();
@@ -126,15 +97,6 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
     document.addEventListener("visibilitychange", onVis);
     return () => { stop(); document.removeEventListener("visibilitychange", onVis); };
   }, [refreshUsers, refreshSessions]);
-
-  const handleShell = async (s: SessionMeta) => {
-    try {
-      const res = await openShell(s.id);
-      setShellTerminal({ res, cwd: s.cwd });
-    } catch (e) {
-      alert(String(e));
-    }
-  };
 
   // Debounced search
   useEffect(() => {
@@ -298,7 +260,7 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
             />
             <div style={{ columns: "minmax(260px, 1fr)", columnGap: 10 }}>
               {pageItems.map((s) => (
-                <SessionCard key={s.id} session={s} showOwner onShell={() => handleShell(s)} />
+                <SessionCard key={s.id} session={s} showOwner />
               ))}
             </div>
             {sessions.length === 0 && (
@@ -407,123 +369,6 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
               </div>
             </div>
 
-            {/* Terminal Font */}
-            <div style={cardStyle}>
-              <h3 style={{ marginBottom: 8, fontSize: 15 }}>Terminal Font</h3>
-              <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 10 }}>
-                Choose a terminal font. Recommend a monospace font with CJK character support for proper alignment. Current:
-                <code style={{ color: "var(--accent-blue)", marginLeft: 4 }}>{terminalFont || "default"}</code>
-              </p>
-              <div style={{ marginBottom: 8, display: "flex", gap: 8, alignItems: "center" }}>
-                <input
-                  placeholder="Search font name…"
-                  value={fontSearch}
-                  onChange={(e) => setFontSearch(e.target.value)}
-                  style={{ ...inputStyle, flex: 1, padding: "6px 10px", fontSize: 12 }}
-                />
-                {fontLoading && <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Loading…</span>}
-              </div>
-              {/* Font list */}
-              <div style={{ maxHeight: 260, overflowY: "auto", border: "1px solid var(--text-faintest)", borderRadius: 6, background: "var(--bg-base)" }}>
-                {(() => {
-                  const q = fontSearch.toLowerCase();
-                  const filtered = fontList.filter((f) => !q || f.family.toLowerCase().includes(q));
-                  if (!filtered.length) return <div style={{ padding: "10px 12px", fontSize: 12, color: "var(--text-faint)" }}>No matching fonts</div>;
-                  return filtered.map((f) => {
-                    const isActive = terminalFont === f.family || (!terminalFont && f.recommended && f.family.startsWith("Ubuntu"));
-                    const isPreviewing = fontPreview === f.family;
-                    return (
-                      <div
-                        key={f.family}
-                        onClick={() => setFontPreview(isPreviewing ? null : f.family)}
-                        style={{
-                          padding: "6px 12px", cursor: "pointer", fontSize: 12,
-                          background: isActive ? "rgba(88,166,255,0.12)" : isPreviewing ? "var(--bg-hover)" : "transparent",
-                          borderBottom: "1px solid var(--text-faintest)",
-                          display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
-                        }}
-                        onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
-                        onMouseLeave={(e) => { e.currentTarget.style.background = isActive ? "rgba(88,166,255,0.12)" : isPreviewing ? "var(--bg-hover)" : "transparent"; }}
-                      >
-                        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-                          {f.recommended && <span style={{ fontSize: 9, padding: "1px 4px", background: "rgba(88,166,255,0.15)", color: "var(--accent-blue)", borderRadius: 3, flexShrink: 0 }}>Recommended</span>}
-                          <span style={{ color: isActive ? "var(--accent-blue)" : "var(--text-body)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.family}</span>
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
-                          <span style={{ fontFamily: f.family, fontSize: 12, color: "var(--text-muted)", letterSpacing: 0.5 }}>AaBb 你好 こんにちは 안녕 مرحبا</span>
-                          {isActive && <span style={{ color: "var(--accent-blue)", fontSize: 11 }}>✓</span>}
-                        </div>
-                      </div>
-                    );
-                  });
-                })()}
-              </div>
-              {/* Preview panel */}
-              {fontPreview && (
-                <div style={{ marginTop: 10, padding: "10px 12px", background: "#0d1117", borderRadius: 6, border: "1px solid var(--text-faintest)" }}>
-                  <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 4 }}>Preview — {fontPreview}</div>
-                  <div style={{ fontFamily: fontPreview, fontSize: 14, color: "#c9d1d9", lineHeight: 1.6 }}>
-                    <div>AaBbCcDdEeFfGg 0123456789 !@#$%^&*()</div>
-                    <div>中文你好 日本語こんにちは 한국어안녕 العربيةمرحبا</div>
-                    <div>Héllo Wörld • Ñoño • Ångström • Ça va • Ελληνικά</div>
-                    <div>if (x &gt;= 0) {"{"} return x * 2; {"}"}</div>
-                    <div>┌─────────┐ │ table   │ └─────────┘</div>
-                  </div>
-                  <div style={{ marginTop: 8, display: "flex", justifyContent: "flex-end" }}>
-                    <button
-                      onClick={async () => {
-                        try {
-                          const c = await setTerminalFont(fontPreview);
-                          setTerminalFontVal(c.terminal_font);
-                          setFontPreview(null);
-                          setMsg(`Terminal font updated to "${fontPreview}". Return to Sessions for it to take effect.`);
-                        } catch (e) { setMsg(String(e)); }
-                      }}
-                      style={{ background: "#58a6ff", color: "#fff", fontSize: 12, padding: "5px 14px", borderRadius: 4 }}
-                    >
-                      Apply Font
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* SSH connection config */}
-            <div style={cardStyle}>
-              <h3 style={{ marginBottom: 12, fontSize: 15 }}>SSH Connection Config</h3>
-              <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
-                Used to directly open session directories in VS Code / Cursor (Remote SSH deep link).
-              </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                  <span style={{ fontSize: 12, color: "var(--text-secondary)", width: 90, flexShrink: 0 }}>Host</span>
-                  <input value={sshInput.host} onChange={(e) => setSshInput((s) => ({ ...s, host: e.target.value }))} placeholder="192.168.1.1" style={{ ...inputStyle, flex: 1 }} />
-                </div>
-                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                  <span style={{ fontSize: 12, color: "var(--text-secondary)", width: 90, flexShrink: 0 }}>Port</span>
-                  <input type="number" value={sshInput.port} onChange={(e) => setSshInput((s) => ({ ...s, port: parseInt(e.target.value) || 22 }))} placeholder="22" style={{ ...inputStyle, flex: 1 }} />
-                </div>
-                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                  <span style={{ fontSize: 12, color: "var(--text-secondary)", width: 90, flexShrink: 0 }}>User</span>
-                  <input value={sshInput.user} onChange={(e) => setSshInput((s) => ({ ...s, user: e.target.value }))} placeholder="username" style={{ ...inputStyle, flex: 1 }} />
-                </div>
-                <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                  <button
-                    disabled={sshInput.host === sshConfig.host && sshInput.port === sshConfig.port && sshInput.user === sshConfig.user}
-                    onClick={async () => {
-                      try {
-                        const saved = await updateSshConfig(sshInput);
-                        setSshConfig(saved);
-                        setMsg("SSH config updated.");
-                      } catch (e) { setMsg(String(e)); }
-                    }}
-                    style={{ background: "#58a6ff", color: "#fff" }}
-                  >
-                    Save
-                  </button>
-                </div>
-              </div>
-            </div>
           </div>
         )}
 
@@ -615,34 +460,6 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
         )}
       </div>
 
-      {/* ── Shell Terminal Modal ── */}
-      {shellTerminal && (
-        <div
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 3000 }}
-          onClick={() => setShellTerminal(null)}
-        >
-          <div
-            style={{ width: "90vw", height: "85vh", background: "var(--bg-base)", borderRadius: 10, border: "1px solid var(--border-strong)", display: "flex", flexDirection: "column", overflow: "hidden" }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ padding: "8px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--bg-hover)", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
-              <span style={{ fontSize: 13, color: "var(--text-secondary)", fontFamily: "monospace" }}>
-                &gt;_ {shellTerminal.cwd}
-              </span>
-              <button onClick={() => setShellTerminal(null)} style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 12, padding: "4px 10px" }}>✕</button>
-            </div>
-            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-              <TerminalPane
-                key={shellTerminal.res.session_id + shellTerminal.res.ws_token}
-                sessionId={shellTerminal.res.session_id}
-                wsUrl={shellTerminal.res.ws_url}
-                onDisconnect={() => setShellTerminal(null)}
-                defaultFit
-              />
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

@@ -202,9 +202,11 @@ interface Props {
   sessionId: string;
   sessionTitle: string;
   onClose: () => void;
+  /** When true, render as an inline panel (no fixed-position backdrop). */
+  inline?: boolean;
 }
 
-export function JsonlPreviewModal({ sessionId, sessionTitle, onClose }: Props) {
+export function JsonlPreviewModal({ sessionId, sessionTitle, onClose, inline = false }: Props) {
   const [data, setData] = useState<JsonlPageResponse | null>(null);
   const [serverPage, setServerPage] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -231,9 +233,16 @@ export function JsonlPreviewModal({ sessionId, sessionTitle, onClose }: Props) {
     setJumpInput("");
   };
 
+  const outerStyle: React.CSSProperties = inline
+    ? { width: "100%", height: "100%", display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg-base)" }
+    : { position: "fixed", inset: 0, zIndex: 3000, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center" };
+  const innerStyle: React.CSSProperties = inline
+    ? { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }
+    : { width: "92vw", height: "88vh", background: "var(--bg-base)", borderRadius: 10, border: "1px solid var(--border-strong)", display: "flex", flexDirection: "column", overflow: "hidden" };
+
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 3000, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: "92vw", height: "88vh", background: "var(--bg-base)", borderRadius: 10, border: "1px solid var(--border-strong)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <div onClick={inline ? undefined : onClose} style={outerStyle}>
+      <div onClick={(e) => e.stopPropagation()} style={innerStyle}>
         {/* Header */}
         <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--bg-hover)", background: "var(--bg-surface)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0, flexWrap: "wrap" }}>
           <span style={{ fontSize: 13, color: "var(--text-secondary)", fontFamily: "monospace", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>

@@ -4,6 +4,7 @@ export type WsCloseHandler = (reason: string) => void;
 export type WsOpenHandler = () => void;
 
 export type WsPromptRejectedHandler = (reason: string, text: string) => void;
+export type WsCopyModeExitedHandler = () => void;
 
 export interface WsClientOptions {
   url: string;
@@ -12,6 +13,7 @@ export interface WsClientOptions {
   onClose?: WsCloseHandler;
   onOpen?: WsOpenHandler;
   onPromptRejected?: WsPromptRejectedHandler;
+  onCopyModeExited?: WsCopyModeExitedHandler;
   autoReconnect?: boolean; // default true
 }
 
@@ -54,6 +56,8 @@ export class WsClient {
           this.opts.onState(msg.payload);
         } else if (msg.type === "prompt-rejected" && this.opts.onPromptRejected) {
           this.opts.onPromptRejected(msg.reason || "", msg.text || "");
+        } else if (msg.type === "copy-mode-exited" && this.opts.onCopyModeExited) {
+          this.opts.onCopyModeExited();
         }
       } catch {
         // might be plain text output fallback

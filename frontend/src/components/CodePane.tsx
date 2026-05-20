@@ -1,14 +1,44 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import hljs from "highlight.js/lib/common";
 import { marked } from "../lib/markdown";
 import {
   getCodeChangedFiles, getCodeFile,
   listFiles, fetchRawFileBlob,
+  getGitInfo,
+  searchFiles, createDir, uploadFile, renameEntry, moveEntry, deleteEntry, writeFile,
+  downloadFile,
+  getFileGitLog, getFileGitShow, getFileGitDiff,
   type ChangedFile, type FileData, type FileEntry,
+  type GitLogEntry,
 } from "../api/sessionApi";
-import { SqliteViewer, CsvViewer, ArchiveViewer, copyText } from "./FileEditorModal";
+import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker, EditorWithLineNumbers } from "./FileEditorModal";
+import { GitPanel, CommitDetailModal } from "./GitPanel";
+import { GitBranchPicker, GitPullButton } from "./GitBranchPicker";
+import downloadIcon from "../assets/download.svg";
+
+const MAX_TRANSFER_MB = 16;
+const MAX_TRANSFER_BYTES = MAX_TRANSFER_MB * 1024 * 1024;
 
 const POLL_MS = 8000;
+
+// ── useResizeWidth: tracks the clientWidth of an element via ResizeObserver ──
+function useResizeWidth<T extends HTMLElement>() {
+  const ref = useRef<T | null>(null);
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setWidth(el.clientWidth);
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setWidth(entry.contentRect.width);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, width] as const;
+}
 
 // ── File icons (copied from FileEditorModal) ──────────────────────────────
 
@@ -128,7 +158,7 @@ interface DirState {
 }
 
 function FileTreeDir({
-  sessionId, entry, depth, selected, changed, onSelect, revealPath, refreshKey,
+  sessionId, entry, depth, selected, changed, onSelect, onEntryContextMenu, revealPath, refreshKey,
 }: {
   sessionId: string;
   entry: FileEntry;
@@ -136,6 +166,7 @@ function FileTreeDir({
   selected: string | null;
   changed: Set<string>;
   onSelect: (entry: FileEntry) => void;
+  onEntryContextMenu?: (e: React.MouseEvent, entry: FileEntry) => void;
   revealPath?: string | null;
   refreshKey?: number;
 }) {
@@ -186,6 +217,7 @@ function FileTreeDir({
     <div>
       <div
         onClick={toggle}
+        onContextMenu={onEntryContextMenu ? (e) => onEntryContextMenu(e, entry) : undefined}
         style={{
           display: "flex", alignItems: "center", gap: 5,
           padding: `2px 8px 2px ${indent}px`,
@@ -214,12 +246,12 @@ function FileTreeDir({
             child.type === "dir" ? (
               <FileTreeDir
                 key={child.path} sessionId={sessionId} entry={child}
-                depth={depth + 1} selected={selected} changed={changed} onSelect={onSelect} revealPath={revealPath} refreshKey={refreshKey}
+                depth={depth + 1} selected={selected} changed={changed} onSelect={onSelect} onEntryContextMenu={onEntryContextMenu} revealPath={revealPath} refreshKey={refreshKey}
               />
             ) : (
               <FileTreeFile
                 key={child.path} entry={child}
-                depth={depth + 1} selected={selected} changed={changed} onSelect={onSelect}
+                depth={depth + 1} selected={selected} changed={changed} onSelect={onSelect} onEntryContextMenu={onEntryContextMenu}
               />
             )
           )}
@@ -230,13 +262,14 @@ function FileTreeDir({
 }
 
 function FileTreeFile({
-  entry, depth, selected, changed, onSelect,
+  entry, depth, selected, changed, onSelect, onEntryContextMenu,
 }: {
   entry: FileEntry;
   depth: number;
   selected: string | null;
   changed: Set<string>;
   onSelect: (entry: FileEntry) => void;
+  onEntryContextMenu?: (e: React.MouseEvent, entry: FileEntry) => void;
 }) {
   const isSelected = selected === entry.path;
   const isChanged = changed.has(entry.path);
@@ -245,6 +278,7 @@ function FileTreeFile({
   return (
     <div
       onClick={() => onSelect(entry)}
+      onContextMenu={onEntryContextMenu ? (e) => onEntryContextMenu(e, entry) : undefined}
       style={{
         display: "flex", alignItems: "center", gap: 5,
         padding: `2px 8px 2px ${indent}px`,
@@ -269,12 +303,13 @@ function FileTreeFile({
 // ── Root tree (loads top-level entries once) ──────────────────────────────
 
 function FileTree({
-  sessionId, selected, changed, onSelect, revealPath, refreshKey,
+  sessionId, selected, changed, onSelect, onEntryContextMenu, revealPath, refreshKey,
 }: {
   sessionId: string;
   selected: string | null;
   changed: Set<string>;
   onSelect: (entry: FileEntry) => void;
+  onEntryContextMenu?: (e: React.MouseEvent, entry: FileEntry) => void;
   revealPath?: string | null;
   refreshKey?: number;
 }) {
@@ -294,12 +329,12 @@ function FileTree({
         e.type === "dir" ? (
           <FileTreeDir
             key={e.path} sessionId={sessionId} entry={e}
-            depth={0} selected={selected} changed={changed} onSelect={onSelect} revealPath={revealPath} refreshKey={refreshKey}
+            depth={0} selected={selected} changed={changed} onSelect={onSelect} onEntryContextMenu={onEntryContextMenu} revealPath={revealPath} refreshKey={refreshKey}
           />
         ) : (
           <FileTreeFile
             key={e.path} entry={e}
-            depth={0} selected={selected} changed={changed} onSelect={onSelect}
+            depth={0} selected={selected} changed={changed} onSelect={onSelect} onEntryContextMenu={onEntryContextMenu}
           />
         )
       )}
@@ -583,7 +618,12 @@ function buildChangesTree(files: ChangedFile[]): ChangesNode[] {
   interface InternalNode { name: string; path: string; file?: ChangedFile; childMap: Map<string, InternalNode> }
   const rootMap = new Map<string, InternalNode>();
   for (const f of files) {
-    const parts = f.path.split("/");
+    // Defensive: strip trailing slash so an untracked-directory entry like
+    // "dir/" (from `git status --porcelain` without -uall) doesn't split
+    // into ["dir", ""] and produce an empty-named leaf row.
+    const cleanPath = f.path.replace(/\/+$/, "");
+    if (!cleanPath) continue;
+    const parts = cleanPath.split("/");
     let cur = rootMap;
     for (let i = 0; i < parts.length; i++) {
       const name = parts[i];
@@ -606,6 +646,13 @@ function buildChangesTree(files: ChangedFile[]): ChangesNode[] {
   return flatten(rootMap);
 }
 
+function countChangedFiles(node: ChangesNode): number {
+  if (node.children.length === 0) return node.file ? 1 : 0;
+  let n = node.file ? 1 : 0;
+  for (const c of node.children) n += countChangedFiles(c);
+  return n;
+}
+
 function ChangesNodeRow({
   node, depth, selectedPath, onClickFile,
 }: {
@@ -614,11 +661,12 @@ function ChangesNodeRow({
   selectedPath: string | null;
   onClickFile: (f: ChangedFile, path: string) => void;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
   const isDir = node.children.length > 0;
   const indent = depth * 10 + 8;
 
   if (isDir) {
+    const fileCount = countChangedFiles(node);
     return (
       <>
         <div
@@ -634,6 +682,7 @@ function ChangesNodeRow({
           <span style={{ fontSize: 9, color: "var(--text-faint)" }}>{open ? "▾" : "▸"}</span>
           <span style={{ fontSize: 12 }}>📁</span>
           <span>{node.name}</span>
+          <span style={{ fontSize: 10, color: "var(--text-faint)", marginLeft: 2 }}>({fileCount})</span>
         </div>
         {open && node.children.map(child => (
           <ChangesNodeRow key={child.path} node={child} depth={depth + 1} selectedPath={selectedPath} onClickFile={onClickFile} />
@@ -668,6 +717,93 @@ function ChangesNodeRow({
         </span>
       )}
     </div>
+  );
+}
+
+// ── RecentCommitsPanel — bottom strip of the left panel ──────────────────
+
+function CommitMiniRow({ entry, onClick }: { entry: GitLogEntry; onClick: () => void }) {
+  const d = new Date(entry.date);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const dateStr = `${d.getMonth() + 1}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return (
+    <div
+      onClick={onClick}
+      style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 10px", cursor: "pointer", fontSize: 11 }}
+      onMouseEnter={e => { e.currentTarget.style.background = "var(--bg-surface)"; }}
+      onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
+      title={`${entry.short_hash} · ${entry.subject}\n${entry.author} · ${dateStr}`}
+    >
+      <span style={{ fontFamily: "monospace", color: "var(--accent-blue)", flexShrink: 0, fontSize: 10 }}>{entry.short_hash}</span>
+      <span style={{ color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{entry.subject}</span>
+      <span style={{ fontSize: 9, color: "var(--text-faintest)", flexShrink: 0 }}>{dateStr}</span>
+    </div>
+  );
+}
+
+const COMMITS_SHOW_N = 5;
+
+function RecentCommitsPanel({ sessionId }: { sessionId: string }) {
+  const [log, setLog] = useState<GitLogEntry[]>([]);
+  const [isRepo, setIsRepo] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [detailEntry, setDetailEntry] = useState<GitLogEntry | null>(null);
+  const [showFullPanel, setShowFullPanel] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    const poll = async () => {
+      try {
+        const info = await getGitInfo(sessionId);
+        if (!mounted) return;
+        setIsRepo(info.is_repo);
+        setLog(info.log ?? []);
+      } catch { /* ignore */ } finally {
+        if (mounted) setLoaded(true);
+      }
+    };
+    poll();
+    const id = setInterval(poll, 15000);
+    return () => { mounted = false; clearInterval(id); };
+  }, [sessionId]);
+
+  // Hide entirely until first fetch settles; avoids flashing "No commits" in non-repo cwd.
+  if (!loaded) return null;
+  if (!isRepo) return null;
+
+  const top = log.slice(0, COMMITS_SHOW_N);
+  const hasMore = log.length > COMMITS_SHOW_N;
+
+  return (
+    <>
+      <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)" }}>
+        <div style={{ padding: "5px 10px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span>Commits{log.length > 0 ? ` (${log.length})` : ""}</span>
+          <button
+            onClick={() => setShowFullPanel(true)}
+            title="Open full git panel"
+            style={{ fontSize: 9, padding: "1px 6px", background: "var(--bg-hover)", color: "var(--text-muted)", border: "1px solid var(--text-faintest)", borderRadius: 3, cursor: "pointer" }}
+          >
+            {hasMore ? "View all →" : "Git…"}
+          </button>
+        </div>
+        {top.length === 0 ? (
+          <div style={{ padding: "4px 12px 8px", color: "var(--text-faint)", fontSize: 11 }}>No commits yet</div>
+        ) : (
+          <div style={{ maxHeight: 140, overflowY: "auto" }}>
+            {top.map(e => (
+              <CommitMiniRow key={e.hash} entry={e} onClick={() => setDetailEntry(e)} />
+            ))}
+          </div>
+        )}
+      </div>
+      {detailEntry && (
+        <CommitDetailModal sessionId={sessionId} entry={detailEntry} onClose={() => setDetailEntry(null)} />
+      )}
+      {showFullPanel && (
+        <GitPanel sessionId={sessionId} onClose={() => setShowFullPanel(false)} />
+      )}
+    </>
   );
 }
 
@@ -712,9 +848,42 @@ export function FileSidePanel({
 
   const handleSelect = (entry: FileEntry) => onFileClick(entry.path, false);
 
+  const [sideBarRef, sideBarWidth] = useResizeWidth<HTMLDivElement>();
+  const [sideBranchName, setSideBranchName] = useState<string>("");
+  const sideNaturalWidth = useMemo(() => {
+    const filesLabel = 32;
+    const padding = 20;
+    const branchOverhead = 42;
+    const branchName = (sideBranchName || "main").length * 7.5;
+    const pullCompact = 60;
+    const gaps = 16;
+    return filesLabel + padding + branchOverhead + branchName + pullCompact + gaps;
+  }, [sideBranchName]);
+  const sideCollapse = sideBarWidth > 0 && sideBarWidth < sideNaturalWidth;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden", background: "var(--bg-base)" }}>
-      <div style={{ borderBottom: "1px solid var(--bg-hover)", flexShrink: 0 }}>
+      {/* Files (top, fills remaining space) */}
+      <div style={{ overflowY: "auto", flex: 1, paddingTop: 4 }}>
+        <div ref={sideBarRef} style={{ padding: "4px 10px 2px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", display: "flex", alignItems: "center", gap: sideCollapse ? 4 : 8, minWidth: 0 }}>
+          <span style={{ flexShrink: 0 }}>Files</span>
+          <GitBranchPicker
+            sessionId={sessionId}
+            refreshKey={filesRefreshKey}
+            onBranchChanged={() => setFilesRefreshKey(k => k + 1)}
+            onInfoLoaded={(i) => setSideBranchName(i.current)}
+            iconOnly={sideCollapse}
+          />
+          <GitPullButton
+            sessionId={sessionId}
+            onPulled={() => setFilesRefreshKey(k => k + 1)}
+            iconOnly={sideCollapse}
+          />
+        </div>
+        <FileTree sessionId={sessionId} selected={selectedPath} changed={changedSet} onSelect={handleSelect} revealPath={selectedPath} refreshKey={filesRefreshKey} />
+      </div>
+      {/* Changes (middle) */}
+      <div style={{ borderTop: "1px solid var(--bg-hover)", flexShrink: 0 }}>
         <div style={{ padding: "5px 10px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
           Changes ({changedFiles.length})
         </div>
@@ -734,12 +903,8 @@ export function FileSidePanel({
           </div>
         )}
       </div>
-      <div style={{ overflowY: "auto", flex: 1, paddingTop: 4 }}>
-        <div style={{ padding: "4px 10px 2px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-          Files
-        </div>
-        <FileTree sessionId={sessionId} selected={selectedPath} changed={changedSet} onSelect={handleSelect} revealPath={selectedPath} refreshKey={filesRefreshKey} />
-      </div>
+      {/* Recent commits (bottom) */}
+      <RecentCommitsPanel sessionId={sessionId} />
     </div>
   );
 }
@@ -748,6 +913,7 @@ export function FileSidePanel({
 
 function ViewerHeader({
   path, selectedChanged, fileData, showImage, showSqlite, isMd, isCsv, mdPreview, setMdPreview, viewMode, setViewMode, noDiff,
+  onDownload, canEdit, editing, saving, isModified, onEditToggle, onCancelEdit,
 }: {
   path: string;
   selectedChanged?: ChangedFile;
@@ -761,6 +927,13 @@ function ViewerHeader({
   viewMode: "full" | "diff" | "split";
   setViewMode: (v: "full" | "diff" | "split") => void;
   noDiff?: boolean;
+  onDownload?: () => void;
+  canEdit?: boolean;
+  editing?: boolean;
+  saving?: boolean;
+  isModified?: boolean;
+  onEditToggle?: () => void;
+  onCancelEdit?: () => void;
 }) {
   const name = path.split("/").pop() ?? path;
   return (
@@ -827,7 +1000,7 @@ function ViewerHeader({
               {viewMode === "full" ? "FULL" : viewMode === "diff" ? "DIFF" : "SPLIT"}
             </button>
           )}
-          {!fileData.is_binary && (
+          {!fileData.is_binary && !editing && (
             <button
               onClick={() => {
                 const bytes = new Blob([fileData.content]).size;
@@ -847,7 +1020,72 @@ function ViewerHeader({
               COPY
             </button>
           )}
+          {canEdit && onEditToggle && !editing && (
+            <button
+              onClick={onEditToggle}
+              title="Edit this file"
+              style={{
+                marginLeft: 6, fontSize: 9, padding: "1px 5px",
+                background: "var(--bg-hover)", color: "var(--text-body)",
+                border: "1px solid var(--text-faintest)", borderRadius: 3, cursor: "pointer",
+              }}
+            >
+              EDIT
+            </button>
+          )}
+          {canEdit && onEditToggle && editing && (
+            <>
+              <button
+                onClick={onEditToggle}
+                disabled={saving || !isModified}
+                title={!isModified ? "No changes to save" : "Save changes"}
+                style={{
+                  marginLeft: 6, fontSize: 9, padding: "1px 5px",
+                  background: isModified ? "var(--accent-blue)" : "var(--text-faintest)",
+                  color: "#fff",
+                  border: `1px solid ${isModified ? "var(--accent-blue)" : "var(--text-faintest)"}`,
+                  borderRadius: 3,
+                  cursor: saving || !isModified ? "default" : "pointer",
+                  opacity: saving ? 0.6 : 1,
+                }}
+              >
+                {saving ? "SAVING…" : "SAVE"}
+              </button>
+              {onCancelEdit && (
+                <button
+                  onClick={onCancelEdit}
+                  disabled={saving}
+                  title="Discard changes"
+                  style={{
+                    marginLeft: 4, fontSize: 9, padding: "1px 5px",
+                    background: "var(--bg-hover)", color: "var(--text-muted)",
+                    border: "1px solid var(--text-faintest)", borderRadius: 3, cursor: "pointer",
+                  }}
+                >
+                  CANCEL
+                </button>
+              )}
+            </>
+          )}
         </span>
+      )}
+      {onDownload && (
+        <button
+          onClick={onDownload}
+          title={fileData?.size != null && fileData.size > MAX_TRANSFER_BYTES ? `Too large to download (>${MAX_TRANSFER_MB}MB)` : "Download file"}
+          style={{
+            marginLeft: 6, background: "transparent", border: "none", padding: "0 2px",
+            cursor: "pointer", flexShrink: 0, lineHeight: 1, display: "flex", alignItems: "center",
+          }}
+        >
+          <img
+            src={downloadIcon}
+            style={{
+              width: 14, height: 14,
+              filter: fileData?.size != null && fileData.size > MAX_TRANSFER_BYTES ? "invert(0.3)" : "invert(0.6)",
+            }}
+          />
+        </button>
       )}
     </div>
   );
@@ -926,15 +1164,24 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const [fileLoading, setFileLoading] = useState(true);
   const [viewMode, setViewMode] = useState<"full" | "diff" | "split">(initViewMode);
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
+  const [editing, setEditing] = useState(false);
+  const [editBuffer, setEditBuffer] = useState<string>("");
+  const [saving, setSaving] = useState(false);
+  const editingRef = useRef(false);
+  const editTextareaRef = useRef<HTMLTextAreaElement>(null);
   const name = path.split("/").pop() ?? path;
   const isMd = isMdFile(name);
   const isCsv = isCsvFile(name);
   const [mdPreview, setMdPreview] = useState(isMd || isCsv);
 
+  useEffect(() => { editingRef.current = editing; }, [editing]);
+
   useEffect(() => { setViewMode(initViewMode); }, [initViewMode]);
   useEffect(() => {
     const n = path.split("/").pop() ?? path;
     setMdPreview(isMdFile(n) || isCsvFile(n));
+    setEditing(false);
+    setEditBuffer("");
   }, [path]);
 
   useEffect(() => {
@@ -949,7 +1196,10 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
       .then(d => { if (mounted) { setFileData(d); setFileLoading(false); } })
       .catch(() => { if (mounted) setFileLoading(false); });
     fetch();
-    const id = setInterval(() => { if (mounted) getCodeFile(sessionId, path).then(d => { if (mounted) setFileData(d); }).catch(() => {}); }, POLL_MS);
+    const id = setInterval(() => {
+      if (!mounted || editingRef.current) return;
+      getCodeFile(sessionId, path).then(d => { if (mounted && !editingRef.current) setFileData(d); }).catch(() => {});
+    }, POLL_MS);
     return () => { mounted = false; clearInterval(id); };
   }, [sessionId, path]);
 
@@ -964,8 +1214,60 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const showSqlite = isSqliteFile(name);
   const showImage = isImage(name);
   const showArchive = isArchiveFile(name);
+  const showPdf = isPdfFile(name);
   const selectedChanged = changedFiles.find(f => f.path === path);
-  const entry: FileEntry = { name, path, type: "file", size: null, is_text: !showSqlite && !isPdfFile(name) && !showArchive, is_skipped: false, is_sqlite: showSqlite, is_archive: showArchive };
+  const entry: FileEntry = { name, path, type: "file", size: null, is_text: !showSqlite && !showPdf && !showArchive, is_skipped: false, is_sqlite: showSqlite, is_archive: showArchive };
+
+  const canEdit = !!fileData && !fileData.is_binary && !showSqlite && !showArchive && !showPdf && !showImage;
+  const isModified = editing && !!fileData && editBuffer !== fileData.content;
+
+  const onDownload = async () => {
+    if (fileData?.size != null && fileData.size > MAX_TRANSFER_BYTES) {
+      alert(`File is too large to download (${(fileData.size / 1024 / 1024).toFixed(1)} MB). Limit is ${MAX_TRANSFER_MB} MB.`);
+      return;
+    }
+    try { await downloadFile(sessionId, path); } catch (e) { alert(String(e)); }
+  };
+
+  const beginEdit = () => {
+    if (!fileData || saving) return;
+    setEditBuffer(fileData.content);
+    setEditing(true);
+    setTimeout(() => editTextareaRef.current?.focus(), 30);
+  };
+
+  const handleSave = async () => {
+    if (!fileData || saving || !isModified) return;
+    setSaving(true);
+    try {
+      await writeFile(sessionId, path, editBuffer);
+      const fresh = await getCodeFile(sessionId, path).catch(() => null);
+      if (fresh) setFileData(fresh);
+      setEditing(false);
+      setEditBuffer("");
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const cancelEdit = () => {
+    if (saving) return;
+    setEditing(false);
+    setEditBuffer("");
+  };
+
+  const handleEditTabKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== "Tab") return;
+    e.preventDefault();
+    const el = e.currentTarget;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const next = editBuffer.slice(0, start) + "  " + editBuffer.slice(end);
+    setEditBuffer(next);
+    requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = start + 2; });
+  };
 
   return (
     <div style={{ display: "flex", flex: 1, flexDirection: "column", minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
@@ -982,17 +1284,33 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
         viewMode={viewMode}
         setViewMode={setViewMode}
         noDiff={noDiff}
+        onDownload={!showSqlite ? onDownload : undefined}
+        canEdit={canEdit}
+        editing={editing}
+        saving={saving}
+        isModified={isModified}
+        onEditToggle={editing ? handleSave : beginEdit}
+        onCancelEdit={cancelEdit}
       />
-      <ViewerContent
-        sessionId={sessionId}
-        entry={entry}
-        fileData={fileData}
-        fileLoading={fileLoading}
-        scrollToFirst={false}
-        viewMode={viewMode}
-        mdPreview={mdPreview}
-        noDiff={noDiff}
-      />
+      {editing && fileData ? (
+        <EditorWithLineNumbers
+          textareaRef={editTextareaRef}
+          content={editBuffer}
+          onChange={setEditBuffer}
+          onKeyDown={handleEditTabKey}
+        />
+      ) : (
+        <ViewerContent
+          sessionId={sessionId}
+          entry={entry}
+          fileData={fileData}
+          fileLoading={fileLoading}
+          scrollToFirst={false}
+          viewMode={viewMode}
+          mdPreview={mdPreview}
+          noDiff={noDiff}
+        />
+      )}
     </div>
   );
 }
@@ -1005,6 +1323,7 @@ export function CodePane({
   selectedPathExternal,
   openPath,
   hideLeftPanel,
+  onGitClick,
 }: {
   sessionId: string;
   // Tree-only mode: when provided, file clicks call this instead of opening viewer inline
@@ -1013,6 +1332,7 @@ export function CodePane({
   // Legacy: open a specific file from outside (only used in inline viewer mode)
   openPath?: { path: string; v: number; viewMode?: "full" | "diff" | "split" } | null;
   hideLeftPanel?: boolean;
+  onGitClick?: () => void;
 }) {
   const treeOnly = !!onFileSelect;
 
@@ -1028,10 +1348,74 @@ export function CodePane({
   // false when file was opened from FILES (plain view, no diff UI)
   const [selectedFromChanges, setSelectedFromChanges] = useState(true);
 
+  // ── Toolbar / action state (ported from FileEditorModal) ───────────────────
+  type ToolForm = null | "search" | "newFile" | "newFolder" | "upload" | "historySearch";
+  const [toolForm, setToolForm] = useState<ToolForm>(null);
+  const [toolError, setToolError] = useState("");
+  const [toolBusy, setToolBusy] = useState(false);
+  // Search
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<FileEntry[] | null>(null);
+  const [searchLoading, setSearchLoading] = useState(false);
+  // New file / folder
+  const [newName, setNewName] = useState("");
+  const [newParent, setNewParent] = useState("");
+  // Upload
+  const [uploadDir, setUploadDir] = useState("");
+  const [uploadPending, setUploadPending] = useState<File | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  // History search by path
+  const [historySearchPath, setHistorySearchPath] = useState("");
+  // Context menu (on tree entries)
+  const [ctxMenu, setCtxMenu] = useState<{ entry: FileEntry; x: number; y: number } | null>(null);
+  // Rename / move / delete / git-history modals
+  const [renameTarget, setRenameTarget] = useState<{ entry: FileEntry; value: string } | null>(null);
+  const [moveTarget, setMoveTarget] = useState<{ entry: FileEntry; dest: string } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ entry: FileEntry; recursive: boolean } | null>(null);
+  const [historyTarget, setHistoryTarget] = useState<{
+    path: string;
+    log: Array<{ hash: string; short_hash: string; subject: string; author: string; date: string }>;
+    loading: boolean;
+    selected: { commit: string; full: string; diff: string; viewMode: "diff" | "full" } | null;
+  } | null>(null);
+
   const autoFollowRef = useRef(autoFollow);
   autoFollowRef.current = autoFollow;
   const selectedRef = useRef<string | null>(null);
   const prevChangedRef = useRef<Set<string>>(new Set());
+
+  // Debounce search query
+  useEffect(() => {
+    if (toolForm !== "search") { setSearchResults(null); return; }
+    if (!searchQuery.trim()) { setSearchResults(null); setSearchLoading(false); return; }
+    setSearchLoading(true);
+    const id = window.setTimeout(async () => {
+      try {
+        const r = await searchFiles(sessionId, searchQuery.trim(), false);
+        setSearchResults(r.entries);
+      } catch { setSearchResults([]); }
+      finally { setSearchLoading(false); }
+    }, 250);
+    return () => window.clearTimeout(id);
+  }, [searchQuery, sessionId, toolForm]);
+
+  // Close context menu on outside click
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    return () => { window.removeEventListener("click", close); window.removeEventListener("scroll", close, true); };
+  }, [ctxMenu]);
+
+  // Reset form state when toolForm changes
+  useEffect(() => {
+    setToolError(""); setToolBusy(false);
+    if (toolForm !== "search") { setSearchQuery(""); setSearchResults(null); }
+    if (toolForm !== "newFile" && toolForm !== "newFolder") { setNewName(""); setNewParent(""); }
+    if (toolForm !== "upload") { setUploadDir(""); setUploadPending(null); }
+    if (toolForm !== "historySearch") setHistorySearchPath("");
+  }, [toolForm]);
 
   const loadFile = useCallback(async (entry: FileEntry, scroll = false) => {
     if (isImage(entry.name) || entry.is_sqlite || isPdfFile(entry.name) || entry.is_archive) {
@@ -1138,6 +1522,148 @@ export function CodePane({
   const highlightedPath = treeOnly ? (selectedPathExternal ?? null) : (selectedEntry?.path ?? null);
   const selectedChanged = changedFiles.find((f) => f.path === (treeOnly ? selectedPathExternal : selectedEntry?.path));
 
+  // ── Action handlers ─────────────────────────────────────────────────────────
+  const bumpFilesRefresh = useCallback(() => setFilesRefreshKey((k) => k + 1), []);
+
+  const handleCreateFile = useCallback(async () => {
+    const name = newName.trim();
+    if (!name) { setToolError("filename required"); return; }
+    if (/[/\\]/.test(name)) { setToolError("name cannot contain / or \\"); return; }
+    setToolBusy(true); setToolError("");
+    try {
+      const path = newParent ? `${newParent}/${name}` : name;
+      await writeFile(sessionId, path, "");
+      bumpFilesRefresh();
+      setToolForm(null);
+    } catch (e) { setToolError(String(e)); }
+    finally { setToolBusy(false); }
+  }, [sessionId, newName, newParent, bumpFilesRefresh]);
+
+  const handleCreateFolder = useCallback(async () => {
+    const name = newName.trim();
+    if (!name) { setToolError("folder name required"); return; }
+    if (/[/\\]/.test(name)) { setToolError("name cannot contain / or \\"); return; }
+    setToolBusy(true); setToolError("");
+    try {
+      const path = newParent ? `${newParent}/${name}` : name;
+      await createDir(sessionId, path);
+      bumpFilesRefresh();
+      setToolForm(null);
+    } catch (e) { setToolError(String(e)); }
+    finally { setToolBusy(false); }
+  }, [sessionId, newName, newParent, bumpFilesRefresh]);
+
+  const handleUpload = useCallback(async () => {
+    if (!uploadPending) { setToolError("pick a file first"); return; }
+    setToolBusy(true); setToolError("");
+    try {
+      await uploadFile(sessionId, uploadDir, uploadPending);
+      bumpFilesRefresh();
+      setToolForm(null);
+    } catch (e) { setToolError(String(e)); }
+    finally { setToolBusy(false); }
+  }, [sessionId, uploadDir, uploadPending, bumpFilesRefresh]);
+
+  const handleRenameCommit = useCallback(async () => {
+    if (!renameTarget) return;
+    const v = renameTarget.value.trim();
+    if (!v) { setToolError("new name required"); return; }
+    if (/[/\\]/.test(v)) { setToolError("name cannot contain / or \\"); return; }
+    if (v === renameTarget.entry.name) { setRenameTarget(null); return; }
+    setToolBusy(true); setToolError("");
+    try {
+      await renameEntry(sessionId, renameTarget.entry.path, v);
+      bumpFilesRefresh();
+      setRenameTarget(null);
+    } catch (e) { setToolError(String(e)); }
+    finally { setToolBusy(false); }
+  }, [sessionId, renameTarget, bumpFilesRefresh]);
+
+  const handleMoveCommit = useCallback(async () => {
+    if (!moveTarget) return;
+    setToolBusy(true); setToolError("");
+    try {
+      await moveEntry(sessionId, moveTarget.entry.path, moveTarget.dest);
+      bumpFilesRefresh();
+      setMoveTarget(null);
+    } catch (e) { setToolError(String(e)); }
+    finally { setToolBusy(false); }
+  }, [sessionId, moveTarget, bumpFilesRefresh]);
+
+  const handleDeleteCommit = useCallback(async () => {
+    if (!deleteTarget) return;
+    setToolBusy(true); setToolError("");
+    try {
+      await deleteEntry(sessionId, deleteTarget.entry.path, deleteTarget.recursive);
+      bumpFilesRefresh();
+      setDeleteTarget(null);
+    } catch (e) { setToolError(String(e)); }
+    finally { setToolBusy(false); }
+  }, [sessionId, deleteTarget, bumpFilesRefresh]);
+
+  const openGitHistory = useCallback(async (path: string) => {
+    setHistoryTarget({ path, log: [], loading: true, selected: null });
+    try {
+      const log = await getFileGitLog(sessionId, path, 50);
+      setHistoryTarget((h) => h && h.path === path ? { ...h, log, loading: false } : h);
+    } catch (e) {
+      setToolError(String(e));
+      setHistoryTarget((h) => h && h.path === path ? { ...h, loading: false } : h);
+    }
+  }, [sessionId]);
+
+  const loadHistoryCommit = useCallback(async (commit: string, mode: "diff" | "full" = "diff") => {
+    if (!historyTarget) return;
+    const path = historyTarget.path;
+    setHistoryTarget((h) => h ? { ...h, selected: { commit, full: "", diff: "", viewMode: mode } } : h);
+    try {
+      const [diffRes, fullRes] = await Promise.all([
+        getFileGitDiff(sessionId, path, commit).catch(() => ({ diff: "" })),
+        getFileGitShow(sessionId, path, commit).catch(() => ({ content: "" })),
+      ]);
+      setHistoryTarget((h) => h && h.selected?.commit === commit
+        ? { ...h, selected: { commit, diff: diffRes.diff || "", full: fullRes.content || "", viewMode: mode } }
+        : h);
+    } catch {/* ignore */}
+  }, [sessionId, historyTarget]);
+
+  const handleHistorySearchSubmit = useCallback(() => {
+    const v = historySearchPath.trim();
+    if (!v) return;
+    setToolForm(null);
+    openGitHistory(v);
+  }, [historySearchPath, openGitHistory]);
+
+  // Context-menu actions
+  const onEntryContextMenu = useCallback((e: React.MouseEvent, entry: FileEntry) => {
+    e.preventDefault(); e.stopPropagation();
+    setCtxMenu({ entry, x: e.clientX, y: e.clientY });
+  }, []);
+
+  // Two-row toolbar — Row 1: branch picker + Pull + Git panel (Pull and Git
+  // adjacent, no gap). Row 2: history search + file-management actions.
+  // Branch picker is granted `maxWidth = spare`, so it expands gradually as the
+  // column widens (RTL ellipsis shows more of the name as the picker grows).
+  const [toolbarRef, toolbarWidth] = useResizeWidth<HTMLDivElement>();
+
+  const secondRowItems = useMemo(() => [
+    { key: "historySearch", label: "Git history by path", icon: "⏱", active: toolForm === "historySearch", onClick: () => setToolForm(toolForm === "historySearch" ? null : "historySearch") },
+    { key: "search",    label: "Search files", icon: "🔍", active: toolForm === "search",    onClick: () => setToolForm(toolForm === "search" ? null : "search") },
+    { key: "newFile",   label: "New file",     icon: "+",  active: toolForm === "newFile",   onClick: () => setToolForm(toolForm === "newFile" ? null : "newFile") },
+    { key: "newFolder", label: "New folder",   icon: "📁", active: toolForm === "newFolder", onClick: () => setToolForm(toolForm === "newFolder" ? null : "newFolder") },
+    { key: "upload",    label: "Upload file",  icon: "⬆", active: toolForm === "upload",    onClick: () => setToolForm(toolForm === "upload" ? null : "upload") },
+  ], [toolForm]);
+
+  const branchMaxWidth = useMemo(() => {
+    if (toolbarWidth <= 0) return undefined;
+    const FILES_W = 32, PAD_W = 14, GAP_W = 3;
+    const PULL_FULL = 60;
+    const GIT_ICON_W = 24;
+    // Layout: Files [gap] Picker [gap] [Pull][Git] (Pull/Git adjacent, no gap).
+    const fixed = FILES_W + PAD_W + GAP_W * 2 + PULL_FULL + (onGitClick ? GIT_ICON_W : 0);
+    return Math.max(40, toolbarWidth - fixed);
+  }, [toolbarWidth, onGitClick]);
+
   return (
     <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
 
@@ -1145,8 +1671,141 @@ export function CodePane({
       {!hideLeftPanel && (
         <div style={{ flex: treeOnly ? 1 : undefined, width: treeOnly ? undefined : 220, flexShrink: 0, borderRight: treeOnly ? "none" : "1px solid var(--bg-hover)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
 
-          {/* Changes */}
-          <div style={{ borderBottom: "1px solid var(--bg-hover)", flexShrink: 0 }}>
+          {/* Row 1: Files label + branch picker + Pull + Git panel (Pull/Git adjacent, no gap) */}
+          <div ref={toolbarRef} style={{ padding: "4px 6px 2px", display: "flex", alignItems: "center", gap: 3, flexShrink: 0, borderBottom: "1px solid var(--bg-hover)", minWidth: 0 }}>
+            <span style={{ fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", paddingLeft: 4, flexShrink: 0 }}>Files</span>
+            <GitBranchPicker
+              sessionId={sessionId}
+              refreshKey={filesRefreshKey}
+              onBranchChanged={bumpFilesRefresh}
+              maxWidth={branchMaxWidth}
+            />
+            <div style={{ display: "flex", alignItems: "center", gap: 0, marginLeft: "auto", flexShrink: 0 }}>
+              <GitPullButton sessionId={sessionId} onPulled={bumpFilesRefresh} />
+              {onGitClick && (
+                <button title="Git panel" onClick={onGitClick} style={toolbarIconBtn(false)}>⎇</button>
+              )}
+            </div>
+          </div>
+
+          {/* Row 2: history search + file management actions */}
+          <div style={{ padding: "2px 6px 4px", display: "flex", alignItems: "center", gap: 2, flexShrink: 0, borderBottom: "1px solid var(--bg-hover)", minWidth: 0 }}>
+            {secondRowItems.map(it => (
+              <button key={it.key} title={it.label} onClick={it.onClick} style={toolbarIconBtn(it.active)}>{it.icon}</button>
+            ))}
+          </div>
+
+          {/* Inline forms */}
+          {toolForm && (
+            <div style={{ padding: "6px 8px 8px", borderBottom: "1px solid var(--bg-hover)", background: "var(--bg-base)", flexShrink: 0 }}>
+              {toolForm === "search" && (
+                <input
+                  autoFocus
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Escape") setToolForm(null); }}
+                  placeholder="Search files…"
+                  style={inlineInputStyle}
+                />
+              )}
+              {(toolForm === "newFile" || toolForm === "newFolder") && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  <div style={{ fontSize: 10, color: "var(--text-muted)" }}>Parent directory:</div>
+                  <DirPicker sessionId={sessionId} value={newParent} onChange={setNewParent} />
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <input
+                      autoFocus
+                      value={newName}
+                      onChange={(e) => setNewName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") { e.preventDefault(); (toolForm === "newFile" ? handleCreateFile : handleCreateFolder)(); }
+                        if (e.key === "Escape") setToolForm(null);
+                      }}
+                      placeholder={toolForm === "newFile" ? "filename.py" : "new-dir-name"}
+                      style={{ ...inlineInputStyle, flex: 1 }}
+                    />
+                    <button onClick={toolForm === "newFile" ? handleCreateFile : handleCreateFolder} disabled={toolBusy || !newName.trim()}
+                      style={primaryBtn}>{toolBusy ? "…" : "OK"}</button>
+                    <button onClick={() => setToolForm(null)} style={ghostBtn}>✕</button>
+                  </div>
+                  {newName.trim() && (
+                    <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "monospace" }}>
+                      → {newParent ? `${newParent}/${newName.trim()}` : newName.trim()}
+                    </div>
+                  )}
+                </div>
+              )}
+              {toolForm === "upload" && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  <div style={{ fontSize: 10, color: "var(--text-muted)" }}>Upload to:</div>
+                  <DirPicker sessionId={sessionId} value={uploadDir} onChange={setUploadDir} />
+                  <input ref={uploadInputRef} type="file" style={{ display: "none" }}
+                    onChange={(e) => setUploadPending(e.target.files?.[0] ?? null)} />
+                  <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                    <button onClick={() => uploadInputRef.current?.click()} style={ghostBtn}>Choose…</button>
+                    <span style={{ fontSize: 10, color: uploadPending ? "var(--text-secondary)" : "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+                      {uploadPending ? uploadPending.name : "No file chosen"}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <button onClick={handleUpload} disabled={toolBusy || !uploadPending} style={primaryBtn}>{toolBusy ? "Uploading…" : "Upload"}</button>
+                    <button onClick={() => setToolForm(null)} style={ghostBtn}>✕</button>
+                  </div>
+                </div>
+              )}
+              {toolForm === "historySearch" && (
+                <div style={{ display: "flex", gap: 4 }}>
+                  <input
+                    autoFocus
+                    value={historySearchPath}
+                    onChange={(e) => setHistorySearchPath(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleHistorySearchSubmit(); } if (e.key === "Escape") setToolForm(null); }}
+                    placeholder="relative/path/to/file"
+                    style={{ ...inlineInputStyle, flex: 1 }}
+                  />
+                  <button onClick={handleHistorySearchSubmit} disabled={!historySearchPath.trim()} style={primaryBtn}>Go</button>
+                  <button onClick={() => setToolForm(null)} style={ghostBtn}>✕</button>
+                </div>
+              )}
+              {toolError && <div style={{ fontSize: 10, color: "var(--accent-red)", marginTop: 4 }}>{toolError}</div>}
+            </div>
+          )}
+
+          {/* File tree / search results (fills remaining space) */}
+          <div style={{ overflowY: "auto", flex: 1, paddingTop: 4 }}>
+            {toolForm === "search" && searchQuery.trim() ? (
+              searchLoading ? (
+                <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-faint)" }}>Searching…</div>
+              ) : searchResults && searchResults.length === 0 ? (
+                <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-faint)" }}>No matches</div>
+              ) : (
+                searchResults?.map((e) => (
+                  <div key={e.path}
+                    onClick={() => handleSelect(e)}
+                    onContextMenu={(ev) => onEntryContextMenu(ev, e)}
+                    style={{ padding: "3px 10px", fontSize: 12, cursor: "pointer", color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: 5, borderBottom: "1px solid var(--bg-deep)" }}
+                    onMouseEnter={(el) => { el.currentTarget.style.background = "var(--bg-surface)"; }}
+                    onMouseLeave={(el) => { el.currentTarget.style.background = "transparent"; }}>
+                    <span style={{ fontSize: 13, flexShrink: 0 }}>{e.type === "dir" ? "📁" : fileIcon(e.name)}</span>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, fontFamily: "monospace" }}>{e.path}</span>
+                  </div>
+                ))
+              )
+            ) : (
+              <FileTree
+                sessionId={sessionId}
+                selected={highlightedPath}
+                changed={changedSet}
+                onSelect={handleSelect}
+                onEntryContextMenu={onEntryContextMenu}
+                revealPath={highlightedPath}
+                refreshKey={filesRefreshKey}
+              />
+            )}
+          </div>
+
+          {/* Changes (middle) */}
+          <div style={{ borderTop: "1px solid var(--bg-hover)", flexShrink: 0 }}>
             <div style={{ padding: "5px 10px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
               <span>Changes ({changedFiles.length})</span>
               {!treeOnly && (
@@ -1186,20 +1845,8 @@ export function CodePane({
             )}
           </div>
 
-          {/* File tree */}
-          <div style={{ overflowY: "auto", flex: 1, paddingTop: 4 }}>
-            <div style={{ padding: "4px 10px 2px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-              Files
-            </div>
-            <FileTree
-              sessionId={sessionId}
-              selected={highlightedPath}
-              changed={changedSet}
-              onSelect={handleSelect}
-              revealPath={highlightedPath}
-              refreshKey={filesRefreshKey}
-            />
-          </div>
+          {/* Recent commits (bottom) */}
+          <RecentCommitsPanel sessionId={sessionId} />
         </div>
       )}
 
@@ -1238,6 +1885,202 @@ export function CodePane({
           />
         </div>
       )}
+
+      {/* ── Context menu ── */}
+      {ctxMenu && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed", top: ctxMenu.y, left: ctxMenu.x, zIndex: 9000,
+            background: "var(--bg-modal)", border: "1px solid var(--border)", borderRadius: 6,
+            boxShadow: "0 6px 16px rgba(0,0,0,0.4)", minWidth: 160, padding: 4,
+          }}
+        >
+          <CtxItem label="Rename…" onClick={() => { setRenameTarget({ entry: ctxMenu.entry, value: ctxMenu.entry.name }); setCtxMenu(null); }} />
+          <CtxItem label="Move to…" onClick={() => { setMoveTarget({ entry: ctxMenu.entry, dest: "" }); setCtxMenu(null); }} />
+          {ctxMenu.entry.type === "file" && (
+            <CtxItem label="Git history" onClick={() => { openGitHistory(ctxMenu.entry.path); setCtxMenu(null); }} />
+          )}
+          <div style={{ height: 1, background: "var(--bg-hover)", margin: "3px 0" }} />
+          <CtxItem
+            label={ctxMenu.entry.type === "dir" ? "Delete (recursive)…" : "Delete…"}
+            destructive
+            onClick={() => { setDeleteTarget({ entry: ctxMenu.entry, recursive: ctxMenu.entry.type === "dir" }); setCtxMenu(null); }}
+          />
+        </div>
+      )}
+
+      {/* ── Rename modal ── */}
+      {renameTarget && (
+        <SmallModal title={`Rename ${renameTarget.entry.type === "dir" ? "folder" : "file"}`} onClose={() => setRenameTarget(null)}>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6, fontFamily: "monospace", wordBreak: "break-all" }}>
+            {renameTarget.entry.path}
+          </div>
+          <input
+            autoFocus
+            value={renameTarget.value}
+            onChange={(e) => setRenameTarget((t) => t ? { ...t, value: e.target.value } : t)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleRenameCommit(); } if (e.key === "Escape") setRenameTarget(null); }}
+            style={inlineInputStyle}
+          />
+          {toolError && <div style={{ fontSize: 10, color: "var(--accent-red)", marginTop: 4 }}>{toolError}</div>}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 10 }}>
+            <button onClick={() => setRenameTarget(null)} style={ghostBtn}>Cancel</button>
+            <button onClick={handleRenameCommit} disabled={toolBusy || !renameTarget.value.trim()} style={primaryBtn}>{toolBusy ? "…" : "Rename"}</button>
+          </div>
+        </SmallModal>
+      )}
+
+      {/* ── Move modal ── */}
+      {moveTarget && (
+        <SmallModal title="Move to" onClose={() => setMoveTarget(null)}>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6, fontFamily: "monospace", wordBreak: "break-all" }}>
+            {moveTarget.entry.path}
+          </div>
+          <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 4 }}>Destination directory:</div>
+          <DirPicker sessionId={sessionId} value={moveTarget.dest} onChange={(p) => setMoveTarget((t) => t ? { ...t, dest: p } : t)} />
+          <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "monospace", marginTop: 6 }}>
+            → {moveTarget.dest ? `${moveTarget.dest}/${moveTarget.entry.name}` : moveTarget.entry.name}
+          </div>
+          {toolError && <div style={{ fontSize: 10, color: "var(--accent-red)", marginTop: 4 }}>{toolError}</div>}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 10 }}>
+            <button onClick={() => setMoveTarget(null)} style={ghostBtn}>Cancel</button>
+            <button onClick={handleMoveCommit} disabled={toolBusy} style={primaryBtn}>{toolBusy ? "…" : "Move"}</button>
+          </div>
+        </SmallModal>
+      )}
+
+      {/* ── Delete confirm ── */}
+      {deleteTarget && (
+        <SmallModal title={`Delete ${deleteTarget.entry.type === "dir" ? "folder" : "file"}?`} onClose={() => setDeleteTarget(null)}>
+          <div style={{ fontSize: 12, color: "var(--text-primary)", marginBottom: 8 }}>
+            This action cannot be undone.
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text-secondary)", fontFamily: "monospace", wordBreak: "break-all", padding: "6px 8px", background: "var(--bg-base)", borderRadius: 4, border: "1px solid var(--border)" }}>
+            {deleteTarget.entry.path}
+          </div>
+          {deleteTarget.entry.type === "dir" && (
+            <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, fontSize: 11, color: "var(--text-secondary)", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={deleteTarget.recursive}
+                onChange={(e) => setDeleteTarget((t) => t ? { ...t, recursive: e.target.checked } : t)}
+              />
+              Recursive (delete folder and all contents)
+            </label>
+          )}
+          {toolError && <div style={{ fontSize: 10, color: "var(--accent-red)", marginTop: 6 }}>{toolError}</div>}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 12 }}>
+            <button onClick={() => setDeleteTarget(null)} style={ghostBtn}>Cancel</button>
+            <button onClick={handleDeleteCommit} disabled={toolBusy}
+              style={{ ...primaryBtn, background: "var(--accent-red)" }}>{toolBusy ? "…" : "Delete"}</button>
+          </div>
+        </SmallModal>
+      )}
+
+      {/* ── Git history modal ── */}
+      {historyTarget && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 9000, display: "flex", alignItems: "center", justifyContent: "center" }}
+          onClick={() => setHistoryTarget(null)}>
+          <div onClick={(e) => e.stopPropagation()}
+            style={{ width: "min(1100px, 95vw)", height: "min(700px, 90vh)", background: "var(--bg-modal)", border: "1px solid var(--border)", borderRadius: 8, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "8px 12px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>Git history</span>
+              <span style={{ fontSize: 12, fontFamily: "monospace", color: "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{historyTarget.path}</span>
+              {historyTarget.selected && (
+                <div style={{ display: "flex", gap: 4 }}>
+                  <button onClick={() => setHistoryTarget((h) => h && h.selected ? { ...h, selected: { ...h.selected, viewMode: "diff" } } : h)}
+                    style={{ ...toolbarIconBtn(historyTarget.selected.viewMode === "diff"), width: "auto", padding: "2px 10px", fontSize: 11 }}>Diff</button>
+                  <button onClick={() => setHistoryTarget((h) => h && h.selected ? { ...h, selected: { ...h.selected, viewMode: "full" } } : h)}
+                    style={{ ...toolbarIconBtn(historyTarget.selected.viewMode === "full"), width: "auto", padding: "2px 10px", fontSize: 11 }}>Full</button>
+                </div>
+              )}
+              <button onClick={() => setHistoryTarget(null)} style={ghostBtn}>✕</button>
+            </div>
+            <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+              <div style={{ width: historyTarget.selected ? 300 : "100%", overflowY: "auto", borderRight: historyTarget.selected ? "1px solid var(--border)" : "none", flexShrink: 0 }}>
+                {historyTarget.loading ? (
+                  <div style={{ padding: 24, color: "var(--text-muted)", fontSize: 12, textAlign: "center" }}>Loading…</div>
+                ) : historyTarget.log.length === 0 ? (
+                  <div style={{ padding: 24, color: "var(--text-muted)", fontSize: 12, textAlign: "center" }}>No history found</div>
+                ) : historyTarget.log.map((entry) => {
+                  const isSel = historyTarget.selected?.commit === entry.hash;
+                  return (
+                    <div key={entry.hash} onClick={() => loadHistoryCommit(entry.hash, historyTarget.selected?.viewMode ?? "diff")}
+                      style={{ padding: "7px 12px", borderBottom: "1px solid var(--bg-hover)", cursor: "pointer", background: isSel ? "rgba(88,166,255,0.12)" : "transparent" }}
+                      onMouseEnter={(e) => { if (!isSel) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                      onMouseLeave={(e) => { if (!isSel) e.currentTarget.style.background = "transparent"; }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
+                        <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{entry.short_hash}</span>
+                        <span style={{ color: "var(--text-muted)" }}>{entry.date.slice(0, 16).replace("T", " ")}</span>
+                        <span style={{ color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.author}</span>
+                      </div>
+                      <div style={{ fontSize: 12, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>{entry.subject}</div>
+                    </div>
+                  );
+                })}
+              </div>
+              {historyTarget.selected && (
+                <div style={{ flex: 1, overflow: "auto", background: "var(--bg-base)", padding: 0 }}>
+                  {historyTarget.selected.viewMode === "diff"
+                    ? <pre style={{ margin: 0, padding: 12, fontSize: 11, fontFamily: "monospace", color: "var(--text-primary)", whiteSpace: "pre", overflow: "visible" }}>{historyTarget.selected.diff || "(loading)"}</pre>
+                    : <pre style={{ margin: 0, padding: 12, fontSize: 11, fontFamily: "monospace", color: "var(--text-primary)", whiteSpace: "pre", overflow: "visible" }}>{historyTarget.selected.full || "(loading)"}</pre>
+                  }
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Helpers for toolbar/forms/modals ────────────────────────────────────────
+function toolbarIconBtn(active: boolean): React.CSSProperties {
+  return {
+    width: 24, height: 22, fontSize: 12, padding: 0,
+    background: active ? "color-mix(in srgb, var(--accent-blue) 18%, transparent)" : "transparent",
+    color: active ? "var(--accent-blue)" : "var(--text-secondary)",
+    border: `1px solid ${active ? "var(--accent-blue)" : "transparent"}`,
+    borderRadius: 4, cursor: "pointer",
+    display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+  };
+}
+const inlineInputStyle: React.CSSProperties = {
+  width: "100%", background: "var(--bg-base)", border: "1px solid var(--border)",
+  borderRadius: 3, padding: "3px 6px", color: "var(--text-body)", fontSize: 11,
+  outline: "none", boxSizing: "border-box",
+};
+const primaryBtn: React.CSSProperties = {
+  background: "var(--accent-blue)", color: "#fff", fontSize: 11, padding: "2px 10px",
+  border: "none", borderRadius: 3, cursor: "pointer", flexShrink: 0,
+};
+const ghostBtn: React.CSSProperties = {
+  background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 11, padding: "2px 8px",
+  border: "none", borderRadius: 3, cursor: "pointer", flexShrink: 0,
+};
+function CtxItem({ label, onClick, destructive }: { label: string; onClick: () => void; destructive?: boolean }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{ padding: "6px 12px", fontSize: 12, cursor: "pointer", borderRadius: 3, color: destructive ? "var(--accent-red)" : "var(--text-primary)" }}
+      onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+    >
+      {label}
+    </div>
+  );
+}
+function SmallModal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 9000, display: "flex", alignItems: "center", justifyContent: "center" }}
+      onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{ width: "min(440px, 92vw)", background: "var(--bg-modal)", border: "1px solid var(--border)", borderRadius: 8, padding: 14, color: "var(--text-primary)" }}>
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>{title}</div>
+        {children}
+      </div>
     </div>
   );
 }

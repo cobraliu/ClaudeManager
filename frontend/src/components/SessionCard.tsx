@@ -1,12 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import type { SessionMeta, ScheduledTask, SshConfig } from "../api/sessionApi";
-import { createTask, cancelTask, renameSession, makeRemoteUri } from "../api/sessionApi";
-import claudeIcon from "../assets/claude.svg";
-import cursorIcon from "../assets/cursor.svg";
-import gitIcon from "../assets/git.svg";
-import terminalIcon from "../assets/terminal.svg";
-import downloadIcon from "../assets/download.svg";
-import downloadChatIcon from "../assets/download-chat.svg";
+import type { SessionMeta, ScheduledTask } from "../api/sessionApi";
+import { createTask, cancelTask, renameSession } from "../api/sessionApi";
 import scheduleIcon from "../assets/schedule.svg";
 
 function _relTime(iso: string): string {
@@ -30,20 +24,13 @@ interface Props {
   session: SessionMeta;
   isActive?: boolean;
   showOwner?: boolean;
-  sshConfig?: SshConfig;
   onAttach?: () => void;
   onViewChat?: () => void;
   onTerminate?: () => void;
   onResume?: () => void;
   onDelete?: () => void;
   onTaskChange?: () => void;
-  onFiles?: () => void;
-  onShell?: () => void;
-  onGit?: () => void;
-  onJsonl?: () => void;
   onRename?: () => void;
-  onDownloadCwd?: () => void;
-  onDownloadChat?: () => void;
   loading?: boolean;
 }
 
@@ -58,6 +45,14 @@ function formatRemaining(runAt: string): string {
   return `${h}h ${m % 60}m`;
 }
 
+type DelayUnit = "seconds" | "minutes" | "hours";
+
+const _UNIT_SECS: Record<DelayUnit, number> = { seconds: 1, minutes: 60, hours: 3600 };
+
+function _toSeconds(value: string, unit: DelayUnit): number {
+  return Math.max(1, parseInt(value, 10) || 1) * _UNIT_SECS[unit];
+}
+
 function ScheduleForm({
   sessionId,
   onCreated,
@@ -69,16 +64,27 @@ function ScheduleForm({
 }) {
   const [command, setCommand] = useState("");
   const [delayValue, setDelayValue] = useState("5");
-  const [delayUnit, setDelayUnit] = useState<"seconds" | "minutes" | "hours">("minutes");
+  const [delayUnit, setDelayUnit] = useState<DelayUnit>("minutes");
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  // Loop fields are user-editable but track After-side defaults until the
+  // user manually edits them — see effect below.
+  const [loopValue, setLoopValue] = useState("5");
+  const [loopUnit, setLoopUnit] = useState<DelayUnit>("minutes");
+  const [loopValueTouched, setLoopValueTouched] = useState(false);
+  const [loopUnitTouched, setLoopUnitTouched] = useState(false);
   const [loading, setLoading] = useState(false);
+
+  // Keep loop value/unit synced with After until user explicitly edits them.
+  useEffect(() => { if (!loopValueTouched) setLoopValue(delayValue); }, [delayValue, loopValueTouched]);
+  useEffect(() => { if (!loopUnitTouched) setLoopUnit(delayUnit); }, [delayUnit, loopUnitTouched]);
 
   const submit = async () => {
     if (!command.trim()) return;
-    const multiplier = delayUnit === "seconds" ? 1 : delayUnit === "minutes" ? 60 : 3600;
-    const delay_seconds = Math.max(1, parseInt(delayValue, 10) || 1) * multiplier;
+    const delay_seconds = _toSeconds(delayValue, delayUnit);
+    const loop_seconds = loopEnabled ? _toSeconds(loopValue, loopUnit) : null;
     setLoading(true);
     try {
-      await createTask(sessionId, command.trim(), delay_seconds);
+      await createTask(sessionId, command.trim(), delay_seconds, loop_seconds);
       onCreated();
       onClose();
     } catch (e) {
@@ -88,68 +94,137 @@ function ScheduleForm({
     }
   };
 
+  const unitSelectStyle: React.CSSProperties = {
+    background: "var(--bg-hover)",
+    border: "1px solid var(--text-faintest)",
+    borderRadius: 4,
+    color: "var(--text-body)",
+    fontSize: 11,
+    padding: "5px 6px",
+    cursor: "pointer",
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   return (
     <div
+      onClick={(e) => { e.stopPropagation(); onClose(); }}
       style={{
-        marginTop: 8,
-        padding: "10px 12px",
-        background: "var(--bg-base)",
-        borderRadius: 6,
-        border: "1px solid var(--text-faintest)",
-        display: "flex",
-        flexDirection: "column",
-        gap: 6,
+        position: "fixed", inset: 0, zIndex: 10000,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        background: "rgba(0,0,0,0.55)",
       }}
-      onClick={(e) => e.stopPropagation()}
     >
-      <div style={{ fontSize: 11, color: "var(--text-secondary)", fontWeight: 600 }}>Schedule Command</div>
-      <input
-        autoFocus
-        placeholder="Command to send..."
-        value={command}
-        onChange={(e) => setCommand(e.target.value)}
-        onKeyDown={(e) => { if (e.key === "Enter") submit(); if (e.key === "Escape") onClose(); }}
-        style={inputStyle}
-      />
-      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-        <span style={{ fontSize: 11, color: "var(--text-muted)", flexShrink: 0 }}>In</span>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "var(--bg-modal)",
+          border: "1px solid var(--text-faintest)",
+          borderRadius: 8,
+          padding: 16,
+          width: "min(440px, 92vw)",
+          display: "flex",
+          flexDirection: "column",
+          gap: 10,
+          boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontSize: 13, color: "var(--text-secondary)", fontWeight: 600 }}>Schedule Command</div>
+          <button onClick={onClose} style={{ background: "var(--text-faintest)", color: "var(--text-secondary)", fontSize: 11, padding: "2px 8px" }}>✕</button>
+        </div>
         <input
-          type="number"
-          min={1}
-          value={delayValue}
-          onChange={(e) => setDelayValue(e.target.value)}
-          style={{ ...inputStyle, width: 60, padding: "5px 8px" }}
+          autoFocus
+          placeholder="Command to send..."
+          value={command}
+          onChange={(e) => setCommand(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+          style={inputStyle}
         />
-        <select
-          value={delayUnit}
-          onChange={(e) => setDelayUnit(e.target.value as typeof delayUnit)}
-          style={{
-            background: "var(--bg-hover)",
-            border: "1px solid var(--text-faintest)",
-            borderRadius: 4,
-            color: "var(--text-body)",
-            fontSize: 11,
-            padding: "5px 6px",
-            cursor: "pointer",
-          }}
-        >
-          <option value="seconds">seconds</option>
-          <option value="minutes">minutes</option>
-          <option value="hours">hours</option>
-        </select>
-        <button
-          disabled={loading || !command.trim()}
-          onClick={submit}
-          style={{ background: "var(--accent-blue)", color: "#fff", fontSize: 11, padding: "4px 10px", marginLeft: "auto" }}
-        >
-          {loading ? "..." : "Set"}
-        </button>
-        <button onClick={onClose} style={{ background: "var(--text-faintest)", color: "var(--text-secondary)", fontSize: 11, padding: "4px 8px" }}>
-          ✕
-        </button>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ fontSize: 12, color: "var(--text-muted)", width: 44, flexShrink: 0 }}>After</span>
+          <input
+            type="number"
+            min={1}
+            value={delayValue}
+            onChange={(e) => setDelayValue(e.target.value)}
+            style={{ ...inputStyle, width: 72, padding: "6px 8px", textAlign: "right" }}
+          />
+          <select
+            value={delayUnit}
+            onChange={(e) => setDelayUnit(e.target.value as DelayUnit)}
+            style={unitSelectStyle}
+          >
+            <option value="seconds">seconds</option>
+            <option value="minutes">minutes</option>
+            <option value="hours">hours</option>
+          </select>
+          <label
+            title="Repeat this command at a fixed interval after each fire"
+            style={{ display: "flex", alignItems: "center", gap: 5, marginLeft: "auto", cursor: "pointer", fontSize: 12, color: loopEnabled ? "#a78bfa" : "var(--text-muted)" }}
+          >
+            <input
+              type="checkbox"
+              checked={loopEnabled}
+              onChange={(e) => setLoopEnabled(e.target.checked)}
+              style={{ cursor: "pointer", margin: 0 }}
+            />
+            <span>↻ Loop</span>
+          </label>
+        </div>
+        {loopEnabled && (
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: "#a78bfa", width: 44, flexShrink: 0 }}>Every</span>
+            <input
+              type="number"
+              min={1}
+              value={loopValue}
+              onChange={(e) => { setLoopValue(e.target.value); setLoopValueTouched(true); }}
+              style={{ ...inputStyle, width: 72, padding: "6px 8px", textAlign: "right", borderColor: "#7c3aed" }}
+            />
+            <select
+              value={loopUnit}
+              onChange={(e) => { setLoopUnit(e.target.value as DelayUnit); setLoopUnitTouched(true); }}
+              style={{ ...unitSelectStyle, borderColor: "#7c3aed" }}
+            >
+              <option value="seconds">seconds</option>
+              <option value="minutes">minutes</option>
+              <option value="hours">hours</option>
+            </select>
+            <span style={{ fontSize: 10, color: "var(--text-faint)", marginLeft: "auto" }}>after each fire</span>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+          <button
+            disabled={loading || !command.trim()}
+            onClick={submit}
+            style={{ background: "var(--accent-blue)", color: "#fff", fontSize: 12, padding: "6px 14px", marginLeft: "auto" }}
+          >
+            {loading ? "..." : (loopEnabled ? "Set loop" : "Set")}
+          </button>
+          <button onClick={onClose} style={{ background: "var(--text-faintest)", color: "var(--text-secondary)", fontSize: 12, padding: "6px 12px" }}>
+            Cancel
+          </button>
+        </div>
       </div>
     </div>
   );
+}
+
+function _formatInterval(totalSeconds: number): string {
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  if (totalSeconds < 3600) {
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    return s === 0 ? `${m}m` : `${m}m${s}s`;
+  }
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  return m === 0 ? `${h}h` : `${h}h${m}m`;
 }
 
 function TaskChip({ task, sessionId, onCancel }: { task: ScheduledTask; sessionId: string; onCancel: () => void }) {
@@ -173,8 +248,9 @@ function TaskChip({ task, sessionId, onCancel }: { task: ScheduledTask; sessionI
     }
   };
 
-  const cmd = task.command.length > 35 ? task.command.slice(0, 35) + "…" : task.command;
   const remaining = formatRemaining(task.run_at);
+  const isLoop = !!task.loop_seconds;
+  const intervalLabel = isLoop ? _formatInterval(task.loop_seconds!) : null;
 
   return (
     <div
@@ -182,23 +258,35 @@ function TaskChip({ task, sessionId, onCancel }: { task: ScheduledTask; sessionI
         display: "flex",
         alignItems: "center",
         gap: 6,
-        background: "var(--bg-hover)",
+        background: isLoop ? "rgba(124,58,237,0.18)" : "var(--bg-hover)",
+        border: isLoop ? "1px solid #7c3aed" : "1px solid transparent",
         borderRadius: 4,
         padding: "3px 8px",
         fontSize: 11,
+        minWidth: 0,
       }}
       onClick={(e) => e.stopPropagation()}
+      title={`${task.command}${isLoop ? ` (repeats every ${intervalLabel})` : ""}`}
     >
-      <img src={scheduleIcon} style={{ width: 12, height: 12, flexShrink: 0, filter: "invert(0.7) sepia(1) saturate(3) hue-rotate(10deg)" }} />
-      <span style={{ color: "var(--text-secondary)", fontFamily: "monospace", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-        {cmd}
+      {isLoop ? (
+        <span style={{ color: "#a78bfa", fontSize: 13, flexShrink: 0, lineHeight: 1 }}>↻</span>
+      ) : (
+        <img src={scheduleIcon} style={{ width: 12, height: 12, flexShrink: 0, filter: "invert(0.7) sepia(1) saturate(3) hue-rotate(10deg)" }} />
+      )}
+      {isLoop && (
+        <span style={{ color: "#a78bfa", fontFamily: "monospace", fontSize: 10, flexShrink: 0, fontWeight: 600 }}>
+          /{intervalLabel}
+        </span>
+      )}
+      <span style={{ color: isLoop ? "#ddd6fe" : "var(--text-secondary)", fontFamily: "monospace", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {task.command}
       </span>
-      <span style={{ color: remaining === "due" ? "#f59e0b" : "var(--text-muted)", flexShrink: 0 }}>{remaining}</span>
+      <span style={{ color: remaining === "due" ? "#f59e0b" : (isLoop ? "#c4b5fd" : "var(--text-muted)"), flexShrink: 0 }}>{remaining}</span>
       <button
         disabled={cancelling}
         onClick={handleCancel}
         style={{ background: "transparent", color: "var(--text-faint)", fontSize: 12, padding: "0 2px", lineHeight: 1 }}
-        title="Cancel task"
+        title={isLoop ? "Cancel next iteration (loop stops)" : "Cancel task"}
       >
         ✕
       </button>
@@ -210,20 +298,13 @@ export function SessionCard({
   session: s,
   isActive,
   showOwner,
-  sshConfig,
   onAttach,
   onViewChat,
   onTerminate,
   onResume,
   onDelete,
   onTaskChange,
-  onFiles,
-  onShell,
-  onGit,
-  onJsonl,
   onRename,
-  onDownloadCwd,
-  onDownloadChat,
   loading,
 }: Props) {
   const canAttach = s.status === "running" || s.status === "detached";
@@ -349,76 +430,17 @@ export function SessionCard({
       )}
 
       {/* row 5: time + model + actions */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginTop: 6, flexWrap: "wrap", gap: 4 }}>
-        <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>
+      {/* No `gap` on the parent: marginLeft:auto on the buttons div handles the
+          spacing — when the row is wide there's a large auto-margin between
+          time and buttons; as the panel narrows the auto-margin shrinks to 0
+          and time/buttons touch; even narrower, buttons wrap to their own
+          line and stay right-aligned (auto-margin consumes left-side space). */}
+      <div style={{ display: "flex", alignItems: "center", marginTop: 6, flexWrap: "wrap", rowGap: 4 }}>
+        <span style={{ fontSize: 10, color: "var(--text-faint)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {new Date(s.created_at).toLocaleString()}
           {s.model && ` · ${s.model.replace("claude-", "").replace(/-\d{8}$/, "")}`}
         </span>
-        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
-          {sshConfig?.host && (
-            <>
-              <Btn
-                color="#1e3a2a"
-                label="VS Code"
-                title={`Open in VS Code (Remote SSH: ${sshConfig.user}@${sshConfig.host})`}
-                onClick={(e) => { e.stopPropagation(); window.open(makeRemoteUri("vscode", sshConfig, s.cwd)); }}
-              />
-              <Btn
-                color="#1a2a3a"
-                label="Cursor"
-                title={`Open in Cursor (Remote SSH: ${sshConfig.user}@${sshConfig.host})`}
-                onClick={(e) => { e.stopPropagation(); window.open(makeRemoteUri("cursor", sshConfig, s.cwd)); }}
-              />
-            </>
-          )}
-          {onFiles && (
-            <Btn
-              color="var(--btn-icon-bg)"
-              label="📁"
-              title="Browse & edit files"
-              onClick={(e) => { e.stopPropagation(); onFiles(); }}
-            />
-          )}
-          {onDownloadCwd && (
-            <Btn
-              color="var(--btn-icon-bg)"
-              label={<img src={downloadIcon} style={{ width: 13, height: 13, display: "block", filter: "invert(1)" }} />}
-              title="Download working directory as zip"
-              onClick={(e) => { e.stopPropagation(); onDownloadCwd(); }}
-            />
-          )}
-          {onDownloadChat && s.claude_session_id && (
-            <Btn
-              color="var(--btn-icon-bg)"
-              label={<img src={downloadChatIcon} style={{ width: 13, height: 13, display: "block", filter: "invert(1)" }} />}
-              title="Export chat as HTML"
-              onClick={(e) => { e.stopPropagation(); onDownloadChat(); }}
-            />
-          )}
-          {onShell && (
-            <Btn
-              color="var(--btn-icon-bg)"
-              label={<img src={terminalIcon} style={{ width: 13, height: 13, display: "block", filter: "invert(1)" }} />}
-              title="Open bash terminal"
-              onClick={(e) => { e.stopPropagation(); onShell(); }}
-            />
-          )}
-          {onJsonl && s.claude_session_id && (
-            <Btn
-              color="var(--btn-icon-bg)"
-              label={<img src={s.tool === "cursor" ? cursorIcon : claudeIcon} style={{ width: 12, height: 12, display: "block", filter: "invert(1)" }} />}
-              title="Preview conversation JSONL"
-              onClick={(e) => { e.stopPropagation(); onJsonl(); }}
-            />
-          )}
-          {onGit && (
-            <Btn
-              color="var(--btn-icon-bg)"
-              label={<img src={gitIcon} style={{ width: 12, height: 12, display: "block", filter: "invert(1)" }} />}
-              title="Git"
-              onClick={(e) => { e.stopPropagation(); onGit(); }}
-            />
-          )}
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end", marginLeft: "auto" }}>
           {canSchedule && (
             <Btn
               color={showSchedule ? "var(--accent-blue)" : "var(--btn-icon-bg)"}

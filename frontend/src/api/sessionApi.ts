@@ -4,6 +4,7 @@ export interface ScheduledTask {
   run_at: string;
   status: string;
   created_at: string;
+  loop_seconds?: number | null;
 }
 
 export interface SessionMeta {
@@ -84,7 +85,13 @@ async function request<T>(
   }
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`${resp.status}: ${text}`);
+    let msg = text;
+    try {
+      const j = JSON.parse(text);
+      if (typeof j?.detail === "string") msg = j.detail;
+      else if (Array.isArray(j?.detail)) msg = j.detail.map((d: { msg?: string }) => d?.msg).filter(Boolean).join("; ") || text;
+    } catch { /* not JSON, use raw text */ }
+    throw new Error(msg || `HTTP ${resp.status}`);
   }
   if (resp.status === 204) return undefined as unknown as T;
   return resp.json();
@@ -202,6 +209,8 @@ export interface ConfigView {
   cursor_bin: string;
   proxy: string;
   terminal_font: string;
+  term_idle_grace_seconds: number;
+  term_standby_grace_seconds: number;
 }
 
 export interface FontInfo {
@@ -252,32 +261,22 @@ export function setProxy(proxy: string): Promise<ConfigView> {
   });
 }
 
+export function setTermLifecycle(
+  idle_grace_seconds: number,
+  standby_grace_seconds: number,
+): Promise<ConfigView> {
+  return request("/api/config/term-lifecycle", {
+    method: "PUT",
+    body: JSON.stringify({ idle_grace_seconds, standby_grace_seconds }),
+  });
+}
+
 export function restartServer(): Promise<void> {
   return request("/api/config/restart", { method: "POST" });
 }
 
 export function getAvailableTools(): Promise<{ claude: boolean; cursor: boolean }> {
   return request("/api/config/available-tools");
-}
-
-export interface SshConfig {
-  host: string;
-  port: number;
-  user: string;
-}
-
-export function getSshConfig(): Promise<SshConfig> {
-  return request("/api/config/ssh");
-}
-
-export function updateSshConfig(cfg: SshConfig): Promise<SshConfig> {
-  return request("/api/config/ssh", { method: "PUT", body: JSON.stringify(cfg) });
-}
-
-// Helper: generate vscode:// or cursor:// URI
-export function makeRemoteUri(scheme: "vscode" | "cursor", ssh: SshConfig, cwd: string): string {
-  const hostPart = ssh.port === 22 ? `${ssh.user}@${ssh.host}` : `${ssh.user}@${ssh.host}:${ssh.port}`;
-  return `${scheme}://vscode-remote/ssh-remote+${hostPart}${cwd}`;
 }
 
 // Filesystem
@@ -643,6 +642,17 @@ export function moveEntry(
   });
 }
 
+export function deleteEntry(
+  sessionId: string,
+  path: string,
+  recursive = false,
+): Promise<void> {
+  return request(`/api/sessions/${sessionId}/fs/delete`, {
+    method: "POST",
+    body: JSON.stringify({ path, recursive }),
+  });
+}
+
 export interface ArchiveListResult {
   entries: string[];
   total: number;
@@ -702,11 +712,12 @@ export function writeFile(
 export function createTask(
   sessionId: string,
   command: string,
-  delay_seconds: number
+  delay_seconds: number,
+  loop_seconds?: number | null,
 ): Promise<ScheduledTask> {
   return request(`/api/sessions/${sessionId}/tasks`, {
     method: "POST",
-    body: JSON.stringify({ command, delay_seconds }),
+    body: JSON.stringify({ command, delay_seconds, loop_seconds: loop_seconds ?? null }),
   });
 }
 
@@ -757,6 +768,7 @@ export function listSessionAuqs(sessionId: string): Promise<AuqEntry[]> {
 export interface TodoItem {
   id?: string;
   content: string;
+  description?: string;
   activeForm?: string;
   status: "pending" | "in_progress" | "completed";
   priority?: "high" | "medium" | "low";
@@ -779,6 +791,89 @@ export function listSessionTodos(sessionId: string): Promise<TodoPlansResponse> 
 
 export function openShell(sessionId: string): Promise<AttachResponse> {
   return request(`/api/sessions/${sessionId}/shell`, { method: "POST", body: JSON.stringify({}) });
+}
+
+// ── Bash terminals (tmux-backed) ────────────────────────────────────────────
+
+export interface TerminalInfo {
+  term_id: string;
+  session_id: string;
+  name: string | null;
+  cwd: string;
+  is_named: boolean;
+  attach_count: number;
+  created_at: number;
+  kept?: boolean;
+}
+
+export interface TerminalHeartbeatResponse {
+  term_id: string;
+  is_named: boolean;
+  kept: boolean;
+  attach_count: number;
+}
+
+export interface CreateTerminalResponse {
+  term_id: string;
+  name: string | null;
+  is_named: boolean;
+  ws_token: string;
+  ws_url: string;
+}
+
+export interface IssueTerminalTokenResponse {
+  term_id: string;
+  ws_token: string;
+  ws_url: string;
+  name?: string | null;
+  is_named?: boolean;
+  kept?: boolean;
+}
+
+export function listTerminals(sessionId: string): Promise<{ items: TerminalInfo[] }> {
+  return request(`/api/sessions/${sessionId}/terminals`);
+}
+
+export function createTerminal(
+  sessionId: string,
+  opts: { name?: string | null; cwd?: string } = {},
+): Promise<CreateTerminalResponse> {
+  return request(`/api/sessions/${sessionId}/terminals`, {
+    method: "POST",
+    body: JSON.stringify({ name: opts.name ?? null, cwd: opts.cwd ?? null }),
+  });
+}
+
+export function issueTerminalToken(
+  sessionId: string,
+  termId: string,
+): Promise<IssueTerminalTokenResponse> {
+  return request(`/api/sessions/${sessionId}/terminals/${termId}/token`, { method: "POST" });
+}
+
+export function renameTerminal(
+  sessionId: string,
+  termId: string,
+  name: string | null,
+): Promise<TerminalInfo> {
+  return request(`/api/sessions/${sessionId}/terminals/${termId}/rename`, {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function deleteTerminal(sessionId: string, termId: string): Promise<{ ok: boolean }> {
+  return request(`/api/sessions/${sessionId}/terminals/${termId}`, { method: "DELETE" });
+}
+
+/** Refresh "still alive" timestamp for a cached ephemeral terminal.
+ *  Throws if the terminal has been swept (HTTP 410) — caller should treat
+ *  that as "cached term_id is stale; spawn a fresh one." */
+export function heartbeatTerminal(
+  sessionId: string,
+  termId: string,
+): Promise<TerminalHeartbeatResponse> {
+  return request(`/api/sessions/${sessionId}/terminals/${termId}/heartbeat`, { method: "POST" });
 }
 
 // Git
@@ -862,9 +957,155 @@ export function gitPush(sessionId: string): Promise<{ ok: boolean; output: strin
   return request(`/api/sessions/${sessionId}/git/push`, { method: "POST" });
 }
 
+export function gitPull(sessionId: string): Promise<{ ok: boolean; output: string }> {
+  return request(`/api/sessions/${sessionId}/git/pull`, { method: "POST" });
+}
+
+// ── Merge (with VSCode-style conflict resolution) ────────────────────────
+
+export interface MergeStatus {
+  in_progress: boolean;
+  conflicted_files: string[];
+  merge_head: string;
+  current_branch: string;
+}
+
+export interface MergeStartResult {
+  ok: true;
+  clean?: boolean;
+  up_to_date?: boolean;
+  conflicted_files?: string[];
+  output?: string;
+}
+
+export interface ConflictFileVersions {
+  path: string;
+  base: string;
+  ours: string;
+  theirs: string;
+  working: string;
+}
+
+export function getMergeStatus(sessionId: string): Promise<MergeStatus> {
+  return request(`/api/sessions/${sessionId}/git/merge/status`);
+}
+
+export function gitMergeStart(sessionId: string, source: string, target: string): Promise<MergeStartResult> {
+  return request(`/api/sessions/${sessionId}/git/merge/start`, {
+    method: "POST",
+    body: JSON.stringify({ source, target }),
+  });
+}
+
+export function getMergeConflictFile(sessionId: string, path: string): Promise<ConflictFileVersions> {
+  return request(`/api/sessions/${sessionId}/git/merge/file?path=${encodeURIComponent(path)}`);
+}
+
+export function gitResolveFile(
+  sessionId: string, path: string, content: string,
+): Promise<{ ok: boolean; status: MergeStatus }> {
+  return request(`/api/sessions/${sessionId}/git/merge/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ path, content }),
+  });
+}
+
+export function gitMergeContinue(sessionId: string, message?: string): Promise<{ ok: boolean; output: string }> {
+  return request(`/api/sessions/${sessionId}/git/merge/continue`, {
+    method: "POST",
+    body: JSON.stringify({ message: message ?? null }),
+  });
+}
+
+export function gitMergeAbort(sessionId: string): Promise<{ ok: boolean; output: string }> {
+  return request(`/api/sessions/${sessionId}/git/merge/abort`, { method: "POST" });
+}
+
 export interface CommitDetail {
   message: string;
   files: GitDiffFile[];
+}
+
+export interface GitBranchInfo {
+  current: string;
+  local: string[];
+  remote_only?: string[];
+  dirty?: boolean;
+}
+
+export interface GitGraphCommit {
+  hash: string;
+  short_hash: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  date: string;
+  refs: string[];
+}
+
+export interface ActiveCwdSession {
+  id: string;
+  name: string;
+  status: string;
+  tool: string;
+  last_activity_at: string | null;
+}
+
+export function getGitBranches(sessionId: string): Promise<GitBranchInfo> {
+  return request(`/api/sessions/${sessionId}/git/branches`);
+}
+
+export function getGitGraph(sessionId: string, scope = "current", n = 500): Promise<GitGraphCommit[]> {
+  return request(`/api/sessions/${sessionId}/git/graph?scope=${encodeURIComponent(scope)}&n=${n}`);
+}
+
+export function getActiveCwdSessions(sessionId: string): Promise<{ sessions: ActiveCwdSession[] }> {
+  return request(`/api/sessions/${sessionId}/git/active-cwd-sessions`);
+}
+
+export interface GitCheckoutConflict {
+  code: "conflict";
+  message: string;
+  conflicting_files: string[];
+}
+
+export class GitCheckoutConflictError extends Error {
+  conflict: GitCheckoutConflict;
+  constructor(c: GitCheckoutConflict) {
+    super(c.message);
+    this.conflict = c;
+  }
+}
+
+export async function gitCheckoutBranch(
+  sessionId: string,
+  branch: string,
+  opts: { stash?: boolean; remote?: boolean } = {},
+): Promise<{ ok: boolean; branch: string; output: string; stashed?: boolean }> {
+  const token = getToken();
+  const resp = await fetch(`/api/sessions/${sessionId}/git/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ branch, stash: opts.stash ?? false, remote: opts.remote ?? false }),
+  });
+  if (resp.status === 409) {
+    const body = await resp.json().catch(() => ({}));
+    const detail = body?.detail;
+    if (detail && typeof detail === "object" && detail.code === "conflict") {
+      throw new GitCheckoutConflictError(detail as GitCheckoutConflict);
+    }
+    throw new Error(typeof detail === "string" ? detail : "checkout conflict");
+  }
+  if (!resp.ok) {
+    const text = await resp.text();
+    let msg = text;
+    try {
+      const j = JSON.parse(text);
+      if (typeof j?.detail === "string") msg = j.detail;
+    } catch { /* */ }
+    throw new Error(msg || `HTTP ${resp.status}`);
+  }
+  return resp.json();
 }
 
 export function getCommitDetail(sessionId: string, commitHash: string): Promise<CommitDetail> {
@@ -1029,6 +1270,10 @@ export interface RawContentBlock {
 
 export function getRawMessages(sessionId: string, tail = 500): Promise<{ messages: RawMessage[]; total: number }> {
   return request<{ messages: RawMessage[]; total: number }>(`/api/sessions/${sessionId}/raw-messages?tail=${tail}`);
+}
+
+export function getAllRawMessages(sessionId: string): Promise<{ messages: RawMessage[]; total: number }> {
+  return request<{ messages: RawMessage[]; total: number }>(`/api/sessions/${sessionId}/raw-messages/all`);
 }
 
 export interface SubAgentMeta {

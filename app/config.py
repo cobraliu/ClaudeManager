@@ -168,16 +168,36 @@ def get_default_admin() -> dict[str, str]:
     return _get_json("default_admin", {"username": "admin", "password": "admin123"})
 
 
-def get_ssh_config() -> dict:
-    import getpass
-    return {
-        "host": _get("ssh_host"),
-        "port": int(_get("ssh_port") or "22"),
-        "user": _get("ssh_user") or getpass.getuser(),
-    }
+# ── Bash terminal lifecycle tuning ────────────────────────────────────────────
+# Defaults match the documented behavior: 10-min idle window, 30-s standby
+# grace. Kept as separate config keys so users can shrink them for testing or
+# stretch them on a workstation that's left running over lunch.
+
+_DEFAULT_TERM_IDLE_GRACE_S = 600
+_DEFAULT_TERM_STANDBY_GRACE_S = 30
 
 
-def set_ssh_config(host: str, port: int, user: str) -> None:
-    _set("ssh_host", host)
-    _set("ssh_port", str(port))
-    _set("ssh_user", user)
+def get_term_idle_grace_seconds() -> int:
+    raw = _get("term_idle_grace_seconds")
+    try:
+        v = int(raw) if raw else _DEFAULT_TERM_IDLE_GRACE_S
+    except ValueError:
+        v = _DEFAULT_TERM_IDLE_GRACE_S
+    return max(10, v)
+
+
+def set_term_idle_grace_seconds(value: int) -> None:
+    _set("term_idle_grace_seconds", str(max(10, int(value))))
+
+
+def get_term_standby_grace_seconds() -> int:
+    raw = _get("term_standby_grace_seconds")
+    try:
+        v = int(raw) if raw else _DEFAULT_TERM_STANDBY_GRACE_S
+    except ValueError:
+        v = _DEFAULT_TERM_STANDBY_GRACE_S
+    return max(5, v)
+
+
+def set_term_standby_grace_seconds(value: int) -> None:
+    _set("term_standby_grace_seconds", str(max(5, int(value))))

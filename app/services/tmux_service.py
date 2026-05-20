@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import pty
 import select
@@ -10,9 +11,25 @@ import signal
 import struct
 import subprocess
 import termios
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Substrings that uniquely identify Claude CLI's workspace-trust dialog.
+# Multiple candidates for version drift tolerance — any one match is enough.
+_TRUST_DIALOG_PATTERNS = (
+    "Yes, I trust this folder",
+    "Accessing workspace",
+)
+
+
+def _looks_like_trust_dialog(screen: str) -> bool:
+    if not screen:
+        return False
+    return any(p in screen for p in _TRUST_DIALOG_PATTERNS)
 
 
 class TmuxError(RuntimeError):
@@ -58,7 +75,13 @@ class PtyHandle:
             pass
 
     def close(self) -> None:
-        """Close the PTY and clean up the child process."""
+        """Close the PTY and reap the child process.
+
+        Non-blocking waitpid after SIGHUP doesn't actually reap — the child
+        hasn't exited yet, so the call returns 0 and the process becomes
+        a zombie ([bash] <defunct>). We poll for ~300ms, then escalate to
+        SIGKILL + blocking waitpid to guarantee reaping.
+        """
         try:
             os.close(self.master_fd)
         except OSError:
@@ -66,9 +89,25 @@ class PtyHandle:
         try:
             os.kill(self.child_pid, signal.SIGHUP)
         except OSError:
+            return  # child already gone
+        # Poll up to ~300ms for the child to exit on its own.
+        for _ in range(30):
+            try:
+                pid, _ = os.waitpid(self.child_pid, os.WNOHANG)
+                if pid != 0:
+                    return
+            except ChildProcessError:
+                return  # already reaped
+            except OSError:
+                return
+            time.sleep(0.01)
+        # Still alive — force-kill and reap (blocking).
+        try:
+            os.kill(self.child_pid, signal.SIGKILL)
+        except OSError:
             pass
         try:
-            os.waitpid(self.child_pid, os.WNOHANG)
+            os.waitpid(self.child_pid, 0)
         except (OSError, ChildProcessError):
             pass
 
@@ -182,6 +221,13 @@ class TmuxService:
             self._run("set-option", "-t", session_name, "mode-keys", "vi")
         except TmuxError:
             pass
+
+        if tool == "claude":
+            threading.Thread(
+                target=self._auto_accept_trust_dialog,
+                args=(session_name,),
+                daemon=True,
+            ).start()
 
     def attach_pty(self, session_name: str, cols: int = 80, rows: int = 24) -> PtyHandle:
         """Attach to a tmux session via a PTY for raw terminal I/O."""
@@ -335,6 +381,37 @@ class TmuxService:
         except TmuxError:
             return ""
 
+    def _auto_accept_trust_dialog(self, session_name: str, timeout: float = 8.0) -> None:
+        """Poll the TUI after startup; if Claude's workspace-trust dialog shows,
+        press Enter to accept the default first option ("Yes, I trust this folder").
+
+        Returns silently if no dialog appears within `timeout`. Never raises —
+        failure here must not affect session creation.
+        """
+        time.sleep(0.8)  # let the TUI render before first scan
+        start = time.monotonic()
+        sent = False
+        while time.monotonic() - start < timeout:
+            screen = self.capture_visible_screen(session_name)
+            is_trust = _looks_like_trust_dialog(screen)
+            if is_trust and not sent:
+                try:
+                    self._run("send-keys", "-t", session_name, "Enter")
+                except TmuxError:
+                    return
+                sent = True
+                logger.info("auto-accepted trust dialog for %s", session_name)
+                time.sleep(0.5)
+                continue
+            if sent and not is_trust:
+                return  # dialog cleared — success
+            time.sleep(0.4)
+        if sent:
+            logger.warning(
+                "trust dialog Enter sent but dialog did not clear within %.1fs (%s)",
+                timeout, session_name,
+            )
+
     def search_init_pty(self, pty_handle: "PtyHandle", query: str) -> None:
         """Enter copy-mode, go to top, search forward for query, center result."""
         import time as _time
@@ -373,6 +450,19 @@ class TmuxService:
             return int(out.strip())
         except (TmuxError, ValueError):
             return None
+
+    def is_pane_in_mode(self, session_name: str) -> bool:
+        """True if the pane is currently in any tmux mode (copy-mode, view-mode).
+
+        Used by WS scroll handlers to detect when copy-mode was cancelled by a
+        user keypress (Enter / Escape / q) so cached in_copy_mode state can be
+        re-synced before issuing further scroll-up commands.
+        """
+        try:
+            out = self._run("display-message", "-p", "-t", session_name, "#{pane_in_mode}")
+            return out.strip() == "1"
+        except TmuxError:
+            return False
 
     def list_sessions(self) -> list[str]:
         out = self._run("list-sessions", "-F", "#{session_name}")
