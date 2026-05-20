@@ -962,6 +962,87 @@ export interface CommitDetail {
   files: GitDiffFile[];
 }
 
+export interface GitBranchInfo {
+  current: string;
+  local: string[];
+  dirty?: boolean;
+}
+
+export interface GitGraphCommit {
+  hash: string;
+  short_hash: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  date: string;
+  refs: string[];
+}
+
+export interface ActiveCwdSession {
+  id: string;
+  name: string;
+  status: string;
+  tool: string;
+  last_activity_at: string | null;
+}
+
+export function getGitBranches(sessionId: string): Promise<GitBranchInfo> {
+  return request(`/api/sessions/${sessionId}/git/branches`);
+}
+
+export function getGitGraph(sessionId: string, scope = "current", n = 500): Promise<GitGraphCommit[]> {
+  return request(`/api/sessions/${sessionId}/git/graph?scope=${encodeURIComponent(scope)}&n=${n}`);
+}
+
+export function getActiveCwdSessions(sessionId: string): Promise<{ sessions: ActiveCwdSession[] }> {
+  return request(`/api/sessions/${sessionId}/git/active-cwd-sessions`);
+}
+
+export interface GitCheckoutConflict {
+  code: "conflict";
+  message: string;
+  conflicting_files: string[];
+}
+
+export class GitCheckoutConflictError extends Error {
+  conflict: GitCheckoutConflict;
+  constructor(c: GitCheckoutConflict) {
+    super(c.message);
+    this.conflict = c;
+  }
+}
+
+export async function gitCheckoutBranch(
+  sessionId: string,
+  branch: string,
+  force_discard = false,
+): Promise<{ ok: boolean; branch: string; output: string }> {
+  const token = getToken();
+  const resp = await fetch(`/api/sessions/${sessionId}/git/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ branch, force_discard }),
+  });
+  if (resp.status === 409) {
+    const body = await resp.json().catch(() => ({}));
+    const detail = body?.detail;
+    if (detail && typeof detail === "object" && detail.code === "conflict") {
+      throw new GitCheckoutConflictError(detail as GitCheckoutConflict);
+    }
+    throw new Error(typeof detail === "string" ? detail : "checkout conflict");
+  }
+  if (!resp.ok) {
+    const text = await resp.text();
+    let msg = text;
+    try {
+      const j = JSON.parse(text);
+      if (typeof j?.detail === "string") msg = j.detail;
+    } catch { /* */ }
+    throw new Error(msg || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
 export function getCommitDetail(sessionId: string, commitHash: string): Promise<CommitDetail> {
   return request(`/api/sessions/${sessionId}/git/show/${commitHash}`);
 }

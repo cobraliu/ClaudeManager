@@ -13,6 +13,7 @@ import {
 } from "../api/sessionApi";
 import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker, EditorWithLineNumbers } from "./FileEditorModal";
 import { GitPanel, CommitDetailModal } from "./GitPanel";
+import { GitBranchPicker } from "./GitBranchPicker";
 import downloadIcon from "../assets/download.svg";
 
 const MAX_TRANSFER_MB = 16;
@@ -832,8 +833,13 @@ export function FileSidePanel({
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden", background: "var(--bg-base)" }}>
       {/* Files (top, fills remaining space) */}
       <div style={{ overflowY: "auto", flex: 1, paddingTop: 4 }}>
-        <div style={{ padding: "4px 10px 2px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-          Files
+        <div style={{ padding: "4px 10px 2px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", display: "flex", alignItems: "center", gap: 8 }}>
+          <span>Files</span>
+          <GitBranchPicker
+            sessionId={sessionId}
+            refreshKey={filesRefreshKey}
+            onBranchChanged={() => setFilesRefreshKey(k => k + 1)}
+          />
         </div>
         <FileTree sessionId={sessionId} selected={selectedPath} changed={changedSet} onSelect={handleSelect} revealPath={selectedPath} refreshKey={filesRefreshKey} />
       </div>
@@ -1604,7 +1610,13 @@ export function CodePane({
 
           {/* Files header + toolbar */}
           <div style={{ padding: "4px 6px 2px", display: "flex", alignItems: "center", gap: 4, flexShrink: 0, borderBottom: "1px solid var(--bg-hover)" }}>
-            <span style={{ fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", flex: 1, paddingLeft: 4 }}>Files</span>
+            <span style={{ fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", paddingLeft: 4, flexShrink: 0 }}>Files</span>
+            <GitBranchPicker
+              sessionId={sessionId}
+              refreshKey={filesRefreshKey}
+              onBranchChanged={bumpFilesRefresh}
+            />
+            <span style={{ flex: 1 }} />
             <button title="Search files" onClick={() => setToolForm(toolForm === "search" ? null : "search")}
               style={toolbarIconBtn(toolForm === "search")}>🔍</button>
             <button title="New file" onClick={() => setToolForm(toolForm === "newFile" ? null : "newFile")}

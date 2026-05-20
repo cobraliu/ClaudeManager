@@ -36,7 +36,8 @@ from app.services.cursor_session_reader import (
     list_all_cursor_sessions_global,
 )
 from app.services.git_service import (
-    git_add_commit, git_clone, git_file_diff, git_file_log, git_file_show, git_get_remote, git_init, git_log,
+    git_add_commit, git_checkout_branch, git_clone, git_file_diff, git_file_log, git_file_show,
+    git_get_remote, git_graph_log, git_init, git_is_dirty, git_list_branches, git_log,
     git_push, git_search_commits, git_set_remote, git_show_commit, is_git_repo,
     make_commit_message, make_commit_summary,
 )
@@ -1326,6 +1327,100 @@ def search_git_commits(session_id: str, user_id: CurrentUser, q: str = Query(def
     if not q.strip() or not is_git_repo(session.cwd):
         return []
     return git_search_commits(session.cwd, q.strip())
+
+
+@router.get("/{session_id}/git/branches")
+def list_git_branches(session_id: str, user_id: CurrentUser) -> dict:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        return {"current": "", "local": []}
+    info = git_list_branches(session.cwd)
+    info["dirty"] = git_is_dirty(session.cwd)
+    return info
+
+
+@router.get("/{session_id}/git/graph")
+def get_git_graph(
+    session_id: str,
+    user_id: CurrentUser,
+    scope: str = Query(default="current"),
+    n: int = Query(default=500, ge=1, le=5000),
+) -> list[dict]:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        return []
+    return git_graph_log(session.cwd, scope=scope, n=n)
+
+
+@router.get("/{session_id}/git/active-cwd-sessions")
+def list_active_cwd_sessions(session_id: str, user_id: CurrentUser) -> dict:
+    """Return RUNNING/DETACHED sessions sharing this session's cwd (excluding self).
+    Used by the Revert/checkout confirm dialog to warn about concurrent edits.
+    """
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    sessions = store.list_for_owner(user_id)
+    target_cwd = os.path.realpath(session.cwd)
+    active = []
+    for s in sessions:
+        if s.id == session_id:
+            continue
+        if s.status not in (SessionStatus.RUNNING, SessionStatus.DETACHED):
+            continue
+        try:
+            if os.path.realpath(s.cwd) != target_cwd:
+                continue
+        except OSError:
+            continue
+        active.append({
+            "id": s.id,
+            "name": s.name,
+            "status": s.status.value,
+            "tool": s.tool,
+            "last_activity_at": s.last_activity_at.isoformat() if s.last_activity_at else None,
+        })
+    return {"sessions": active}
+
+
+class GitCheckoutRequest(BaseModel):
+    branch: str = Field(min_length=1, max_length=200)
+    force_discard: bool = False
+
+
+@router.post("/{session_id}/git/checkout")
+def checkout_git_branch(
+    session_id: str, body: GitCheckoutRequest, user_id: CurrentUser,
+) -> dict:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        raise HTTPException(status_code=400, detail="not a git repo")
+    # Try plain checkout first. Git itself decides whether uncommitted edits
+    # conflict with the target branch; we only force-discard when explicitly
+    # requested by the caller after they've been shown the conflict.
+    result = git_checkout_branch(session.cwd, body.branch, force_discard=body.force_discard)
+    if not result["ok"]:
+        if result.get("conflict"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "conflict",
+                    "message": "local changes would be overwritten; pass force_discard=true to discard them",
+                    "conflicting_files": result.get("conflicting_files", []),
+                },
+            )
+        raise HTTPException(status_code=400, detail=result["output"])
+    return {"ok": True, "branch": body.branch, "output": result["output"]}
 
 
 @router.post("/{session_id}/git/init")

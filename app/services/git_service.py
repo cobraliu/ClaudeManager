@@ -547,6 +547,116 @@ def git_push(cwd: str) -> dict:
     return {"ok": result.returncode == 0, "output": out}
 
 
+def git_current_branch(cwd: str) -> str:
+    """Return current branch name, or '' if detached / failure."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return ""
+    name = result.stdout.strip()
+    return "" if name == "HEAD" else name
+
+
+def git_list_branches(cwd: str) -> dict:
+    """Return {current: str, local: [str, ...]} for local branches only."""
+    current = git_current_branch(cwd)
+    result = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return {"current": current, "local": []}
+    local = [b.strip() for b in result.stdout.splitlines() if b.strip()]
+    return {"current": current, "local": local}
+
+
+def git_checkout_branch(cwd: str, branch: str, force_discard: bool = False) -> dict:
+    """Checkout an existing local branch.
+
+    Strategy:
+      - Try plain `git checkout <branch>` first. Git carries over uncommitted
+        edits when they don't conflict with the target.
+      - If git refuses because local changes would be overwritten, return
+        {ok: False, conflict: True, conflicting_files: [...]} so the caller
+        can decide whether to discard and retry.
+      - If force_discard=True, reset --hard + clean -fd first, then checkout.
+    """
+    if force_discard:
+        reset = subprocess.run(
+            ["git", "reset", "--hard", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        )
+        if reset.returncode != 0:
+            return {"ok": False, "output": reset.stderr.strip(), "conflict": False}
+        subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        )
+
+    result = subprocess.run(
+        ["git", "checkout", branch],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    out = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        return {"ok": True, "output": out, "conflict": False}
+
+    # Parse conflicting file list from git's error output.
+    if "would be overwritten by checkout" in out or "would be overwritten by merge" in out:
+        conflicting: list[str] = []
+        for line in out.splitlines():
+            stripped = line.strip()
+            # Git lists conflicting files indented with a tab on lines between
+            # "error: Your local changes..." and "Please commit your changes...".
+            if line.startswith("\t") and stripped:
+                conflicting.append(stripped)
+        return {
+            "ok": False,
+            "output": out,
+            "conflict": True,
+            "conflicting_files": conflicting,
+        }
+
+    return {"ok": False, "output": out, "conflict": False}
+
+
+def git_graph_log(cwd: str, scope: str = "current", n: int = 500) -> list[dict]:
+    """Return commits suitable for client-side graph rendering.
+
+    scope: 'current' (HEAD), 'all' (--all), or a specific branch name.
+    Each commit: {hash, short_hash, parents: [hash,...], subject, author, date, refs: [str,...]}.
+    """
+    args = ["git", "-c", "core.quotepath=false", "log", f"-{n}",
+            "--pretty=format:%H\x1f%h\x1f%P\x1f%s\x1f%an\x1f%ai\x1f%D"]
+    if scope == "all":
+        args.append("--all")
+    elif scope and scope != "current":
+        args.append(scope)
+    result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding="utf-8")
+    if result.returncode != 0:
+        return []
+    entries = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) < 6:
+            continue
+        full, short, parents, subject, author, date = parts[:6]
+        refs_raw = parts[6] if len(parts) > 6 else ""
+        refs = [r.strip() for r in refs_raw.split(",") if r.strip()] if refs_raw else []
+        entries.append({
+            "hash": full,
+            "short_hash": short,
+            "parents": [p for p in parents.split(" ") if p],
+            "subject": subject,
+            "author": author,
+            "date": date,
+            "refs": refs,
+        })
+    return entries
+
+
 def git_rollback(cwd: str, commit_hash: str, author: str = "claude") -> dict:
     """
     Rollback to commit_hash by checking out its tree, then committing.

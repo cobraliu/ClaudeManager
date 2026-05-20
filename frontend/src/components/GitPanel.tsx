@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import gitIcon from "../assets/git.svg";
-import type { GitLogEntry, GitDiffFile } from "../api/sessionApi";
+import type { GitLogEntry, GitDiffFile, GitGraphCommit, GitBranchInfo } from "../api/sessionApi";
 import {
   getGitInfo,
   getCommitDetail,
@@ -12,7 +12,11 @@ import {
   saveGitignore,
   gitSetRemote,
   gitPush,
+  getGitBranches,
+  getGitGraph,
 } from "../api/sessionApi";
+import { GitGraph } from "./GitGraph";
+import { ConfirmAffectingChangeModal } from "./GitBranchPicker";
 
 interface Props {
   sessionId: string;
@@ -443,27 +447,28 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
   const [remote, setRemote] = useState("");
   const [remoteDraft, setRemoteDraft] = useState("");
   const [remoteEditing, setRemoteEditing] = useState(false);
-
-  // Derived: filter + paginate entirely in the browser (list mode)
-  const filteredLog = useMemo(() => {
-    if (deepMode) return deepResults ?? [];
-    if (!logSearch.trim()) return allLog;
-    const q = logSearch.toLowerCase();
-    return allLog.filter(e => e.subject.toLowerCase().includes(q) || e.short_hash.includes(q));
-  }, [allLog, logSearch, deepMode, deepResults]);
-
-  const totalPages = Math.max(1, Math.ceil(filteredLog.length / PAGE_SIZE));
-  const safePage = Math.min(logPage, totalPages - 1);
-  const pageLog = filteredLog.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
+  // Branch + view mode
+  const [branches, setBranches] = useState<GitBranchInfo>({ current: "", local: [] });
+  // scope: "current" (= current branch HEAD), "all", or specific local branch name
+  const [scope, setScope] = useState<string>("current");
+  const [viewMode, setViewMode] = useState<"list" | "graph">("list");
+  const [graphCommits, setGraphCommits] = useState<GitGraphCommit[] | null>(null);
+  const [graphLoading, setGraphLoading] = useState(false);
+  // Revert confirm state
+  const [revertCandidate, setRevertCandidate] = useState<{ hash: string; short: string } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const info = await getGitInfo(sessionId);
+      const [info, br] = await Promise.all([
+        getGitInfo(sessionId),
+        getGitBranches(sessionId).catch(() => ({ current: "", local: [] }) as GitBranchInfo),
+      ]);
       setAutoCommit(info.auto_commit);
       setAllLog(info.log);
       setGitignore(info.gitignore ?? "");
       setRemote(info.remote ?? "");
       setRemoteDraft(info.remote ?? "");
+      setBranches(br);
     } catch (e) {
       setMsg(`Failed to load git info: ${String(e)}`);
     } finally {
@@ -472,6 +477,45 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
   }, [sessionId]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Fetch graph data whenever scope changes (used by both Graph view and non-current List view).
+  // For the default "current" scope we already have allLog for list mode, so skip extra fetch
+  // unless graph mode is active.
+  useEffect(() => {
+    if (scope === "current" && viewMode === "list") {
+      setGraphCommits(null);
+      return;
+    }
+    setGraphLoading(true);
+    getGitGraph(sessionId, scope, 500)
+      .then(setGraphCommits)
+      .catch((e) => { setMsg(String(e)); setGraphCommits([]); })
+      .finally(() => setGraphLoading(false));
+  }, [sessionId, viewMode, scope, allLog.length]);
+
+  // Unified list source: when scope == "current" use allLog (rich, paginated). When scope is
+  // a specific branch or "all", project the graph fetch into GitLogEntry shape.
+  const scopedLog: GitLogEntry[] = useMemo(() => {
+    if (scope === "current") return allLog;
+    if (!graphCommits) return [];
+    return graphCommits.map(c => ({
+      hash: c.hash, short_hash: c.short_hash, subject: c.subject,
+      author: c.author, date: c.date,
+    }));
+  }, [scope, allLog, graphCommits]);
+
+  // Derived: filter + paginate entirely in the browser (list mode)
+  const filteredLog = useMemo(() => {
+    if (deepMode) return deepResults ?? [];
+    const base = scope === "current" ? allLog : scopedLog;
+    if (!logSearch.trim()) return base;
+    const q = logSearch.toLowerCase();
+    return base.filter(e => e.subject.toLowerCase().includes(q) || e.short_hash.includes(q));
+  }, [allLog, scopedLog, scope, logSearch, deepMode, deepResults]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredLog.length / PAGE_SIZE));
+  const safePage = Math.min(logPage, totalPages - 1);
+  const pageLog = filteredLog.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
 
   const handleSearchChange = (val: string) => {
     setLogSearch(val);
@@ -519,14 +563,25 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
     } catch (e) { setMsg(String(e)); } finally { setBusyId(null); }
   };
 
-  const handleRollback = async (hash: string) => {
-    if (!confirm(`Rollback to ${hash.slice(0, 8)}? This will create a new commit.`)) return;
+  const handleRollback = (hash: string) => {
+    setRevertCandidate({ hash, short: hash.slice(0, 8) });
+  };
+
+  const doRollback = async () => {
+    if (!revertCandidate) return;
+    const { hash } = revertCandidate;
     setBusyId(hash);
     try {
       const res = await gitRollback(sessionId, hash);
       setMsg(res.output);
+      setRevertCandidate(null);
       load();
-    } catch (e) { setMsg(String(e)); } finally { setBusyId(null); }
+    } catch (e) {
+      setMsg(String(e));
+      throw e;
+    } finally {
+      setBusyId(null);
+    }
   };
 
   const handleDiff = async () => {
@@ -735,6 +790,30 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
                 </div>
               )}
 
+              {/* ── Branch selector + view mode toggle ── */}
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <label style={{ fontSize: 11, color: "var(--text-muted)" }}>Scope:</label>
+                <select
+                  value={scope}
+                  onChange={(e) => { setScope(e.target.value); setLogPage(0); setChecked([]); }}
+                  style={{ background: "var(--bg-hover)", color: "var(--text-body)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "3px 6px", fontSize: 11, fontFamily: "monospace" }}
+                >
+                  <option value="current">Current branch{branches.current ? ` (${branches.current})` : ""}</option>
+                  <option value="all">All branches</option>
+                  {branches.local.filter(b => b !== branches.current).map(b => (
+                    <option key={b} value={b}>{b}</option>
+                  ))}
+                </select>
+                <div style={{ display: "flex", borderRadius: 4, overflow: "hidden", border: "1px solid var(--text-faintest)", marginLeft: "auto" }}>
+                  {(["list", "graph"] as const).map((m) => (
+                    <button key={m} onClick={() => setViewMode(m)}
+                      style={{ padding: "2px 12px", fontSize: 11, background: viewMode === m ? "var(--text-faintest)" : "transparent", color: viewMode === m ? "var(--text-body)" : "var(--text-muted)", border: "none", cursor: "pointer" }}>
+                      {m === "list" ? "List" : "Graph"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {/* ── Commit log: search + list ── */}
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 {/* search + stats row */}
@@ -770,7 +849,22 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
                   </span>
                 </div>
 
-                {pageLog.length === 0 ? (
+                {viewMode === "graph" ? (
+                  graphLoading ? (
+                    <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Loading graph…</span>
+                  ) : (
+                    <GitGraph
+                      commits={graphCommits ?? []}
+                      latestHash={(graphCommits ?? [])[0]?.hash ?? null}
+                      selectedHashes={checked}
+                      onToggleCheck={toggleCheck}
+                      checkDisabled={(h) => checked.length >= 2 && !checked.includes(h)}
+                      busyHash={busyId}
+                      onRevert={(c) => handleRollback(c.hash)}
+                      onCommitClick={(c) => setDetailEntry({ hash: c.hash, short_hash: c.short_hash, subject: c.subject, author: c.author, date: c.date })}
+                    />
+                  )
+                ) : pageLog.length === 0 ? (
                   <span style={{ fontSize: 13, color: "var(--text-faint)" }}>{logSearch ? "No matching commits." : "No commits yet."}</span>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -790,8 +884,8 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
                   </div>
                 )}
 
-                {/* pagination */}
-                {totalPages > 1 && (
+                {/* pagination — list mode only */}
+                {viewMode === "list" && totalPages > 1 && (
                   <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 8, paddingTop: 4 }}>
                     <button disabled={safePage === 0} onClick={() => setLogPage(safePage - 1)}
                       style={{ background: "var(--text-faintest)", color: "var(--text-body)", fontSize: 11, padding: "3px 10px" }}>← Prev</button>
@@ -812,6 +906,23 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
           sessionId={sessionId}
           entry={detailEntry}
           onClose={() => setDetailEntry(null)}
+        />
+      )}
+      {revertCandidate && (
+        <ConfirmAffectingChangeModal
+          sessionId={sessionId}
+          title={`Revert to ${revertCandidate.short}`}
+          description={
+            <span>
+              This will reset the working tree to commit{" "}
+              <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{revertCandidate.short}</span>
+              {" "}and create a new commit. Intermediate history is preserved.
+            </span>
+          }
+          actionLabel="Revert"
+          busyLabel="Reverting…"
+          onCancel={() => setRevertCandidate(null)}
+          onConfirm={doRollback}
         />
       )}
     </div>
