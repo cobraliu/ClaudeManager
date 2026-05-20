@@ -17,6 +17,7 @@ import {
 } from "../api/sessionApi";
 import { GitGraph } from "./GitGraph";
 import { ConfirmAffectingChangeModal } from "./GitBranchPicker";
+import { MergeTab } from "./MergeTab";
 
 interface Props {
   sessionId: string;
@@ -456,6 +457,8 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
   const [graphLoading, setGraphLoading] = useState(false);
   // Revert confirm state
   const [revertCandidate, setRevertCandidate] = useState<{ hash: string; short: string } | null>(null);
+  // Top-level tab: history (the existing view) vs merge (conflict resolver)
+  const [activeTab, setActiveTab] = useState<"history" | "merge">("history");
 
   const load = useCallback(async () => {
     try {
@@ -665,16 +668,41 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
           <button onClick={onClose} style={{ background: "var(--text-faintest)", color: "var(--text-secondary)", fontSize: 12, padding: "4px 10px" }}>✕</button>
         </div>
 
-        <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+        {/* tabs */}
+        <div style={{ display: "flex", background: "var(--bg-surface)", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0 }}>
+          {(["history", "merge"] as const).map(t => (
+            <button
+              key={t}
+              onClick={() => setActiveTab(t)}
+              style={{
+                background: activeTab === t ? "var(--bg-base)" : "transparent",
+                color: activeTab === t ? "var(--accent-blue)" : "var(--text-secondary)",
+                borderBottom: activeTab === t ? "2px solid var(--accent-blue)" : "2px solid transparent",
+                borderRadius: 0, padding: "6px 18px", fontSize: 12, fontWeight: 600,
+              }}
+            >
+              {t === "history" ? "History" : "Merge"}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: activeTab === "merge" ? 0 : "12px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
           {/* status message */}
           {msg && (
-            <div style={{ fontSize: 12, color: "var(--text-secondary)", background: "var(--bg-surface)", borderRadius: 4, padding: "6px 10px", fontFamily: "monospace", wordBreak: "break-all" }}>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", background: "var(--bg-surface)", borderRadius: 4, padding: activeTab === "merge" ? "6px 16px" : "6px 10px", fontFamily: "monospace", wordBreak: "break-all" }}>
               {msg}
               <button onClick={() => setMsg(null)} style={{ float: "right", background: "transparent", color: "var(--text-faint)", fontSize: 11 }}>✕</button>
             </div>
           )}
 
-          {loading ? (
+          {activeTab === "merge" ? (
+            <MergeTab
+              sessionId={sessionId}
+              branches={branches}
+              onCompleted={() => { setActiveTab("history"); load(); }}
+              setMsg={setMsg}
+            />
+          ) : loading ? (
             <span style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading...</span>
           ) : (
             <>

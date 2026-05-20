@@ -6,6 +6,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -37,9 +38,11 @@ from app.services.cursor_session_reader import (
 )
 from app.services.git_service import (
     git_add_commit, git_checkout_branch, git_checkout_remote_branch, git_clone,
-    git_file_diff, git_file_log, git_file_show,
+    git_conflict_file_versions, git_file_diff, git_file_log, git_file_show,
     git_get_remote, git_graph_log, git_init, git_is_dirty, git_list_branches, git_log,
-    git_pull, git_push, git_search_commits, git_set_remote, git_show_commit, is_git_repo,
+    git_merge_abort, git_merge_continue, git_merge_start, git_merge_status,
+    git_pull, git_push, git_resolve_file, git_search_commits, git_set_remote,
+    git_show_commit, is_git_repo,
     make_commit_message, make_commit_summary,
 )
 from app.services.session_store import SessionStore
@@ -1502,6 +1505,84 @@ def pull_from_remote(session_id: str, user_id: CurrentUser) -> dict:
     if not is_git_repo(session.cwd):
         raise HTTPException(status_code=400, detail="not a git repo")
     result = git_pull(session.cwd)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
+    return {"ok": True, "output": result["output"]}
+
+
+# ── Merge endpoints (VSCode-style conflict resolution) ─────────────────────
+
+class GitMergeStartRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=200)
+    target: str = Field(min_length=1, max_length=200)
+
+
+class GitResolveRequest(BaseModel):
+    path: str = Field(min_length=1)
+    content: str
+
+
+class GitMergeContinueRequest(BaseModel):
+    message: str | None = None
+
+
+def _require_session_repo(session_id: str, user_id: str):
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        raise HTTPException(status_code=400, detail="not a git repo")
+    return session
+
+
+@router.get("/{session_id}/git/merge/status")
+def get_merge_status(session_id: str, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    return git_merge_status(session.cwd)
+
+
+@router.post("/{session_id}/git/merge/start")
+def start_merge(session_id: str, body: GitMergeStartRequest, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    result = git_merge_start(session.cwd, body.source, body.target)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
+    return result
+
+
+@router.get("/{session_id}/git/merge/file")
+def get_merge_conflict_file(session_id: str, path: str, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    if not (Path(session.cwd) / ".git" / "MERGE_HEAD").exists():
+        raise HTTPException(status_code=400, detail="no merge in progress")
+    return git_conflict_file_versions(session.cwd, path)
+
+
+@router.post("/{session_id}/git/merge/resolve")
+def resolve_merge_file(session_id: str, body: GitResolveRequest, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    if not (Path(session.cwd) / ".git" / "MERGE_HEAD").exists():
+        raise HTTPException(status_code=400, detail="no merge in progress")
+    result = git_resolve_file(session.cwd, body.path, body.content)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
+    return {"ok": True, "status": git_merge_status(session.cwd)}
+
+
+@router.post("/{session_id}/git/merge/continue")
+def continue_merge(session_id: str, body: GitMergeContinueRequest, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    result = git_merge_continue(session.cwd, body.message)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
+    return {"ok": True, "output": result["output"]}
+
+
+@router.post("/{session_id}/git/merge/abort")
+def abort_merge(session_id: str, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    result = git_merge_abort(session.cwd)
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["output"])
     return {"ok": True, "output": result["output"]}

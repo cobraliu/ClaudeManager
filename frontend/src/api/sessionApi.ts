@@ -961,6 +961,66 @@ export function gitPull(sessionId: string): Promise<{ ok: boolean; output: strin
   return request(`/api/sessions/${sessionId}/git/pull`, { method: "POST" });
 }
 
+// ── Merge (with VSCode-style conflict resolution) ────────────────────────
+
+export interface MergeStatus {
+  in_progress: boolean;
+  conflicted_files: string[];
+  merge_head: string;
+  current_branch: string;
+}
+
+export interface MergeStartResult {
+  ok: true;
+  clean?: boolean;
+  up_to_date?: boolean;
+  conflicted_files?: string[];
+  output?: string;
+}
+
+export interface ConflictFileVersions {
+  path: string;
+  base: string;
+  ours: string;
+  theirs: string;
+  working: string;
+}
+
+export function getMergeStatus(sessionId: string): Promise<MergeStatus> {
+  return request(`/api/sessions/${sessionId}/git/merge/status`);
+}
+
+export function gitMergeStart(sessionId: string, source: string, target: string): Promise<MergeStartResult> {
+  return request(`/api/sessions/${sessionId}/git/merge/start`, {
+    method: "POST",
+    body: JSON.stringify({ source, target }),
+  });
+}
+
+export function getMergeConflictFile(sessionId: string, path: string): Promise<ConflictFileVersions> {
+  return request(`/api/sessions/${sessionId}/git/merge/file?path=${encodeURIComponent(path)}`);
+}
+
+export function gitResolveFile(
+  sessionId: string, path: string, content: string,
+): Promise<{ ok: boolean; status: MergeStatus }> {
+  return request(`/api/sessions/${sessionId}/git/merge/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ path, content }),
+  });
+}
+
+export function gitMergeContinue(sessionId: string, message?: string): Promise<{ ok: boolean; output: string }> {
+  return request(`/api/sessions/${sessionId}/git/merge/continue`, {
+    method: "POST",
+    body: JSON.stringify({ message: message ?? null }),
+  });
+}
+
+export function gitMergeAbort(sessionId: string): Promise<{ ok: boolean; output: string }> {
+  return request(`/api/sessions/${sessionId}/git/merge/abort`, { method: "POST" });
+}
+
 export interface CommitDetail {
   message: string;
   files: GitDiffFile[];

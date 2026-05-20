@@ -780,3 +780,174 @@ def git_rollback(cwd: str, commit_hash: str, author: str = "claude") -> dict:
     if "nothing to commit" in out:
         return {"ok": True, "output": "Already at that version, nothing to rollback"}
     return {"ok": False, "output": out}
+
+
+# ── Merge (with VSCode-style conflict resolution) ──────────────────────────
+
+def git_merge_status(cwd: str) -> dict:
+    """Report whether a merge is in progress and which files are conflicted.
+
+    Returns:
+      {
+        "in_progress": bool,           # .git/MERGE_HEAD exists
+        "conflicted_files": [str,...], # paths from `git ls-files -u`
+        "merge_head": str,             # short hash of being-merged commit
+        "current_branch": str,
+      }
+    """
+    merge_head_path = Path(cwd) / ".git" / "MERGE_HEAD"
+    in_progress = merge_head_path.exists()
+    merge_head = ""
+    conflicted: list[str] = []
+    if in_progress:
+        try:
+            merge_head = merge_head_path.read_text(encoding="utf-8").strip()[:8]
+        except OSError:
+            merge_head = ""
+        ls = subprocess.run(
+            ["git", "ls-files", "-u"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        )
+        if ls.returncode == 0:
+            seen: set[str] = set()
+            for line in ls.stdout.splitlines():
+                # format: <mode> <hash> <stage>\t<path>
+                if "\t" not in line:
+                    continue
+                path = line.split("\t", 1)[1]
+                if path not in seen:
+                    seen.add(path)
+                    conflicted.append(path)
+    return {
+        "in_progress": in_progress,
+        "conflicted_files": conflicted,
+        "merge_head": merge_head,
+        "current_branch": git_current_branch(cwd),
+    }
+
+
+def git_merge_start(cwd: str, source: str, target: str) -> dict:
+    """Merge `source` into `target` (no-ff). If `target` is not the current branch,
+    checks out `target` first.
+
+    Returns:
+      - {"ok": True, "clean": True, "output": ...} when merge completed (no conflicts)
+      - {"ok": True, "clean": False, "conflicted_files": [...]} when conflicts surfaced
+      - {"ok": True, "up_to_date": True, "output": ...} when already up to date
+      - {"ok": False, "output": ...} on hard failure (dirty tree, unknown branch, ...)
+    """
+    if source == target:
+        return {"ok": False, "output": "source and target branches are the same"}
+    # Refuse if a merge is already in progress.
+    if (Path(cwd) / ".git" / "MERGE_HEAD").exists():
+        return {"ok": False, "output": "a merge is already in progress; resolve or abort it first"}
+    # Refuse if working tree is dirty — git itself will refuse, but we surface a friendlier error.
+    if git_is_dirty(cwd):
+        return {"ok": False, "output": "working tree has uncommitted changes; commit or stash before merging"}
+
+    # Switch to target branch if not already there.
+    current = git_current_branch(cwd)
+    if current != target:
+        co = subprocess.run(
+            ["git", "checkout", target],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        )
+        if co.returncode != 0:
+            return {"ok": False, "output": f"failed to checkout target branch '{target}': {(co.stdout + co.stderr).strip()}"}
+
+    result = subprocess.run(
+        ["git", "merge", "--no-ff", "--no-edit", source],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=120,
+    )
+    out = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        if "Already up to date" in out or "Already up-to-date" in out:
+            return {"ok": True, "up_to_date": True, "output": out}
+        return {"ok": True, "clean": True, "output": out}
+
+    # Non-zero exit: either a conflict (merge in progress, files unmerged) or a real error.
+    status = git_merge_status(cwd)
+    if status["in_progress"] and status["conflicted_files"]:
+        return {
+            "ok": True,
+            "clean": False,
+            "conflicted_files": status["conflicted_files"],
+            "output": out,
+        }
+    return {"ok": False, "output": out}
+
+
+def git_conflict_file_versions(cwd: str, path: str) -> dict:
+    """Return base/ours/theirs/working for a conflicted file.
+
+    Uses `git show :<stage>:<path>` where stage is 1=base, 2=ours, 3=theirs.
+    A missing stage (e.g., file added on only one side) returns empty string.
+    Working is the on-disk content with conflict markers.
+    """
+    def _show(stage: int) -> str:
+        r = subprocess.run(
+            ["git", "show", f":{stage}:{path}"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        return r.stdout if r.returncode == 0 else ""
+
+    working = ""
+    try:
+        working = (Path(cwd) / path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        working = ""
+
+    return {
+        "path": path,
+        "base": _show(1),
+        "ours": _show(2),
+        "theirs": _show(3),
+        "working": working,
+    }
+
+
+def git_resolve_file(cwd: str, path: str, content: str) -> dict:
+    """Write resolved content to disk, then `git add <path>` to mark resolved."""
+    target = Path(cwd) / path
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "output": f"write failed: {e}"}
+    add = subprocess.run(
+        ["git", "add", "--", path],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    if add.returncode != 0:
+        return {"ok": False, "output": (add.stdout + add.stderr).strip()}
+    return {"ok": True, "output": ""}
+
+
+def git_merge_continue(cwd: str, message: str | None = None) -> dict:
+    """Finalize an in-progress merge. Refuses if any files are still unmerged."""
+    if not (Path(cwd) / ".git" / "MERGE_HEAD").exists():
+        return {"ok": False, "output": "no merge in progress"}
+    status = git_merge_status(cwd)
+    if status["conflicted_files"]:
+        return {
+            "ok": False,
+            "output": f"still unresolved: {', '.join(status['conflicted_files'])}",
+        }
+    cmd = ["git", "commit", "--no-edit"]
+    if message:
+        cmd = ["git", "commit", "-m", message]
+    result = subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    out = (result.stdout + result.stderr).strip()
+    return {"ok": result.returncode == 0, "output": out}
+
+
+def git_merge_abort(cwd: str) -> dict:
+    """Abort the in-progress merge (restores working tree to pre-merge state)."""
+    result = subprocess.run(
+        ["git", "merge", "--abort"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    out = (result.stdout + result.stderr).strip()
+    return {"ok": result.returncode == 0, "output": out}
