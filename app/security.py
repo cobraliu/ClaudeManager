@@ -30,7 +30,7 @@ class RateLimiter:
         q.append(now)
 
 
-rate_limiter = RateLimiter(max_requests=600, window_seconds=60)
+rate_limiter = RateLimiter(max_requests=6000, window_seconds=60)
 login_rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
 
 
