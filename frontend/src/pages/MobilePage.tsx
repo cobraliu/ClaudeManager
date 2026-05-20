@@ -13,6 +13,10 @@ import {
   getConfig,
   getConversation,
   getGitInfo,
+  getGitBranches,
+  getGitGraph,
+  gitCheckoutBranch,
+  GitCheckoutConflictError,
   gitRollback,
   gitManualCommit,
   getCommitDetail,
@@ -63,6 +67,8 @@ import {
   type ModelInfo,
   type ConversationTurn,
   type GitLogEntry,
+  type GitBranchInfo,
+  type GitGraphCommit,
   type GitDiffFile,
   type ScheduledTask,
   type FileEntry,
@@ -87,6 +93,7 @@ import { ClaudeCapsModal } from "../components/ClaudeCapsModal";
 import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
 import { downloadConversationHtml } from "../lib/exportChat";
 import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
+import { GitGraph } from "../components/GitGraph";
 import type { DirInfoResponse } from "../api/sessionApi";
 
 const MOBILE_PAGE_SIZE = 10;
@@ -814,6 +821,15 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
   const [log, setLog] = useState<GitLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [isRepo, setIsRepo] = useState(false);
+  const [branches, setBranches] = useState<GitBranchInfo>({ current: "", local: [] });
+  const [scope, setScope] = useState<string>("current");
+  const [scopedLog, setScopedLog] = useState<GitLogEntry[]>([]);
+  const [scopedLoading, setScopedLoading] = useState(false);
+  const [showBranchSheet, setShowBranchSheet] = useState(false);
+  const [checkoutBusy, setCheckoutBusy] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"list" | "graph">("list");
+  const [graphCommits, setGraphCommits] = useState<GitGraphCommit[] | null>(null);
+  const [graphLoading, setGraphLoading] = useState(false);
   const [autoCommit, setAutoCommit] = useState(session.git_auto_commit);
   const [gitignore, setGitignore] = useState("");
   const [gitignoreDraft, setGitignoreDraft] = useState("");
@@ -834,17 +850,92 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
 
   useEffect(() => {
     setLoading(true);
-    getGitInfo(sessionId)
-      .then((info) => { setIsRepo(info.is_repo); setLog(info.log); setGitignore(info.gitignore ?? ""); setGitignoreDraft(info.gitignore ?? ""); setAutoCommit(info.auto_commit); setRemote(info.remote ?? ""); setRemoteInput(info.remote ?? ""); })
-      .catch(() => {})
+    Promise.all([
+      getGitInfo(sessionId).catch(() => null),
+      getGitBranches(sessionId).catch(() => ({ current: "", local: [] }) as GitBranchInfo),
+    ])
+      .then(([info, br]) => {
+        if (info) {
+          setIsRepo(info.is_repo); setLog(info.log);
+          setGitignore(info.gitignore ?? ""); setGitignoreDraft(info.gitignore ?? "");
+          setAutoCommit(info.auto_commit); setRemote(info.remote ?? ""); setRemoteInput(info.remote ?? "");
+        }
+        setBranches(br);
+      })
       .finally(() => setLoading(false));
   }, [sessionId]);
 
+  // Fetch scoped graph when scope is not "current"
+  useEffect(() => {
+    if (scope === "current") return;
+    setScopedLoading(true);
+    getGitGraph(sessionId, scope, 500)
+      .then((commits) => {
+        setScopedLog(commits.map((c) => ({
+          hash: c.hash, short_hash: c.short_hash, subject: c.subject,
+          author: c.author, date: c.date,
+        })));
+      })
+      .catch(() => setScopedLog([]))
+      .finally(() => setScopedLoading(false));
+  }, [sessionId, scope]);
+
+  // Fetch raw graph commits when in graph view
+  useEffect(() => {
+    if (viewMode !== "graph") return;
+    setGraphLoading(true);
+    getGitGraph(sessionId, scope, 500)
+      .then(setGraphCommits)
+      .catch(() => setGraphCommits([]))
+      .finally(() => setGraphLoading(false));
+  }, [sessionId, scope, viewMode]);
+
+  const activeLog: GitLogEntry[] = scope === "current" ? log : scopedLog;
+  const activeLoading = scope === "current" ? loading : scopedLoading;
+
+  const doCheckout = async (branch: string, remote: boolean) => {
+    if (checkoutBusy) return;
+    setCheckoutBusy(branch);
+    try {
+      const res = await gitCheckoutBranch(sessionId, branch, { remote });
+      setMsg({ text: res.stashed ? `Switched to ${res.branch} (changes stashed)` : `Switched to ${res.branch}`, ok: true });
+      setShowBranchSheet(false);
+      setScope("current");
+      // Refresh info + branches
+      const [info, br] = await Promise.all([
+        getGitInfo(sessionId).catch(() => null),
+        getGitBranches(sessionId).catch(() => branches),
+      ]);
+      if (info) setLog(info.log);
+      setBranches(br);
+    } catch (e) {
+      if (e instanceof GitCheckoutConflictError) {
+        const stash = window.confirm(`${e.conflict.message}\n\nStash local changes and retry?`);
+        if (stash) {
+          try {
+            const res = await gitCheckoutBranch(sessionId, branch, { remote, stash: true });
+            setMsg({ text: `Switched to ${res.branch} (changes stashed)`, ok: true });
+            setShowBranchSheet(false);
+            setScope("current");
+            const [info, br] = await Promise.all([
+              getGitInfo(sessionId).catch(() => null),
+              getGitBranches(sessionId).catch(() => branches),
+            ]);
+            if (info) setLog(info.log);
+            setBranches(br);
+          } catch (e2) { setMsg({ text: String(e2), ok: false }); }
+        }
+      } else {
+        setMsg({ text: String(e), ok: false });
+      }
+    } finally { setCheckoutBusy(null); }
+  };
+
   const filtered = useMemo(() => {
-    if (!search.trim()) return log;
+    if (!search.trim()) return activeLog;
     const q = search.toLowerCase();
-    return log.filter((e) => e.subject.toLowerCase().includes(q) || e.short_hash.includes(q));
-  }, [log, search]);
+    return activeLog.filter((e) => e.subject.toLowerCase().includes(q) || e.short_hash.includes(q));
+  }, [activeLog, search]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / GIT_PAGE_SIZE));
   const safePage = Math.min(page, totalPages - 1);
@@ -873,7 +964,13 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
       <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
         <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
         <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Git</span>
-        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{filtered.length} commits</span>
+        {branches.current && (
+          <button
+            onClick={() => setShowBranchSheet(true)}
+            style={{ fontSize: 11, padding: "3px 10px", background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", color: "var(--accent-blue)", borderRadius: 11, fontFamily: "monospace", maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 1 }}
+          >⎇ {branches.current}</button>
+        )}
+        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{filtered.length}</span>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
           {isRepo && (
             <>
@@ -936,6 +1033,31 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
             <span style={{ fontSize: 12, color: "var(--text-faint)", flexShrink: 0 }}>›</span>
           </div>
 
+          {/* Scope pills + view-mode toggle */}
+          {branches.local.length > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+              <div style={{ display: "flex", gap: 6, overflowX: "auto", scrollbarWidth: "none", flex: 1, minWidth: 0 }}>
+                {[{ id: "current", label: `● ${branches.current}` }, { id: "all", label: "all" }, ...branches.local.filter(b => b !== branches.current).map(b => ({ id: b, label: b }))].map(p => {
+                  const active = scope === p.id;
+                  return (
+                    <button
+                      key={p.id}
+                      onClick={() => { setScope(p.id); setPage(0); }}
+                      style={{ flex: "0 0 auto", fontSize: 11, padding: "4px 10px", background: active ? "var(--accent-blue)" : "var(--bg-hover)", color: active ? "#fff" : "var(--text-muted)", border: "1px solid " + (active ? "var(--accent-blue)" : "var(--border)"), borderRadius: 12, fontFamily: "monospace", whiteSpace: "nowrap" }}
+                    >{p.label}</button>
+                  );
+                })}
+              </div>
+              <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden", flexShrink: 0 }}>
+                {(["list", "graph"] as const).map(m => (
+                  <button key={m} onClick={() => setViewMode(m)}
+                    style={{ padding: "4px 8px", fontSize: 11, background: viewMode === m ? "var(--bg-hover)" : "transparent", color: viewMode === m ? "var(--text-body)" : "var(--text-muted)", border: "none" }}
+                  >{m === "list" ? "List" : "Graph"}</button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Search */}
           <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
             <input
@@ -948,12 +1070,38 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
 
           {/* Commit list */}
           <div style={{ flex: 1, overflowY: "auto" }}>
-            {loading
+            {viewMode === "graph" ? (
+              graphLoading ? (
+                <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>Loading graph…</div>
+              ) : (graphCommits ?? []).length === 0 ? (
+                <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>No commits found</div>
+              ) : (
+                <div style={{ overflowX: "auto", padding: "8px 0" }}>
+                  <GitGraph
+                    commits={graphCommits ?? []}
+                    latestHash={(graphCommits ?? [])[0]?.hash ?? null}
+                    onCommitClick={async (c) => {
+                      setDetailHash(c.hash);
+                      setDetailMsg("Loading…");
+                      setDetailFiles([]);
+                      try {
+                        const d = await getCommitDetail(sessionId, c.hash);
+                        setDetailMsg(d.message);
+                        setDetailFiles(d.files ?? []);
+                      } catch {
+                        setDetailMsg("Failed to load commit detail.");
+                      }
+                    }}
+                    onRevert={scope === "current" ? (c) => setRevertHash(c.hash) : undefined}
+                  />
+                </div>
+              )
+            ) : activeLoading
               ? <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>Loading…</div>
               : pageLog.length === 0
                 ? <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>No commits found</div>
                 : pageLog.map((entry) => {
-                  const isLatest = entry.hash === log[0]?.hash;
+                  const isLatest = entry.hash === activeLog[0]?.hash;
                   return (
                     <div key={entry.hash} style={{ padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)", display: "flex", flexDirection: "column", gap: 4 }}>
                       <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
@@ -980,7 +1128,7 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
                           >
                             Detail
                           </button>
-                          {!isLatest && (
+                          {!isLatest && scope === "current" && (
                             <button
                               onClick={() => setRevertHash(entry.hash)}
                               style={{ fontSize: 11, padding: "3px 10px", background: "var(--bg-hover)", color: "var(--accent-amber)", border: "1px solid var(--border)", borderRadius: 5 }}
@@ -997,7 +1145,7 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
           </div>
 
           {/* Pagination */}
-          {totalPages > 1 && (
+          {viewMode === "list" && totalPages > 1 && (
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 16, padding: "10px 16px", borderTop: "1px solid var(--border-subtle)", background: "var(--bg-base)", flexShrink: 0 }}>
               <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={safePage === 0}
                 style={{ ...btn, padding: "5px 18px", opacity: safePage === 0 ? 0.35 : 1, background: "var(--bg-hover)", color: "var(--text-secondary)" }}>‹</button>
@@ -1007,6 +1155,63 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
             </div>
           )}
         </>
+      )}
+
+      {/* Branch checkout sheet */}
+      {showBranchSheet && (
+        <div onClick={() => setShowBranchSheet(false)} style={{ position: "absolute", inset: 0, zIndex: 250, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "flex-end" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxHeight: "70vh", background: "var(--bg-surface)", borderRadius: "12px 12px 0 0", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-bright)" }}>⎇ Switch branch</span>
+              <button onClick={() => setShowBranchSheet(false)} style={{ background: "var(--bg-hover)", border: "none", color: "var(--text-secondary)", fontSize: 13, padding: "4px 12px", borderRadius: 6, cursor: "pointer" }}>✕</button>
+            </div>
+            <div style={{ overflowY: "auto" }}>
+              {branches.local.length === 0 && (!branches.remote_only || branches.remote_only.length === 0) && (
+                <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>No branches</div>
+              )}
+              {branches.local.map(b => {
+                const isCurrent = b === branches.current;
+                const busy = checkoutBusy === b;
+                return (
+                  <button
+                    key={b}
+                    onClick={() => { if (!isCurrent) doCheckout(b, false); }}
+                    disabled={isCurrent || !!checkoutBusy}
+                    style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: isCurrent ? "var(--accent-blue)" : "var(--text-bright)", fontSize: 14, cursor: isCurrent ? "default" : "pointer", textAlign: "left", fontFamily: "monospace" }}
+                  >
+                    <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                      {isCurrent && <span style={{ color: "var(--accent-blue)" }}>●</span>}
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b}</span>
+                    </span>
+                    {busy && <span style={{ fontSize: 11, color: "var(--text-muted)" }}>…</span>}
+                  </button>
+                );
+              })}
+              {branches.remote_only && branches.remote_only.length > 0 && (
+                <>
+                  <div style={{ padding: "10px 16px 6px", fontSize: 10, textTransform: "uppercase", letterSpacing: 0.6, color: "var(--text-faint)", fontWeight: 600, background: "var(--bg-base)" }}>Remote-only</div>
+                  {branches.remote_only.map(b => {
+                    const busy = checkoutBusy === b;
+                    return (
+                      <button
+                        key={b}
+                        onClick={() => doCheckout(b, true)}
+                        disabled={!!checkoutBusy}
+                        style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-bright)", fontSize: 14, cursor: "pointer", textAlign: "left", fontFamily: "monospace" }}
+                      >
+                        <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                          <span style={{ color: "var(--text-faint)" }}>↓</span>
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b}</span>
+                        </span>
+                        {busy && <span style={{ fontSize: 11, color: "var(--text-muted)" }}>…</span>}
+                      </button>
+                    );
+                  })}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Toast message */}
