@@ -2,12 +2,15 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import hljs from "highlight.js/lib/common";
 import {
   getMergeStatus,
+  getMergePreview,
+  getMergeFileDiff,
   gitMergeStart,
   gitMergeAbort,
   gitMergeContinue,
   getMergeConflictFile,
   gitResolveFile,
   type MergeStatus,
+  type MergePreview,
   type ConflictFileVersions,
   type GitBranchInfo,
 } from "../api/sessionApi";
@@ -27,6 +30,8 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
   const [target, setTarget] = useState<string>("");
   const [starting, setStarting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [preview, setPreview] = useState<MergePreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   const refresh = useCallback(() => {
     return getMergeStatus(sessionId)
@@ -37,6 +42,24 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
   useEffect(() => {
     refresh().finally(() => setLoading(false));
   }, [refresh]);
+
+  // Debounced preview fetch whenever both branches are selected and differ.
+  useEffect(() => {
+    if (!source || !target || source === target) { setPreview(null); return; }
+    let cancelled = false;
+    setPreviewLoading(true);
+    const handle = setTimeout(async () => {
+      try {
+        const p = await getMergePreview(sessionId, source, target);
+        if (!cancelled) setPreview(p);
+      } catch (e) {
+        if (!cancelled) setPreview({ merge_kind: "error", error: String(e) });
+      } finally {
+        if (!cancelled) setPreviewLoading(false);
+      }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(handle); };
+  }, [sessionId, source, target]);
 
   // Default target to main/master; leave source empty (user must pick).
   useEffect(() => {
@@ -133,6 +156,15 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
           </div>
           {source && target && source === target && (
             <div style={{ fontSize: 11, color: "var(--accent-amber)" }}>Source and target must differ.</div>
+          )}
+          {source && target && source !== target && (
+            <MergePreviewBlock
+              sessionId={sessionId}
+              preview={preview}
+              loading={previewLoading}
+              source={source}
+              target={target}
+            />
           )}
           <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
             Checks out <span style={{ fontFamily: "monospace" }}>{target || "<target>"}</span> (if not already), then runs
@@ -588,5 +620,256 @@ function ResultHunkView({
         );
       })}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Merge preview block: status badge + Commits/Diff tabs
+
+const STATUS_COLOR: Record<string, string> = {
+  M: "var(--accent-amber)", A: "var(--accent-green)", D: "var(--accent-red)",
+  R: "var(--accent-blue)", C: "var(--accent-blue)",
+};
+
+function statusBadge(kind: MergePreview["merge_kind"], err?: string): { label: string; color: string; bg: string } {
+  switch (kind) {
+    case "up_to_date": return { label: "✓ Up to date", color: "var(--accent-green)", bg: "rgba(63,185,80,0.12)" };
+    case "fast_forward": return { label: "→ Fast-forward (clean)", color: "var(--accent-blue)", bg: "rgba(88,166,255,0.12)" };
+    case "clean": return { label: "✓ Clean merge", color: "var(--accent-green)", bg: "rgba(63,185,80,0.12)" };
+    case "conflict": return { label: "⚠ Would conflict", color: "var(--accent-amber)", bg: "rgba(187,128,9,0.15)" };
+    case "error": return { label: err ? `✕ ${err}` : "✕ Error", color: "var(--accent-red)", bg: "rgba(248,81,73,0.12)" };
+  }
+}
+
+function MergePreviewBlock({
+  sessionId, preview, loading, source, target,
+}: {
+  sessionId: string;
+  preview: MergePreview | null;
+  loading: boolean;
+  source: string;
+  target: string;
+}) {
+  const [tab, setTab] = useState<"commits" | "diff">("commits");
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [diff, setDiff] = useState<string>("");
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const conflictSet = useMemo(
+    () => new Set(preview?.conflicting_files ?? []),
+    [preview],
+  );
+
+  // Default the file selection to the first changed file once the preview arrives.
+  useEffect(() => {
+    const files = preview?.changed_files;
+    if (!files || files.length === 0) { setSelectedFile(null); return; }
+    if (!selectedFile || !files.find(f => f.path === selectedFile)) {
+      setSelectedFile(files[0].path);
+    }
+  }, [preview, selectedFile]);
+
+  // Lazy fetch per-file diff when on Diff tab.
+  useEffect(() => {
+    if (tab !== "diff" || !selectedFile) { setDiff(""); setDiffError(null); return; }
+    let cancelled = false;
+    setDiffLoading(true);
+    setDiffError(null);
+    getMergeFileDiff(sessionId, source, target, selectedFile)
+      .then(r => {
+        if (cancelled) return;
+        if (r.error) { setDiffError(r.error); setDiff(""); }
+        else { setDiff(r.diff || ""); }
+      })
+      .catch(e => { if (!cancelled) { setDiffError(String(e)); setDiff(""); } })
+      .finally(() => { if (!cancelled) setDiffLoading(false); });
+    return () => { cancelled = true; };
+  }, [sessionId, source, target, selectedFile, tab]);
+
+  const containerStyle: React.CSSProperties = {
+    border: "1px solid var(--bg-hover)", borderRadius: 6,
+    background: "var(--bg-surface)", display: "flex", flexDirection: "column",
+    fontSize: 12,
+  };
+
+  if (loading && !preview) {
+    return (
+      <div style={{ ...containerStyle, padding: "10px 12px", color: "var(--text-muted)" }}>
+        Loading preview for <span style={{ fontFamily: "monospace" }}>{source}</span> → <span style={{ fontFamily: "monospace" }}>{target}</span>…
+      </div>
+    );
+  }
+  if (!preview) return null;
+  const badge = statusBadge(preview.merge_kind, preview.error);
+  const commits = preview.commits ?? [];
+  const files = preview.changed_files ?? [];
+
+  return (
+    <div style={containerStyle}>
+      {/* Status header */}
+      <div style={{ padding: "8px 12px", display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", borderBottom: "1px solid var(--bg-hover)" }}>
+        <span style={{ padding: "2px 8px", borderRadius: 4, background: badge.bg, color: badge.color, fontWeight: 600 }}>
+          {badge.label}
+        </span>
+        {preview.merge_kind !== "error" && (
+          <span style={{ color: "var(--text-muted)" }}>
+            <span style={{ color: "var(--accent-blue)", fontFamily: "monospace" }}>{source}</span> is{" "}
+            <span style={{ color: "var(--text-body)" }}>{preview.ahead ?? 0}</span> commit{preview.ahead === 1 ? "" : "s"} ahead,{" "}
+            <span style={{ color: "var(--text-body)" }}>{preview.behind ?? 0}</span> behind{" "}
+            <span style={{ color: "var(--accent-amber)", fontFamily: "monospace" }}>{target}</span>
+          </span>
+        )}
+        {loading && <span style={{ color: "var(--text-faint)", fontSize: 11 }}>refreshing…</span>}
+      </div>
+
+      {preview.merge_kind === "error" || preview.merge_kind === "up_to_date" ? null : (
+        <>
+          {/* Tabs */}
+          <div style={{ display: "flex", borderBottom: "1px solid var(--bg-hover)" }}>
+            <TabButton active={tab === "commits"} onClick={() => setTab("commits")}>
+              Commits {commits.length > 0 && <span style={{ opacity: 0.7 }}>({commits.length})</span>}
+            </TabButton>
+            <TabButton active={tab === "diff"} onClick={() => setTab("diff")}>
+              Code diff {files.length > 0 && <span style={{ opacity: 0.7 }}>({files.length})</span>}
+            </TabButton>
+          </div>
+
+          {/* Tab body */}
+          {tab === "commits" ? (
+            <CommitsTabBody commits={commits} />
+          ) : (
+            <DiffTabBody
+              files={files}
+              conflictSet={conflictSet}
+              selectedFile={selectedFile}
+              onSelectFile={setSelectedFile}
+              diff={diff}
+              diffLoading={diffLoading}
+              diffError={diffError}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: active ? "var(--bg-base)" : "transparent",
+        color: active ? "var(--accent-blue)" : "var(--text-secondary)",
+        border: "none",
+        borderBottom: active ? "2px solid var(--accent-blue)" : "2px solid transparent",
+        padding: "6px 14px", fontSize: 12, cursor: "pointer", fontWeight: active ? 600 : 400,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function CommitsTabBody({ commits }: { commits: MergePreview["commits"] }) {
+  if (!commits || commits.length === 0) {
+    return <div style={{ padding: "10px 12px", color: "var(--text-muted)" }}>(no commits)</div>;
+  }
+  return (
+    <div style={{ maxHeight: 240, overflowY: "auto" }}>
+      {commits.map(c => (
+        <div key={c.hash} style={{ padding: "5px 12px", display: "flex", gap: 10, alignItems: "baseline", borderBottom: "1px solid var(--bg-hover)" }}>
+          <span style={{ fontFamily: "monospace", color: "var(--accent-amber)", fontSize: 11 }}>{c.short}</span>
+          <span style={{ color: "var(--text-body)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.subject}>
+            {c.subject}
+          </span>
+          <span style={{ color: "var(--text-faint)", fontSize: 11, whiteSpace: "nowrap" }} title={c.date}>
+            {c.author}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DiffTabBody({
+  files, conflictSet, selectedFile, onSelectFile,
+  diff, diffLoading, diffError,
+}: {
+  files: Array<{ path: string; status: string }>;
+  conflictSet: Set<string>;
+  selectedFile: string | null;
+  onSelectFile: (p: string) => void;
+  diff: string;
+  diffLoading: boolean;
+  diffError: string | null;
+}) {
+  if (files.length === 0) {
+    return <div style={{ padding: "10px 12px", color: "var(--text-muted)" }}>(no file changes)</div>;
+  }
+  return (
+    <div style={{ display: "flex", minHeight: 200, maxHeight: 360 }}>
+      {/* File list */}
+      <div style={{ width: 240, flexShrink: 0, borderRight: "1px solid var(--bg-hover)", overflowY: "auto" }}>
+        {files.map(f => {
+          const isConflict = conflictSet.has(f.path);
+          const isActive = f.path === selectedFile;
+          return (
+            <div
+              key={f.path}
+              onClick={() => onSelectFile(f.path)}
+              title={f.path + (isConflict ? "  (would conflict)" : "")}
+              style={{
+                padding: "4px 8px", fontSize: 11, fontFamily: "monospace", cursor: "pointer",
+                background: isActive ? "rgba(88,166,255,0.15)" : "transparent",
+                borderLeft: isActive ? "2px solid var(--accent-blue)" : "2px solid transparent",
+                color: isConflict ? "var(--accent-red)" : "var(--text-body)",
+                display: "flex", gap: 6, alignItems: "baseline",
+              }}
+            >
+              <span style={{ width: 12, color: STATUS_COLOR[f.status] || "var(--text-muted)" }}>{f.status}</span>
+              <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {f.path}
+              </span>
+              {isConflict && <span style={{ fontSize: 9, color: "var(--accent-red)" }}>⚠</span>}
+            </div>
+          );
+        })}
+      </div>
+      {/* Diff viewer */}
+      <div style={{ flex: 1, overflow: "auto", background: "var(--bg-base)", minWidth: 0 }}>
+        {diffLoading ? (
+          <div style={{ padding: 12, color: "var(--text-muted)", fontSize: 12 }}>Loading diff…</div>
+        ) : diffError ? (
+          <div style={{ padding: 12, color: "var(--accent-red)", fontSize: 12 }}>{diffError}</div>
+        ) : !diff ? (
+          <div style={{ padding: 12, color: "var(--text-muted)", fontSize: 12 }}>(empty diff)</div>
+        ) : (
+          <DiffView diff={diff} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DiffView({ diff }: { diff: string }) {
+  const lines = diff.split("\n");
+  return (
+    <pre style={{ margin: 0, padding: "6px 10px", fontSize: 11, fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,"Courier New",monospace', whiteSpace: "pre" }}>
+      {lines.map((ln, i) => {
+        let color = "var(--text-body)";
+        let bg = "transparent";
+        if (ln.startsWith("+++") || ln.startsWith("---")) { color = "var(--text-faint)"; }
+        else if (ln.startsWith("@@")) { color = "var(--accent-blue)"; bg = "rgba(88,166,255,0.08)"; }
+        else if (ln.startsWith("+")) { color = "var(--accent-green)"; bg = "rgba(63,185,80,0.08)"; }
+        else if (ln.startsWith("-")) { color = "var(--accent-red)"; bg = "rgba(248,81,73,0.08)"; }
+        else if (ln.startsWith("diff --git")) { color = "var(--text-faint)"; }
+        return (
+          <div key={i} style={{ color, background: bg, whiteSpace: "pre" }}>
+            {ln || " "}
+          </div>
+        );
+      })}
+    </pre>
   );
 }

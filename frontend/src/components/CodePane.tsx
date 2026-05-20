@@ -40,36 +40,8 @@ function useResizeWidth<T extends HTMLElement>() {
   return [ref, width] as const;
 }
 
-// ── File icons (copied from FileEditorModal) ──────────────────────────────
-
-const EXT_ICONS: Record<string, string> = {
-  py: "🐍", js: "📜", ts: "📘", tsx: "⚛️", jsx: "⚛️",
-  json: "{ }", yaml: "📋", yml: "📋", toml: "📋",
-  md: "📝", txt: "📄", csv: "📊", sql: "🗄️",
-  css: "🎨", scss: "🎨", html: "🌐", htm: "🌐",
-  sh: "⚙️", bash: "⚙️", zsh: "⚙️",
-  go: "🔵", rs: "🦀", java: "☕", kt: "🟣",
-  c: "🔷", cpp: "🔷", h: "🔷",
-  rb: "💎", php: "🐘", swift: "🍎",
-  tf: "🏗️", dockerfile: "🐳", env: "🔑",
-  log: "📋", lock: "🔒",
-  db: "🗄️", sqlite: "🗄️", sqlite3: "🗄️",
-  pdf: "📕",
-  zip: "🗜️", tar: "🗜️", gz: "🗜️", bz2: "🗜️", xz: "🗜️",
-  tgz: "🗜️", tbz2: "🗜️", txz: "🗜️",
-  png: "🖼️", jpg: "🖼️", jpeg: "🖼️", gif: "🖼️", webp: "🖼️",
-  bmp: "🖼️", ico: "🖼️", avif: "🖼️", tiff: "🖼️", tif: "🖼️", svg: "🖼️",
-};
-const SPECIAL_ICONS: Record<string, string> = {
-  Makefile: "⚙️", Dockerfile: "🐳", ".gitignore": "🔍",
-  ".env": "🔑", "package.json": "📦", "go.mod": "🔵",
-  "Cargo.toml": "🦀", "pyproject.toml": "🐍",
-};
-function fileIcon(name: string): string {
-  if (SPECIAL_ICONS[name]) return SPECIAL_ICONS[name];
-  const ext = name.split(".").pop()?.toLowerCase() || "";
-  return EXT_ICONS[ext] || "📄";
-}
+// ── File icons (shared with FileEditorModal & MobilePage) ────────────────
+import { FileIcon } from "./FileIcon";
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "tiff", "tif", "ico", "svg"]);
 function isImage(name: string) { return IMAGE_EXTS.has(name.split(".").pop()?.toLowerCase() ?? ""); }
@@ -231,7 +203,7 @@ function FileTreeDir({
         <span style={{ fontSize: 9, color: "var(--text-muted)", minWidth: 8, textAlign: "center", flexShrink: 0 }}>
           {state.loading ? "…" : state.open ? "▾" : "▸"}
         </span>
-        <span style={{ fontSize: 13, flexShrink: 0 }}>{state.open ? "📂" : "📁"}</span>
+        <FileIcon isDir isOpen={state.open} />
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {entry.name}
         </span>
@@ -291,7 +263,7 @@ function FileTreeFile({
       onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}
     >
       <span style={{ minWidth: 8, flexShrink: 0 }} />
-      <span style={{ fontSize: 13, flexShrink: 0 }}>{fileIcon(entry.name)}</span>
+      <FileIcon name={entry.name} isDir={entry.type === "dir"} />
       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
         {entry.name}
       </span>
@@ -680,7 +652,7 @@ function ChangesNodeRow({
           onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
         >
           <span style={{ fontSize: 9, color: "var(--text-faint)" }}>{open ? "▾" : "▸"}</span>
-          <span style={{ fontSize: 12 }}>📁</span>
+          <FileIcon isDir isOpen={open} />
           <span>{node.name}</span>
           <span style={{ fontSize: 10, color: "var(--text-faint)", marginLeft: 2 }}>({fileCount})</span>
         </div>
@@ -708,7 +680,7 @@ function ChangesNodeRow({
       <span style={{ fontSize: 9, color: STATUS_COLORS[f.status] ?? "var(--text-secondary)", minWidth: 10, fontWeight: 700, flexShrink: 0 }}>
         {f.status[0].toUpperCase()}
       </span>
-      <span style={{ fontSize: 13, flexShrink: 0 }}>{fileIcon(node.name)}</span>
+      <FileIcon name={node.name} />
       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{node.name}</span>
       {(f.added != null || f.removed != null) && (
         <span style={{ display: "flex", gap: 3, flexShrink: 0, fontSize: 9, fontFamily: "monospace" }}>
@@ -941,7 +913,7 @@ function ViewerHeader({
       padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0,
       display: "flex", alignItems: "center", gap: 8, background: "var(--bg-base)", fontSize: 12, minHeight: 28,
     }}>
-      <span style={{ fontSize: 13, flexShrink: 0 }}>{fileIcon(name)}</span>
+      <FileIcon name={name} />
       <span style={{ color: "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {path}
       </span>
@@ -1107,7 +1079,7 @@ function ViewerContent({
     return (
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faintest)", fontSize: 13 }}>
         <div style={{ textAlign: "center" }}>
-          <div style={{ fontSize: 32, marginBottom: 8 }}>📂</div>
+          <div style={{ marginBottom: 8, lineHeight: 0 }}><FileIcon isDir isOpen size={36} /></div>
           <div>Select a file from the tree</div>
           <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 4 }}>Changed files are highlighted in yellow</div>
         </div>
@@ -1786,7 +1758,7 @@ export function CodePane({
                     style={{ padding: "3px 10px", fontSize: 12, cursor: "pointer", color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: 5, borderBottom: "1px solid var(--bg-deep)" }}
                     onMouseEnter={(el) => { el.currentTarget.style.background = "var(--bg-surface)"; }}
                     onMouseLeave={(el) => { el.currentTarget.style.background = "transparent"; }}>
-                    <span style={{ fontSize: 13, flexShrink: 0 }}>{e.type === "dir" ? "📁" : fileIcon(e.name)}</span>
+                    <FileIcon name={e.name} isDir={e.type === "dir"} />
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, fontFamily: "monospace" }}>{e.path}</span>
                   </div>
                 ))

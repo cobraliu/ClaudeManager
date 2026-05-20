@@ -329,7 +329,7 @@ export function DownloadExclusionModal({
           border: "1px solid var(--border-strong)",
           borderRadius: 8,
           padding: 20,
-          width: 480,
+          width: "min(480px, 92vw)",
           maxHeight: "80vh",
           display: "flex",
           flexDirection: "column",

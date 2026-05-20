@@ -826,6 +826,171 @@ def git_merge_status(cwd: str) -> dict:
     }
 
 
+def git_merge_preview(cwd: str, source: str, target: str) -> dict:
+    """Read-only preview of merging `source` into `target`.
+
+    Computes:
+      - merge_kind: "up_to_date" | "fast_forward" | "clean" | "conflict" | "error"
+      - ahead/behind: commit counts relative to the merge-base
+      - commits: [{hash, short, subject, author, date}] for commits in source not on target
+      - changed_files: [{path, status}] from `git diff --name-status target...source`
+      - conflicting_files: paths git merge-tree predicts would conflict (only when
+        merge_kind == "conflict")
+      - error: human-readable error string when merge_kind == "error"
+
+    Does not modify the working tree or index; safe to call repeatedly.
+    """
+    if not source or not target:
+        return {"merge_kind": "error", "error": "source and target are required"}
+    if source == target:
+        return {"merge_kind": "error", "error": "source and target are the same"}
+
+    def _run(args: list[str]) -> tuple[int, str, str]:
+        r = subprocess.run(
+            ["git", "-c", "core.quotepath=false", *args],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        return r.returncode, r.stdout, r.stderr
+
+    # Validate refs exist.
+    for ref in (source, target):
+        rc, _, _ = _run(["rev-parse", "--verify", f"{ref}^{{commit}}"])
+        if rc != 0:
+            return {"merge_kind": "error", "error": f"unknown ref: {ref}"}
+
+    # Find merge-base. Without one, the branches share no history.
+    rc, base_out, _ = _run(["merge-base", target, source])
+    base = base_out.strip()
+    if rc != 0 or not base:
+        return {"merge_kind": "error", "error": f"no common ancestor between {target} and {source}"}
+
+    # ahead = commits source has past base, behind = commits target has past base.
+    def _count(rev_range: str) -> int:
+        rc, out, _ = _run(["rev-list", "--count", rev_range])
+        if rc != 0:
+            return 0
+        return int(out.strip() or "0")
+
+    ahead = _count(f"{base}..{source}")
+    behind = _count(f"{base}..{target}")
+
+    # Changed files between target and source via the symmetric `target...source`
+    # form — i.e., everything source has that's not on target, relative to base.
+    rc, ns_out, _ = _run(["diff", "--name-status", f"{target}...{source}"])
+    changed_files: list[dict] = []
+    if rc == 0:
+        for line in ns_out.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            status = parts[0][:1]  # M / A / D / R / C — take first letter
+            path = parts[-1]
+            changed_files.append({"path": path, "status": status})
+
+    # Commits in source not on target. Cap at 200 to keep payload bounded.
+    commits: list[dict] = []
+    # %x1f = unit separator — safe field delimiter that won't appear in commit metadata.
+    fmt = "%H%x1f%h%x1f%an%x1f%ad%x1f%s"
+    rc, log_out, _ = _run([
+        "log", f"--pretty=format:{fmt}", "--date=iso-strict",
+        "--max-count=200", f"{base}..{source}",
+    ])
+    if rc == 0:
+        for line in log_out.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\x1f")
+            if len(parts) < 5:
+                continue
+            commits.append({
+                "hash": parts[0], "short": parts[1],
+                "author": parts[2], "date": parts[3], "subject": parts[4],
+            })
+
+    if ahead == 0:
+        return {
+            "merge_kind": "up_to_date",
+            "ahead": 0,
+            "behind": behind,
+            "commits": [],
+            "changed_files": [],
+            "conflicting_files": [],
+        }
+    if behind == 0:
+        # target is an ancestor of source — fast-forward is possible.
+        return {
+            "merge_kind": "fast_forward",
+            "ahead": ahead,
+            "behind": 0,
+            "commits": commits,
+            "changed_files": changed_files,
+            "conflicting_files": [],
+        }
+
+    # True three-way merge: probe for conflicts with `git merge-tree`.
+    # Modern form (git >= 2.38): `git merge-tree --write-tree --name-only --merge-base=BASE TARGET SOURCE`.
+    # Non-zero exit means conflicts; stdout's first line is the merged tree OID,
+    # remaining lines are conflicted paths (with --name-only).
+    rc, mt_out, mt_err = _run([
+        "merge-tree", "--write-tree", "--name-only",
+        f"--merge-base={base}", target, source,
+    ])
+    if rc == 0:
+        return {
+            "merge_kind": "clean",
+            "ahead": ahead,
+            "behind": behind,
+            "commits": commits,
+            "changed_files": changed_files,
+            "conflicting_files": [],
+        }
+    # rc != 0 → conflicts. Lines after the first (tree OID) are paths.
+    lines = [ln for ln in mt_out.splitlines() if ln.strip()]
+    conflicting = lines[1:] if len(lines) > 1 else []
+    if not conflicting and not mt_err:
+        # Older git that doesn't support --write-tree falls through here.
+        # Best-effort fall-back using the legacy `merge-tree BASE TARGET SOURCE`
+        # form — search for conflict markers in its output.
+        rc2, legacy_out, _ = _run(["merge-tree", base, target, source])
+        if rc2 == 0 and "<<<<<<<" not in legacy_out:
+            return {
+                "merge_kind": "clean",
+                "ahead": ahead,
+                "behind": behind,
+                "commits": commits,
+                "changed_files": changed_files,
+                "conflicting_files": [],
+            }
+    return {
+        "merge_kind": "conflict",
+        "ahead": ahead,
+        "behind": behind,
+        "commits": commits,
+        "changed_files": changed_files,
+        "conflicting_files": conflicting,
+    }
+
+
+def git_merge_file_diff(cwd: str, source: str, target: str, path: str) -> dict:
+    """Return the unified diff of `path` between target and source.
+
+    Uses `git diff target...source -- path` (symmetric form) so the diff shows
+    changes source has that target doesn't, relative to the merge base.
+    """
+    if not source or not target or not path:
+        return {"diff": "", "error": "source, target, and path are required"}
+    r = subprocess.run(
+        ["git", "-c", "core.quotepath=false", "diff", "--no-color",
+         f"{target}...{source}", "--", path],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if r.returncode != 0:
+        return {"diff": "", "error": (r.stderr or "").strip() or "diff failed"}
+    return {"diff": r.stdout}
+
+
 def git_merge_start(cwd: str, source: str, target: str) -> dict:
     """Merge `source` into `target` (no-ff). If `target` is not the current branch,
     checks out `target` first.

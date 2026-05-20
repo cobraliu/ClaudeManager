@@ -4,6 +4,7 @@ import downloadIcon from "../assets/download.svg";
 import moveIcon from "../assets/move.svg";
 import renameIcon from "../assets/rename.svg";
 import { DownloadExclusionModal } from "./DownloadExclusionModal";
+import { FileIcon, NewFolderIcon } from "./FileIcon";
 import hljs from "highlight.js/lib/common";
 import "highlight.js/styles/github-dark.css";
 import { marked } from "../lib/markdown";
@@ -138,36 +139,7 @@ interface OpenFile {
   size?: number;  // bytes, for binary files
 }
 
-// ── File type icons ──────────────────────────────────────────────────────────
-const EXT_ICONS: Record<string, string> = {
-  py: "🐍", js: "📜", ts: "📘", tsx: "⚛️", jsx: "⚛️",
-  json: "{ }", yaml: "📋", yml: "📋", toml: "📋",
-  md: "📝", txt: "📄", csv: "📊", sql: "🗄️",
-  css: "🎨", scss: "🎨", html: "🌐", htm: "🌐",
-  sh: "⚙️", bash: "⚙️", zsh: "⚙️",
-  go: "🔵", rs: "🦀", java: "☕", kt: "🟣",
-  c: "🔷", cpp: "🔷", h: "🔷",
-  rb: "💎", php: "🐘", swift: "🍎",
-  tf: "🏗️", dockerfile: "🐳", env: "🔑",
-  log: "📋", lock: "🔒",
-  db: "🗄️", sqlite: "🗄️", sqlite3: "🗄️",
-  pdf: "📕",
-  zip: "🗜️", tar: "🗜️", gz: "🗜️", bz2: "🗜️", xz: "🗜️",
-  tgz: "🗜️", tbz2: "🗜️", txz: "🗜️",
-  png: "🖼️", jpg: "🖼️", jpeg: "🖼️", gif: "🖼️", webp: "🖼️", bmp: "🖼️", ico: "🖼️", avif: "🖼️", tiff: "🖼️", tif: "🖼️",
-};
-
-const SPECIAL_ICONS: Record<string, string> = {
-  Makefile: "⚙️", Dockerfile: "🐳", ".gitignore": "🔍",
-  ".env": "🔑", "package.json": "📦", "go.mod": "🔵",
-  "Cargo.toml": "🦀", "pyproject.toml": "🐍",
-};
-
-function fileIcon(name: string): string {
-  if (SPECIAL_ICONS[name]) return SPECIAL_ICONS[name];
-  const ext = name.split(".").pop()?.toLowerCase() || "";
-  return EXT_ICONS[ext] || "📄";
-}
+// ── File type icons (shared via ./FileIcon) ──────────────────────────────
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
@@ -238,7 +210,7 @@ export function DirPicker({
               onMouseEnter={(el) => (el.currentTarget.style.background = "var(--bg-hover)")}
               onMouseLeave={(el) => (el.currentTarget.style.background = "")}
             >
-              <span style={{ color: "var(--text-muted)", flexShrink: 0 }}>📁</span>
+              <span style={{ flexShrink: 0, display: "inline-flex", alignItems: "center" }}><FileIcon isDir size={12} /></span>
               <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.name}</span>
             </div>
           ))}
@@ -362,7 +334,7 @@ function TreeEntries({
                 <span style={{ fontSize: 9, width: 10, flexShrink: 0, color: "var(--text-muted)" }}>
                   {entry.is_skipped ? "" : isExpanded ? "▼" : "▶"}
                 </span>
-                <span style={{ fontSize: 13 }}>📁</span>
+                <FileIcon isDir isOpen={isExpanded} size={13} />
                 {isRenaming ? (
                   <input
                     ref={renameInputRef}
@@ -454,7 +426,7 @@ function TreeEntries({
               e.currentTarget.querySelectorAll(".tree-hover-btn").forEach((b) => ((b as HTMLElement).style.display = "none"));
             }}
           >
-            <span style={{ fontSize: 13, flexShrink: 0 }}>{fileIcon(entry.name)}</span>
+            <FileIcon name={entry.name} size={13} />
             {isRenaming ? (
               <input
                 ref={renameInputRef}
@@ -2267,7 +2239,7 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
               />
               hidden
             </label>
-            <span>📁</span>
+            <FileIcon isDir size={13} />
             <span style={{ fontSize: 12, color: "var(--text-secondary)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {sessionCwd}
             </span>
@@ -2476,7 +2448,7 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
                 ) : (
                   <div style={{ display: "flex", gap: 4 }}>
                     <button onClick={() => startCreating("")} style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 10, padding: "3px 0", flex: 1 }}>+ File</button>
-                    <button onClick={() => { setCreatingDir(true); setTimeout(() => newDirInputRef.current?.focus(), 80); }} style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 10, padding: "3px 0", flex: 1 }}>📁+</button>
+                    <button onClick={() => { setCreatingDir(true); setTimeout(() => newDirInputRef.current?.focus(), 80); }} title="New folder" style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 10, padding: "3px 0", flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 3 }}><NewFolderIcon size={12} color="var(--text-body)" /><span>+ Dir</span></button>
                     <button onClick={() => setUploadForm(true)} style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 10, padding: "3px 0", flex: 1 }}>⬆ Upload</button>
                     <button
                       onClick={() => setHistorySearchOpen(true)}
@@ -2513,7 +2485,7 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
                         onMouseEnter={(e) => { if (!isOpen) e.currentTarget.style.background = "var(--bg-hover)"; }}
                         onMouseLeave={(e) => { if (!isOpen) e.currentTarget.style.background = "transparent"; }}
                       >
-                        <span style={{ fontSize: 13, flexShrink: 0 }}>{entry.type === "dir" ? "📁" : fileIcon(entry.name)}</span>
+                        <FileIcon name={entry.name} isDir={entry.type === "dir"} size={13} />
                         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{entry.name}</span>
                         <span style={{ fontSize: 10, color: "var(--text-faintest)", flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 80 }}>
                           {entry.path.slice(0, entry.path.length - entry.name.length - 1).split("/").pop() || ""}
@@ -2671,7 +2643,7 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
                   alignItems: "center",
                   gap: 6,
                 }}>
-                  <span>{fileIcon(openFile.path.split("/").pop()!)}</span>
+                  <FileIcon name={openFile.path.split("/").pop()!} size={13} />
                   <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{openFile.path}</span>
                   {isModified && <span style={{ color: "#f59e0b", flexShrink: 0 }}>●</span>}
                   {openFile.size !== undefined && (
@@ -2726,7 +2698,7 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
                   <span style={{ color: "var(--accent-red)" }}>{fileError}</span>
                 ) : (
                   <>
-                    <span style={{ fontSize: 32 }}>📄</span>
+                    <FileIcon size={36} />
                     <span>Select a file to view or edit</span>
                     <span style={{ fontSize: 11, color: "var(--bg-hover)" }}>Ctrl+S to save</span>
                   </>

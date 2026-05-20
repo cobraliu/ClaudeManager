@@ -26,12 +26,16 @@ Lifecycle:
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import secrets
 import shlex
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 from app.services.tmux_service import TmuxService, TmuxError
@@ -102,6 +106,7 @@ class TerminalManager:
         *,
         idle_grace_getter: Optional[Callable[[], float]] = None,
         standby_grace_getter: Optional[Callable[[], float]] = None,
+        persist_path: Optional[Path | str] = None,
     ) -> None:
         self._tmux = tmux
         self._terms: dict[str, TermRecord] = {}
@@ -115,6 +120,10 @@ class TerminalManager:
         self._standby_grace_getter: Callable[[], float] = (
             standby_grace_getter or (lambda: DEFAULT_STANDBY_GRACE_S)
         )
+        # Disk-backed record store so terminals survive a backend restart as
+        # long as their cmterm-* tmux session is still alive. None disables
+        # persistence (tests, in-memory mode).
+        self._persist_path: Optional[Path] = Path(persist_path) if persist_path else None
         # Background sweeper drives the ephemeral lifecycle. Daemon so it
         # doesn't block process shutdown; uvicorn reload spawns a fresh one.
         self._sweeper_stop = threading.Event()
@@ -162,6 +171,7 @@ class TerminalManager:
         )
         with self._lock:
             self._terms[term_id] = rec
+        self._persist()
         logger.info("term.create id=%s name=%r ephemeral=%s", term_id, name, name is None)
         return rec
 
@@ -177,7 +187,8 @@ class TerminalManager:
                 if other is not None and other.term_id != term_id:
                     raise ValueError(f"a named terminal '{name}' already exists in this session")
             rec.name = name
-            return rec
+        self._persist()
+        return rec
 
     def delete(self, term_id: str) -> bool:
         with self._lock:
@@ -193,6 +204,7 @@ class TerminalManager:
             self._tmux.terminate(rec.tmux_name)
         except TmuxError as exc:
             logger.warning("term.delete tmux kill failed id=%s: %s", term_id, exc)
+        self._persist()
         logger.info("term.delete id=%s", term_id)
         return True
 
@@ -232,6 +244,7 @@ class TerminalManager:
     # ── attach refcount (driven by ws handler) ────────────────────────────
 
     def on_attach(self, term_id: str) -> int:
+        promoted = False
         with self._lock:
             rec = self._terms.get(term_id)
             if rec is None:
@@ -242,11 +255,15 @@ class TerminalManager:
             if rec.is_standby:
                 rec.standby_at = None
                 rec.kept = True
+                promoted = True
                 logger.info("term.revive id=%s via=attach", term_id)
             rec.attach_count += 1
             rec.last_holder_at = time.time()
-            logger.debug("term.attach id=%s count=%d", term_id, rec.attach_count)
-            return rec.attach_count
+            count = rec.attach_count
+        if promoted:
+            self._persist()
+        logger.debug("term.attach id=%s count=%d", term_id, count)
+        return count
 
     def on_detach(self, term_id: str) -> tuple[int, bool]:
         """Decrement attach count. Returns (new_count, was_killed).
@@ -276,6 +293,7 @@ class TerminalManager:
         - In ``standby``: revives and promotes to ``kept`` (no auto-close).
         - For named/kept: idempotent touch.
         """
+        promoted = False
         with self._lock:
             rec = self._terms.get(term_id)
             if rec is None:
@@ -283,9 +301,12 @@ class TerminalManager:
             if rec.is_standby:
                 rec.standby_at = None
                 rec.kept = True
+                promoted = True
                 logger.info("term.revive id=%s via=heartbeat", term_id)
             rec.last_holder_at = time.time()
-            return rec
+        if promoted:
+            self._persist()
+        return rec
 
     # ── ephemeral lifecycle sweeper ───────────────────────────────────────
 
@@ -300,61 +321,223 @@ class TerminalManager:
                 return
 
     def _sweep_once(self) -> None:
-        """One sweeper tick: drive idle→standby and standby→kill transitions."""
-        # Read once per tick — keeps the sweeper cheap while still picking up
-        # live config changes without a restart.
+        """One sweeper tick: drive idle→standby and standby→kill transitions.
+
+        Terminals whose pane shell still has descendant processes (a running
+        command, a backgrounded job, an editor) are spared at both transitions
+        — the heartbeat may have lapsed because the browser closed, but the
+        work inside tmux is still live.
+        """
         idle_grace = float(self._idle_grace_getter())
         standby_grace = float(self._standby_grace_getter())
         now = time.time()
-        to_kill: list[TermRecord] = []
+
+        # Pass 1: collect candidates under the lock (cheap).
+        idle_candidates: list[TermRecord] = []   # ready to enter standby
+        kill_candidates: list[TermRecord] = []   # ready to be killed
         with self._lock:
             for rec in list(self._terms.values()):
                 if rec.is_immortal or rec.attach_count > 0:
                     continue
                 if rec.standby_at is None:
                     if now - rec.last_holder_at > idle_grace:
-                        rec.standby_at = now
-                        logger.info(
-                            "term.standby id=%s idle-for=%.0fs",
-                            rec.term_id, now - rec.last_holder_at,
-                        )
+                        idle_candidates.append(rec)
                 else:
                     if now - rec.standby_at > standby_grace:
-                        to_kill.append(rec)
-                        self._terms.pop(rec.term_id, None)
-                        stale = [t for t, tid in self._tokens.items() if tid == rec.term_id]
-                        for t in stale:
-                            self._tokens.pop(t, None)
+                        kill_candidates.append(rec)
+
+        # Pass 2: probe tmux/proc outside the lock (potentially slow).
+        idle_busy: dict[str, bool] = {
+            r.term_id: self._tmux.has_active_children(r.tmux_name)
+            for r in idle_candidates
+        }
+        kill_busy: dict[str, bool] = {
+            r.term_id: self._tmux.has_active_children(r.tmux_name)
+            for r in kill_candidates
+        }
+
+        # Pass 3: apply transitions under the lock.
+        to_kill: list[TermRecord] = []
+        with self._lock:
+            for rec in idle_candidates:
+                if rec.term_id not in self._terms:
+                    continue
+                if idle_busy.get(rec.term_id):
+                    # Active command running — refresh the idle clock so we
+                    # don't churn through this check every tick.
+                    rec.last_holder_at = now
+                    logger.debug("term.busy-skip-standby id=%s", rec.term_id)
+                    continue
+                rec.standby_at = now
+                logger.info(
+                    "term.standby id=%s idle-for=%.0fs",
+                    rec.term_id, now - rec.last_holder_at,
+                )
+            for rec in kill_candidates:
+                if rec.term_id not in self._terms:
+                    continue
+                if kill_busy.get(rec.term_id):
+                    # Revive: pull it back out of standby, restart the idle
+                    # clock. No promotion to `kept` — once the command
+                    # finishes, the term re-enters the normal lifecycle.
+                    rec.standby_at = None
+                    rec.last_holder_at = now
+                    logger.info("term.busy-revive id=%s", rec.term_id)
+                    continue
+                to_kill.append(rec)
+                self._terms.pop(rec.term_id, None)
+                stale = [t for t, tid in self._tokens.items() if tid == rec.term_id]
+                for t in stale:
+                    self._tokens.pop(t, None)
+
         for rec in to_kill:
             try:
                 self._tmux.terminate(rec.tmux_name)
             except TmuxError as exc:
                 logger.warning("term auto-close kill failed id=%s: %s", rec.term_id, exc)
             logger.info("term.auto-close id=%s standby-elapsed", rec.term_id)
+        if to_kill:
+            self._persist()
 
     # ── startup reaping ──────────────────────────────────────────────────
 
     def reap_orphan_tmux_sessions(self) -> int:
-        """On startup, kill any cmterm-* tmux sessions we don't know about.
+        """On startup, reconcile persisted records with live cmterm-* tmux
+        sessions, then kill any session we have no record for.
 
-        These are leftovers from a previous backend process. Since refcounts
-        live in memory, we can't reliably reattach to them anyway.
+        Restores ``self._terms`` for records whose tmux session is still alive.
+        Records whose tmux session has died are dropped. Live tmux sessions
+        with no matching record are reaped (true orphans from a clobbered
+        run, or from a build before persistence existed).
+
+        Returns the number of orphan tmux sessions killed.
         """
+        persisted = self._load_persisted()
         try:
-            sessions = self._tmux.list_sessions()
+            live_sessions = self._tmux.list_sessions()
         except TmuxError:
+            # Without a tmux server we can't reconcile — drop the file so a
+            # later run starts from scratch.
+            if persisted:
+                self._delete_persisted()
             return 0
+        live_cmterms = {s for s in live_sessions if s.startswith(TMUX_PREFIX)}
+
+        restored = 0
+        with self._lock:
+            for rec in persisted:
+                if rec.tmux_name in live_cmterms:
+                    # Refcounts and standby state don't survive — they're tied
+                    # to WS connections that are gone. Reset them so the idle
+                    # clock starts ticking from "now" on restart.
+                    rec.attach_count = 0
+                    rec.standby_at = None
+                    rec.last_holder_at = time.time()
+                    self._terms[rec.term_id] = rec
+                    restored += 1
+        restored_tmux = {r.tmux_name for r in self._terms.values()}
+
         n = 0
-        for s in sessions:
-            if s.startswith(TMUX_PREFIX):
-                try:
-                    self._tmux.terminate(s)
-                    n += 1
-                except TmuxError:
-                    pass
+        for s in live_cmterms:
+            if s in restored_tmux:
+                continue
+            try:
+                self._tmux.terminate(s)
+                n += 1
+            except TmuxError:
+                pass
+
+        if restored:
+            logger.info("restored %d cmterm tmux session(s) from disk", restored)
         if n:
             logger.info("reaped %d orphan cmterm tmux session(s)", n)
+        # Rewrite the file so dropped (already-dead) records are gone.
+        self._persist()
         return n
+
+    # ── persistence ──────────────────────────────────────────────────────
+
+    def _record_to_dict(self, rec: TermRecord) -> dict:
+        # Skip transient fields (attach_count, standby_at, last_holder_at)
+        # since they're meaningful only within the lifetime of one backend.
+        return {
+            "term_id": rec.term_id,
+            "tmux_name": rec.tmux_name,
+            "session_id": rec.session_id,
+            "user_id": rec.user_id,
+            "cwd": rec.cwd,
+            "name": rec.name,
+            "created_at": rec.created_at,
+            "kept": rec.kept,
+        }
+
+    def _record_from_dict(self, d: dict) -> Optional[TermRecord]:
+        try:
+            return TermRecord(
+                term_id=d["term_id"],
+                tmux_name=d["tmux_name"],
+                session_id=d["session_id"],
+                user_id=d["user_id"],
+                cwd=d["cwd"],
+                name=d.get("name"),
+                created_at=float(d.get("created_at") or 0.0),
+                last_holder_at=time.time(),
+                kept=bool(d.get("kept", False)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _load_persisted(self) -> list[TermRecord]:
+        if self._persist_path is None or not self._persist_path.exists():
+            return []
+        try:
+            data = json.loads(self._persist_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("term persistence read failed: %s", exc)
+            return []
+        if not isinstance(data, list):
+            return []
+        out: list[TermRecord] = []
+        for d in data:
+            if not isinstance(d, dict):
+                continue
+            rec = self._record_from_dict(d)
+            if rec is not None:
+                out.append(rec)
+        return out
+
+    def _persist(self) -> None:
+        """Atomically rewrite the on-disk snapshot of all current records."""
+        if self._persist_path is None:
+            return
+        with self._lock:
+            payload = [self._record_to_dict(r) for r in self._terms.values()]
+        try:
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic write: tmp file in the same dir, then rename.
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".terms-", suffix=".json", dir=str(self._persist_path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_name, self._persist_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            logger.warning("term persistence write failed: %s", exc)
+
+    def _delete_persisted(self) -> None:
+        if self._persist_path is None:
+            return
+        try:
+            self._persist_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # ── internal ──────────────────────────────────────────────────────────
 

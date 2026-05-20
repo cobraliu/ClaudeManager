@@ -13,6 +13,10 @@ import {
   getConfig,
   getConversation,
   getGitInfo,
+  getGitBranches,
+  getGitGraph,
+  gitCheckoutBranch,
+  GitCheckoutConflictError,
   gitRollback,
   gitManualCommit,
   getCommitDetail,
@@ -40,13 +44,36 @@ import {
   readFile,
   sqliteQuery,
   sqliteExec,
-  openShell,
+  createTerminal,
+  deleteTerminal,
+  heartbeatTerminal,
+  issueTerminalToken,
+  listTerminals,
+  renameTerminal,
+  type TerminalInfo,
   listAvailableClaudeSessions,
   setClaudeSessionId,
   fetchRawFileBlob,
   browseExternalSessions,
+  browseCursorSessions,
+  getExternalPreview,
+  type ExternalPreview,
+  getMergeStatus,
+  getMergePreview,
+  getMergeFileDiff,
+  gitMergeStart,
+  gitMergeAbort,
+  gitMergeContinue,
+  getMergeConflictFile,
+  gitResolveFile,
+  type MergeStatus,
+  type MergePreview,
+  type ConflictFileVersions,
   listModels,
   setSessionModel,
+  getSystemFonts,
+  setTerminalFont,
+  type FontInfo,
   listSessionTodos,
   listGoals,
   listSessionAuqs,
@@ -60,11 +87,12 @@ import {
   type ModelInfo,
   type ConversationTurn,
   type GitLogEntry,
+  type GitBranchInfo,
+  type GitGraphCommit,
   type GitDiffFile,
   type ScheduledTask,
   type FileEntry,
   type SqliteInfo,
-  type AttachResponse,
   type AvailableClaudeSession,
   type UsageInfo,
   type TuiAuqData,
@@ -81,6 +109,12 @@ import { PromptText } from "../components/SessionCard";
 import { UsageBar } from "../components/UsageBar";
 import { WsClient } from "../lib/wsClient";
 import { ClaudeCapsModal } from "../components/ClaudeCapsModal";
+import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
+import { downloadConversationHtml } from "../lib/exportChat";
+import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
+import { GitGraph } from "../components/GitGraph";
+import { FileIcon, NewFolderIcon } from "../components/FileIcon";
+import type { DirInfoResponse } from "../api/sessionApi";
 
 const MOBILE_PAGE_SIZE = 10;
 const POLL_INTERVAL = 1000;
@@ -246,18 +280,99 @@ function relativeTime(mtime: number): string {
   return new Date(mtime * 1000).toLocaleDateString();
 }
 
+function MobileSessionPreviewModal({
+  session, tool, onClose,
+}: { session: ExternalSession; tool: "claude" | "cursor"; onClose: () => void }) {
+  const [preview, setPreview] = useState<ExternalPreview | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    getExternalPreview(session.claude_session_id, session.cwd, tool)
+      .then(setPreview)
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [session.claude_session_id, session.cwd, tool]);
+
+  const turns = preview?.turns ?? [];
+  const splitAt = preview && preview.truncated_before > 0 ? 100 : turns.length;
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 500, display: "flex", flexDirection: "column" }}>
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1, flexShrink: 0 }}>‹</button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {session.title || "No title"}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {session.cwd}
+          </div>
+        </div>
+        {preview && (
+          <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{preview.total} turns</span>
+        )}
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+        {loading && <div style={{ color: "var(--text-faint)", fontSize: 13, textAlign: "center", marginTop: 32 }}>Loading…</div>}
+        {!loading && !preview && <div style={{ color: "var(--text-faint)", fontSize: 13, textAlign: "center", marginTop: 32 }}>Failed to load preview.</div>}
+        {preview && (
+          <>
+            {turns.slice(0, splitAt).map((t, i) => (
+              <PreviewTurnBubble key={`head-${i}`} turn={t} />
+            ))}
+            {preview.truncated_before > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 0" }}>
+                <div style={{ flex: 1, height: 1, background: "var(--border)" }} />
+                <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0, padding: "2px 10px", background: "var(--bg-surface)", borderRadius: 12, border: "1px solid var(--border)" }}>
+                  … {preview.truncated_before} messages omitted …
+                </span>
+                <div style={{ flex: 1, height: 1, background: "var(--border)" }} />
+              </div>
+            )}
+            {preview.truncated_before > 0 && turns.slice(100).map((t, i) => (
+              <PreviewTurnBubble key={`tail-${i}`} turn={t} />
+            ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PreviewTurnBubble({ turn }: { turn: { role: string; text: string; ts: number } }) {
+  const isUser = turn.role === "user";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}>
+      <div style={{
+        maxWidth: "90%", padding: "8px 12px", borderRadius: 10, fontSize: 13, lineHeight: 1.5,
+        background: isUser ? "var(--accent-blue)" : "var(--bg-surface)",
+        color: isUser ? "#fff" : "var(--text-body)",
+        border: isUser ? "none" : "1px solid var(--border)",
+        whiteSpace: "pre-wrap", wordBreak: "break-word",
+      }}>
+        {turn.text.length > 600 ? turn.text.slice(0, 600) + "…" : turn.text}
+      </div>
+    </div>
+  );
+}
+
 function MobileBrowseExternalPanel({
   onClose, onLoad,
-}: { onClose: () => void; onLoad: (ext: ExternalSession) => Promise<void> }) {
+}: { onClose: () => void; onLoad: (ext: ExternalSession, tool: "claude" | "cursor") => Promise<void> }) {
+  const [tool, setTool] = useState<"claude" | "cursor">("claude");
   const [groups, setGroups] = useState<ExternalSessionGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [previewSession, setPreviewSession] = useState<ExternalSession | null>(null);
 
   useEffect(() => {
-    browseExternalSessions().then((data) => setGroups(data)).catch(() => {}).finally(() => setLoading(false));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    setLoading(true);
+    setGroups([]);
+    const fetcher = tool === "cursor" ? browseCursorSessions : browseExternalSessions;
+    fetcher().then((data) => setGroups(data)).catch(() => {}).finally(() => setLoading(false));
+  }, [tool]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const q = search.toLowerCase();
 
@@ -289,7 +404,18 @@ function MobileBrowseExternalPanel({
       {/* Header */}
       <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
         <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1, flexShrink: 0 }}>‹</button>
-        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Browse External Sessions</span>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Browse External Sessions</span>
+        <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden", flexShrink: 0 }}>
+          {(["claude", "cursor"] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setTool(t)}
+              style={{ padding: "4px 10px", fontSize: 12, background: tool === t ? "var(--bg-hover)" : "transparent", color: tool === t ? "var(--text-body)" : "var(--text-muted)", border: "none", cursor: "pointer", textTransform: "capitalize" }}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
       </div>
       {/* Search */}
       <div style={{ flexShrink: 0, padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
@@ -360,25 +486,37 @@ function MobileBrowseExternalPanel({
                         </span>
                       </div>
                     </div>
-                    <button
-                      disabled={!canLoad || isLoadingThis}
-                      onPointerDown={(e) => e.preventDefault()}
-                      onClick={async () => {
-                        if (!canLoad) return;
-                        setLoadingId(s.claude_session_id);
-                        try { await onLoad(s); } finally { setLoadingId(null); }
-                      }}
-                      style={{
-                        background: canLoad ? "var(--accent-blue)" : "var(--bg-hover)",
-                        color: canLoad ? "#fff" : "var(--text-faint)",
-                        border: "none", borderRadius: 6,
-                        padding: "6px 14px", fontSize: 13,
-                        cursor: canLoad ? "pointer" : "not-allowed",
-                        flexShrink: 0, opacity: isLoadingThis ? 0.6 : 1,
-                      }}
-                    >
-                      {isLoadingThis ? "…" : "Load"}
-                    </button>
+                    <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                      <button
+                        onClick={() => setPreviewSession(s)}
+                        style={{
+                          background: "var(--bg-hover)", color: "var(--text-secondary)",
+                          border: "1px solid var(--border)", borderRadius: 6,
+                          padding: "6px 10px", fontSize: 12, cursor: "pointer",
+                        }}
+                      >
+                        View
+                      </button>
+                      <button
+                        disabled={!canLoad || isLoadingThis}
+                        onPointerDown={(e) => e.preventDefault()}
+                        onClick={async () => {
+                          if (!canLoad) return;
+                          setLoadingId(s.claude_session_id);
+                          try { await onLoad(s, tool); } finally { setLoadingId(null); }
+                        }}
+                        style={{
+                          background: canLoad ? "var(--accent-blue)" : "var(--bg-hover)",
+                          color: canLoad ? "#fff" : "var(--text-faint)",
+                          border: "none", borderRadius: 6,
+                          padding: "6px 14px", fontSize: 13,
+                          cursor: canLoad ? "pointer" : "not-allowed",
+                          opacity: isLoadingThis ? 0.6 : 1,
+                        }}
+                      >
+                        {isLoadingThis ? "…" : "Load"}
+                      </button>
+                    </div>
                   </div>
                 );
               })}
@@ -386,6 +524,13 @@ function MobileBrowseExternalPanel({
           );
         })}
       </div>
+      {previewSession && (
+        <MobileSessionPreviewModal
+          session={previewSession}
+          tool={tool}
+          onClose={() => setPreviewSession(null)}
+        />
+      )}
     </div>
   );
 }
@@ -409,7 +554,7 @@ function _writeListCache(items: SessionMeta[], total: number) {
   } catch { /* quota — ignore */ }
 }
 
-function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggleTheme }: { username: string; onLogout: () => void; onOpen: (s: SessionMeta) => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void }) {
+function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggleTheme, terminalFont, onTerminalFontChange }: { username: string; onLogout: () => void; onOpen: (s: SessionMeta) => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void; terminalFont?: string; onTerminalFontChange?: (font: string) => void }) {
   const isAdmin = localStorage.getItem("role") === "admin";
   const cached = _readListCache();
   const [sessions, setSessions] = useState<SessionMeta[]>(cached?.items ?? []);
@@ -422,6 +567,7 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
   const [showImport, setShowImport] = useState(false);
   const [workspaceBase, setWorkspaceBase] = useState("/workspace");
   const [restarting, setRestarting] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [showAllSessions, setShowAllSessions] = useState<boolean>(
     () => localStorage.getItem("mobileShowAllSessions") === "1",
   );
@@ -521,6 +667,10 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
               {theme === "light" ? "🌙" : "☀️"}
             </button>
           )}
+          <button onClick={() => setShowSettings(true)} title="Settings"
+            style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-muted)", fontSize: 14, padding: "4px 7px", cursor: "pointer" }}>
+            ⚙
+          </button>
           {onSwitchToAdmin && (
             <button onClick={onSwitchToAdmin}
               style={{ fontSize: 12, padding: "5px 10px", background: "rgba(88,166,255,0.12)", color: "var(--accent-blue)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 6 }}>
@@ -638,14 +788,19 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
       {showImport && (
         <MobileBrowseExternalPanel
           onClose={() => setShowImport(false)}
-          onLoad={async (ext) => {
+          onLoad={async (ext, tool) => {
             const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
-            const newSession = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id });
+            const newSession = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id, tool });
             setShowImport(false);
             onOpen(newSession);
           }}
         />
       )}
+      <MobileSettingsPanel
+        open={showSettings} onClose={() => setShowSettings(false)}
+        theme={theme} onToggleTheme={onToggleTheme}
+        terminalFont={terminalFont} onTerminalFontChange={onTerminalFontChange}
+      />
     </div>
   );
 }
@@ -797,6 +952,15 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
   const [log, setLog] = useState<GitLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [isRepo, setIsRepo] = useState(false);
+  const [branches, setBranches] = useState<GitBranchInfo>({ current: "", local: [] });
+  const [scope, setScope] = useState<string>("current");
+  const [scopedLog, setScopedLog] = useState<GitLogEntry[]>([]);
+  const [scopedLoading, setScopedLoading] = useState(false);
+  const [showBranchSheet, setShowBranchSheet] = useState(false);
+  const [checkoutBusy, setCheckoutBusy] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"list" | "graph">("list");
+  const [graphCommits, setGraphCommits] = useState<GitGraphCommit[] | null>(null);
+  const [graphLoading, setGraphLoading] = useState(false);
   const [autoCommit, setAutoCommit] = useState(session.git_auto_commit);
   const [gitignore, setGitignore] = useState("");
   const [gitignoreDraft, setGitignoreDraft] = useState("");
@@ -814,20 +978,96 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
   const [detailFiles, setDetailFiles] = useState<GitDiffFile[]>([]);
   const [diffFile, setDiffFile] = useState<GitDiffFile | null>(null);
   const [committing, setCommitting] = useState(false);
+  const [showMerge, setShowMerge] = useState(false);
 
   useEffect(() => {
     setLoading(true);
-    getGitInfo(sessionId)
-      .then((info) => { setIsRepo(info.is_repo); setLog(info.log); setGitignore(info.gitignore ?? ""); setGitignoreDraft(info.gitignore ?? ""); setAutoCommit(info.auto_commit); setRemote(info.remote ?? ""); setRemoteInput(info.remote ?? ""); })
-      .catch(() => {})
+    Promise.all([
+      getGitInfo(sessionId).catch(() => null),
+      getGitBranches(sessionId).catch(() => ({ current: "", local: [] }) as GitBranchInfo),
+    ])
+      .then(([info, br]) => {
+        if (info) {
+          setIsRepo(info.is_repo); setLog(info.log);
+          setGitignore(info.gitignore ?? ""); setGitignoreDraft(info.gitignore ?? "");
+          setAutoCommit(info.auto_commit); setRemote(info.remote ?? ""); setRemoteInput(info.remote ?? "");
+        }
+        setBranches(br);
+      })
       .finally(() => setLoading(false));
   }, [sessionId]);
 
+  // Fetch scoped graph when scope is not "current"
+  useEffect(() => {
+    if (scope === "current") return;
+    setScopedLoading(true);
+    getGitGraph(sessionId, scope, 500)
+      .then((commits) => {
+        setScopedLog(commits.map((c) => ({
+          hash: c.hash, short_hash: c.short_hash, subject: c.subject,
+          author: c.author, date: c.date,
+        })));
+      })
+      .catch(() => setScopedLog([]))
+      .finally(() => setScopedLoading(false));
+  }, [sessionId, scope]);
+
+  // Fetch raw graph commits when in graph view
+  useEffect(() => {
+    if (viewMode !== "graph") return;
+    setGraphLoading(true);
+    getGitGraph(sessionId, scope, 500)
+      .then(setGraphCommits)
+      .catch(() => setGraphCommits([]))
+      .finally(() => setGraphLoading(false));
+  }, [sessionId, scope, viewMode]);
+
+  const activeLog: GitLogEntry[] = scope === "current" ? log : scopedLog;
+  const activeLoading = scope === "current" ? loading : scopedLoading;
+
+  const doCheckout = async (branch: string, remote: boolean) => {
+    if (checkoutBusy) return;
+    setCheckoutBusy(branch);
+    try {
+      const res = await gitCheckoutBranch(sessionId, branch, { remote });
+      setMsg({ text: res.stashed ? `Switched to ${res.branch} (changes stashed)` : `Switched to ${res.branch}`, ok: true });
+      setShowBranchSheet(false);
+      setScope("current");
+      // Refresh info + branches
+      const [info, br] = await Promise.all([
+        getGitInfo(sessionId).catch(() => null),
+        getGitBranches(sessionId).catch(() => branches),
+      ]);
+      if (info) setLog(info.log);
+      setBranches(br);
+    } catch (e) {
+      if (e instanceof GitCheckoutConflictError) {
+        const stash = window.confirm(`${e.conflict.message}\n\nStash local changes and retry?`);
+        if (stash) {
+          try {
+            const res = await gitCheckoutBranch(sessionId, branch, { remote, stash: true });
+            setMsg({ text: `Switched to ${res.branch} (changes stashed)`, ok: true });
+            setShowBranchSheet(false);
+            setScope("current");
+            const [info, br] = await Promise.all([
+              getGitInfo(sessionId).catch(() => null),
+              getGitBranches(sessionId).catch(() => branches),
+            ]);
+            if (info) setLog(info.log);
+            setBranches(br);
+          } catch (e2) { setMsg({ text: String(e2), ok: false }); }
+        }
+      } else {
+        setMsg({ text: String(e), ok: false });
+      }
+    } finally { setCheckoutBusy(null); }
+  };
+
   const filtered = useMemo(() => {
-    if (!search.trim()) return log;
+    if (!search.trim()) return activeLog;
     const q = search.toLowerCase();
-    return log.filter((e) => e.subject.toLowerCase().includes(q) || e.short_hash.includes(q));
-  }, [log, search]);
+    return activeLog.filter((e) => e.subject.toLowerCase().includes(q) || e.short_hash.includes(q));
+  }, [activeLog, search]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / GIT_PAGE_SIZE));
   const safePage = Math.min(page, totalPages - 1);
@@ -853,29 +1093,52 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
   return (
     <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
       {/* Header */}
-      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
-        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Git</span>
-        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{filtered.length} commits</span>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          {isRepo && (
-            <>
-              <button
-                disabled={committing}
-                onClick={async () => {
-                  setCommitting(true);
-                  try {
-                    const res = await gitManualCommit(sessionId);
-                    setMsg({ text: res.committed ? res.output || "Committed" : "Nothing to commit", ok: res.committed });
-                    if (res.committed) { const info = await getGitInfo(sessionId); setLog(info.log); }
-                  } catch (e) { setMsg({ text: String(e), ok: false }); }
-                  finally { setCommitting(false); }
-                }}
-                style={{ fontSize: 11, padding: "3px 10px", background: committing ? "var(--bg-hover)" : "var(--bg-hover)", color: committing ? "var(--text-muted)" : "var(--accent-green)", border: "1px solid #2d5a2d", borderRadius: 5 }}
-              >
-                {committing ? "…" : "Commit"}
-              </button>
-              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Auto commit</span>
+      <div style={{ background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+        {/* Row 1: title + branch */}
+        <div style={{ padding: "10px 14px 6px 10px", display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+          <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Git</span>
+          {branches.current && (
+            <button
+              onClick={() => setShowBranchSheet(true)}
+              style={{ fontSize: 11, padding: "3px 10px", background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", color: "var(--accent-blue)", borderRadius: 11, fontFamily: "monospace", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 1 }}
+            >⎇ {branches.current}</button>
+          )}
+          <span style={{ fontSize: 12, color: "var(--text-muted)", marginLeft: "auto", flexShrink: 0 }}>{filtered.length} commits</span>
+        </div>
+
+        {/* Row 2: action buttons */}
+        {isRepo && (
+          <div style={{ padding: "0 12px 10px 12px", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <button
+              disabled={committing}
+              onClick={async () => {
+                setCommitting(true);
+                try {
+                  const res = await gitManualCommit(sessionId);
+                  setMsg({ text: res.committed ? res.output || "Committed" : "Nothing to commit", ok: res.committed });
+                  if (res.committed) { const info = await getGitInfo(sessionId); setLog(info.log); }
+                } catch (e) { setMsg({ text: String(e), ok: false }); }
+                finally { setCommitting(false); }
+              }}
+              style={{ fontSize: 11, padding: "4px 12px", background: "var(--bg-hover)", color: committing ? "var(--text-muted)" : "var(--accent-green)", border: "1px solid #2d5a2d", borderRadius: 5 }}
+            >
+              {committing ? "…" : "Commit"}
+            </button>
+            <button
+              onClick={() => setEditingGitignore(true)}
+              style={{ fontSize: 11, padding: "4px 10px", background: "var(--bg-hover)", color: "var(--text-secondary)", border: "1px solid #374151", borderRadius: 5 }}
+            >
+              .gitignore
+            </button>
+            <button
+              onClick={() => setShowMerge(true)}
+              style={{ fontSize: 11, padding: "4px 10px", background: "var(--bg-hover)", color: "var(--accent-amber)", border: "1px solid #5a4527", borderRadius: 5 }}
+            >
+              Merge
+            </button>
+            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+              <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Auto commit</span>
               <button
                 onClick={async () => {
                   const next = !autoCommit;
@@ -890,15 +1153,9 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
               >
                 <span style={{ position: "absolute", top: 2, left: autoCommit ? 18 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.15s" }} />
               </button>
-              <button
-                onClick={() => setEditingGitignore(true)}
-                style={{ fontSize: 11, padding: "3px 8px", background: "var(--bg-hover)", color: "var(--text-secondary)", border: "1px solid #374151", borderRadius: 5 }}
-              >
-                .gitignore
-              </button>
-            </>
-          )}
-        </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {!isRepo && !loading && (
@@ -919,6 +1176,31 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
             <span style={{ fontSize: 12, color: "var(--text-faint)", flexShrink: 0 }}>›</span>
           </div>
 
+          {/* Scope pills + view-mode toggle */}
+          {branches.local.length > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+              <div style={{ display: "flex", gap: 6, overflowX: "auto", scrollbarWidth: "none", flex: 1, minWidth: 0 }}>
+                {[{ id: "current", label: `● ${branches.current}` }, { id: "all", label: "all" }, ...branches.local.filter(b => b !== branches.current).map(b => ({ id: b, label: b }))].map(p => {
+                  const active = scope === p.id;
+                  return (
+                    <button
+                      key={p.id}
+                      onClick={() => { setScope(p.id); setPage(0); }}
+                      style={{ flex: "0 0 auto", fontSize: 11, padding: "4px 10px", background: active ? "var(--accent-blue)" : "var(--bg-hover)", color: active ? "#fff" : "var(--text-muted)", border: "1px solid " + (active ? "var(--accent-blue)" : "var(--border)"), borderRadius: 12, fontFamily: "monospace", whiteSpace: "nowrap" }}
+                    >{p.label}</button>
+                  );
+                })}
+              </div>
+              <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden", flexShrink: 0 }}>
+                {(["list", "graph"] as const).map(m => (
+                  <button key={m} onClick={() => setViewMode(m)}
+                    style={{ padding: "4px 8px", fontSize: 11, background: viewMode === m ? "var(--bg-hover)" : "transparent", color: viewMode === m ? "var(--text-body)" : "var(--text-muted)", border: "none" }}
+                  >{m === "list" ? "List" : "Graph"}</button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Search */}
           <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
             <input
@@ -931,12 +1213,38 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
 
           {/* Commit list */}
           <div style={{ flex: 1, overflowY: "auto" }}>
-            {loading
+            {viewMode === "graph" ? (
+              graphLoading ? (
+                <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>Loading graph…</div>
+              ) : (graphCommits ?? []).length === 0 ? (
+                <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>No commits found</div>
+              ) : (
+                <div style={{ overflowX: "auto", padding: "8px 0" }}>
+                  <GitGraph
+                    commits={graphCommits ?? []}
+                    latestHash={(graphCommits ?? [])[0]?.hash ?? null}
+                    onCommitClick={async (c) => {
+                      setDetailHash(c.hash);
+                      setDetailMsg("Loading…");
+                      setDetailFiles([]);
+                      try {
+                        const d = await getCommitDetail(sessionId, c.hash);
+                        setDetailMsg(d.message);
+                        setDetailFiles(d.files ?? []);
+                      } catch {
+                        setDetailMsg("Failed to load commit detail.");
+                      }
+                    }}
+                    onRevert={scope === "current" ? (c) => setRevertHash(c.hash) : undefined}
+                  />
+                </div>
+              )
+            ) : activeLoading
               ? <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>Loading…</div>
               : pageLog.length === 0
                 ? <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>No commits found</div>
                 : pageLog.map((entry) => {
-                  const isLatest = entry.hash === log[0]?.hash;
+                  const isLatest = entry.hash === activeLog[0]?.hash;
                   return (
                     <div key={entry.hash} style={{ padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)", display: "flex", flexDirection: "column", gap: 4 }}>
                       <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
@@ -963,7 +1271,7 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
                           >
                             Detail
                           </button>
-                          {!isLatest && (
+                          {!isLatest && scope === "current" && (
                             <button
                               onClick={() => setRevertHash(entry.hash)}
                               style={{ fontSize: 11, padding: "3px 10px", background: "var(--bg-hover)", color: "var(--accent-amber)", border: "1px solid var(--border)", borderRadius: 5 }}
@@ -980,7 +1288,7 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
           </div>
 
           {/* Pagination */}
-          {totalPages > 1 && (
+          {viewMode === "list" && totalPages > 1 && (
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 16, padding: "10px 16px", borderTop: "1px solid var(--border-subtle)", background: "var(--bg-base)", flexShrink: 0 }}>
               <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={safePage === 0}
                 style={{ ...btn, padding: "5px 18px", opacity: safePage === 0 ? 0.35 : 1, background: "var(--bg-hover)", color: "var(--text-secondary)" }}>‹</button>
@@ -990,6 +1298,63 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
             </div>
           )}
         </>
+      )}
+
+      {/* Branch checkout sheet */}
+      {showBranchSheet && (
+        <div onClick={() => setShowBranchSheet(false)} style={{ position: "absolute", inset: 0, zIndex: 250, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "flex-end" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxHeight: "70vh", background: "var(--bg-surface)", borderRadius: "12px 12px 0 0", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-bright)" }}>⎇ Switch branch</span>
+              <button onClick={() => setShowBranchSheet(false)} style={{ background: "var(--bg-hover)", border: "none", color: "var(--text-secondary)", fontSize: 13, padding: "4px 12px", borderRadius: 6, cursor: "pointer" }}>✕</button>
+            </div>
+            <div style={{ overflowY: "auto" }}>
+              {branches.local.length === 0 && (!branches.remote_only || branches.remote_only.length === 0) && (
+                <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>No branches</div>
+              )}
+              {branches.local.map(b => {
+                const isCurrent = b === branches.current;
+                const busy = checkoutBusy === b;
+                return (
+                  <button
+                    key={b}
+                    onClick={() => { if (!isCurrent) doCheckout(b, false); }}
+                    disabled={isCurrent || !!checkoutBusy}
+                    style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: isCurrent ? "var(--accent-blue)" : "var(--text-bright)", fontSize: 14, cursor: isCurrent ? "default" : "pointer", textAlign: "left", fontFamily: "monospace" }}
+                  >
+                    <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                      {isCurrent && <span style={{ color: "var(--accent-blue)" }}>●</span>}
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b}</span>
+                    </span>
+                    {busy && <span style={{ fontSize: 11, color: "var(--text-muted)" }}>…</span>}
+                  </button>
+                );
+              })}
+              {branches.remote_only && branches.remote_only.length > 0 && (
+                <>
+                  <div style={{ padding: "10px 16px 6px", fontSize: 10, textTransform: "uppercase", letterSpacing: 0.6, color: "var(--text-faint)", fontWeight: 600, background: "var(--bg-base)" }}>Remote-only</div>
+                  {branches.remote_only.map(b => {
+                    const busy = checkoutBusy === b;
+                    return (
+                      <button
+                        key={b}
+                        onClick={() => doCheckout(b, true)}
+                        disabled={!!checkoutBusy}
+                        style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-bright)", fontSize: 14, cursor: "pointer", textAlign: "left", fontFamily: "monospace" }}
+                      >
+                        <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                          <span style={{ color: "var(--text-faint)" }}>↓</span>
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b}</span>
+                        </span>
+                        {busy && <span style={{ fontSize: 11, color: "var(--text-muted)" }}>…</span>}
+                      </button>
+                    );
+                  })}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Toast message */}
@@ -1123,11 +1488,740 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
           </div>
         </div>
       )}
+
+      {showMerge && (
+        <MobileMergePanel
+          sessionId={sessionId}
+          branches={branches}
+          onClose={() => setShowMerge(false)}
+          onCompleted={async () => {
+            // Refresh log + branches after a successful merge/abort
+            try {
+              const [info, br] = await Promise.all([
+                getGitInfo(sessionId).catch(() => null),
+                getGitBranches(sessionId).catch(() => branches),
+              ]);
+              if (info) setLog(info.log);
+              setBranches(br);
+            } catch {}
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ─── Mobile Merge Panel ─── */
+
+interface ConflictHunk {
+  startLine: number;
+  endLine: number;
+  ours: string[];
+  theirs: string[];
+}
+
+function parseConflictHunks(content: string): ConflictHunk[] {
+  const lines = content.split("\n");
+  const hunks: ConflictHunk[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].startsWith("<<<<<<<")) {
+      const startLine = i;
+      const ours: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("=======") && !lines[i].startsWith(">>>>>>>")) {
+        ours.push(lines[i]); i++;
+      }
+      const theirs: string[] = [];
+      if (i < lines.length && lines[i].startsWith("=======")) {
+        i++;
+        while (i < lines.length && !lines[i].startsWith(">>>>>>>")) { theirs.push(lines[i]); i++; }
+      }
+      if (i < lines.length && lines[i].startsWith(">>>>>>>")) {
+        hunks.push({ startLine, endLine: i, ours, theirs }); i++;
+      }
+    } else { i++; }
+  }
+  return hunks;
+}
+
+function replaceLines(content: string, startLine: number, endLine: number, replacement: string[]): string {
+  const lines = content.split("\n");
+  lines.splice(startLine, endLine - startLine + 1, ...replacement);
+  return lines.join("\n");
+}
+
+function MobileMergePanel({
+  sessionId, branches, onClose, onCompleted,
+}: {
+  sessionId: string;
+  branches: GitBranchInfo;
+  onClose: () => void;
+  onCompleted: () => void;
+}) {
+  const [status, setStatus] = useState<MergeStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [source, setSource] = useState<string>("");
+  const [target, setTarget] = useState<string>("");
+  const [starting, setStarting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [preview, setPreview] = useState<MergePreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  const refresh = useCallback(() =>
+    getMergeStatus(sessionId).then(s => { setStatus(s); return s; }).catch(e => { setErr(String(e)); return null; }),
+  [sessionId]);
+
+  useEffect(() => { refresh().finally(() => setLoading(false)); }, [refresh]);
+
+  useEffect(() => {
+    if (target || !branches.local.length) return;
+    const def = branches.local.includes("main") ? "main"
+      : branches.local.includes("master") ? "master"
+      : branches.current || branches.local[0];
+    setTarget(def);
+  }, [target, branches]);
+
+  // Debounced preview fetch.
+  useEffect(() => {
+    if (!source || !target || source === target) { setPreview(null); return; }
+    let cancelled = false;
+    setPreviewLoading(true);
+    const handle = setTimeout(async () => {
+      try {
+        const p = await getMergePreview(sessionId, source, target);
+        if (!cancelled) setPreview(p);
+      } catch (e) {
+        if (!cancelled) setPreview({ merge_kind: "error", error: String(e) });
+      } finally {
+        if (!cancelled) setPreviewLoading(false);
+      }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(handle); };
+  }, [sessionId, source, target]);
+
+  const handleStart = async () => {
+    if (!source || !target) return;
+    if (source === target) { setErr("Source and target must be different branches."); return; }
+    setStarting(true); setErr(null);
+    try {
+      const r = await gitMergeStart(sessionId, source, target);
+      if (r.up_to_date) { setMsg({ text: `${target} is already up to date with ${source}.`, ok: true }); onCompleted(); return; }
+      if (r.clean) { setMsg({ text: `Merged ${source} into ${target} cleanly.`, ok: true }); onCompleted(); return; }
+      await refresh();
+    } catch (e) {
+      setErr(String(e).replace(/^Error:\s*/, ""));
+    } finally { setStarting(false); }
+  };
+
+  const selectStyle: React.CSSProperties = {
+    background: "var(--bg-surface)", color: "var(--text-body)",
+    border: "1px solid var(--border)", borderRadius: 6,
+    padding: "8px 10px", fontSize: 14, fontFamily: "monospace", width: "100%",
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 280, display: "flex", flexDirection: "column" }}>
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Merge</span>
+      </div>
+
+      {loading ? (
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)" }}>Loading merge status…</div>
+      ) : status?.in_progress ? (
+        <MobileMergeResolver
+          sessionId={sessionId}
+          status={status}
+          onStatusChange={setStatus}
+          onCompleted={() => { setStatus(null); onCompleted(); onClose(); }}
+          setMsg={setMsg}
+        />
+      ) : branches.local.length < 2 ? (
+        <div style={{ padding: 20, color: "var(--text-muted)", fontSize: 13 }}>Need at least 2 local branches to merge.</div>
+      ) : (
+        <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Merge a source branch into a target branch.</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ fontSize: 12, color: "var(--text-muted)" }}>Source</label>
+            <select value={source} onChange={(e) => setSource(e.target.value)} style={selectStyle}>
+              <option value="">— select source —</option>
+              {branches.local.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ fontSize: 12, color: "var(--text-muted)" }}>Target</label>
+            <select value={target} onChange={(e) => setTarget(e.target.value)} style={selectStyle}>
+              <option value="">— select target —</option>
+              {branches.local.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          {source && target && source === target && (
+            <div style={{ fontSize: 12, color: "var(--accent-amber)" }}>Source and target must differ.</div>
+          )}
+          {source && target && source !== target && (
+            <MobileMergePreviewBlock
+              sessionId={sessionId}
+              preview={preview}
+              loading={previewLoading}
+              source={source}
+              target={target}
+            />
+          )}
+          <button
+            disabled={!source || !target || source === target || starting}
+            onClick={handleStart}
+            style={{
+              background: !source || !target || source === target ? "var(--bg-hover)" : "var(--accent-blue)",
+              color: !source || !target || source === target ? "var(--text-faint)" : "#fff",
+              fontSize: 14, padding: "10px 18px", borderRadius: 8, border: "none", marginTop: 4,
+            }}
+          >
+            {starting ? "Merging…" : "Start Merge"}
+          </button>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
+            Checks out <span style={{ fontFamily: "monospace" }}>{target || "<target>"}</span> (if not already), then runs
+            {" "}<span style={{ fontFamily: "monospace" }}>git merge --no-ff --no-edit {source || "<source>"}</span>.
+            On conflict, you'll get a per-file resolver.
+          </div>
+          {err && (
+            <div style={{ background: "rgba(248,81,73,0.12)", border: "1px solid var(--accent-red)", borderRadius: 6, padding: "10px 12px", color: "var(--text-body)", fontSize: 12, whiteSpace: "pre-wrap" }}>
+              {err}
+            </div>
+          )}
+        </div>
+      )}
+
+      {msg && (
+        <div onClick={() => setMsg(null)} style={{ position: "absolute", bottom: 16, left: 16, right: 16, background: "var(--bg-hover)", border: `1px solid ${msg.ok ? "var(--accent-green)" : "var(--accent-red)"}`, borderRadius: 8, padding: "10px 14px", color: msg.ok ? "var(--accent-green)" : "var(--accent-red)", fontSize: 13 }}>
+          {msg.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const _MERGE_STATUS_COLOR: Record<string, string> = {
+  M: "var(--accent-amber)", A: "var(--accent-green)", D: "var(--accent-red)",
+  R: "var(--accent-blue)", C: "var(--accent-blue)",
+};
+
+function _mobileStatusBadge(kind: MergePreview["merge_kind"], err?: string): { label: string; color: string; bg: string } {
+  switch (kind) {
+    case "up_to_date": return { label: "✓ Up to date", color: "var(--accent-green)", bg: "rgba(63,185,80,0.12)" };
+    case "fast_forward": return { label: "→ Fast-forward", color: "var(--accent-blue)", bg: "rgba(88,166,255,0.12)" };
+    case "clean": return { label: "✓ Clean merge", color: "var(--accent-green)", bg: "rgba(63,185,80,0.12)" };
+    case "conflict": return { label: "⚠ Would conflict", color: "var(--accent-amber)", bg: "rgba(187,128,9,0.15)" };
+    case "error": return { label: err ? `✕ ${err}` : "✕ Error", color: "var(--accent-red)", bg: "rgba(248,81,73,0.12)" };
+  }
+}
+
+function MobileMergePreviewBlock({
+  sessionId, preview, loading, source, target,
+}: {
+  sessionId: string;
+  preview: MergePreview | null;
+  loading: boolean;
+  source: string;
+  target: string;
+}) {
+  const [tab, setTab] = useState<"commits" | "diff">("commits");
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [diff, setDiff] = useState<string>("");
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const conflictSet = useMemo(
+    () => new Set(preview?.conflicting_files ?? []),
+    [preview],
+  );
+
+  useEffect(() => {
+    const files = preview?.changed_files;
+    if (!files || files.length === 0) { setSelectedFile(null); return; }
+    if (!selectedFile || !files.find(f => f.path === selectedFile)) {
+      setSelectedFile(files[0].path);
+    }
+  }, [preview, selectedFile]);
+
+  useEffect(() => {
+    if (tab !== "diff" || !selectedFile) { setDiff(""); setDiffError(null); return; }
+    let cancelled = false;
+    setDiffLoading(true);
+    setDiffError(null);
+    getMergeFileDiff(sessionId, source, target, selectedFile)
+      .then(r => {
+        if (cancelled) return;
+        if (r.error) { setDiffError(r.error); setDiff(""); }
+        else { setDiff(r.diff || ""); }
+      })
+      .catch(e => { if (!cancelled) { setDiffError(String(e)); setDiff(""); } })
+      .finally(() => { if (!cancelled) setDiffLoading(false); });
+    return () => { cancelled = true; };
+  }, [sessionId, source, target, selectedFile, tab]);
+
+  if (loading && !preview) {
+    return (
+      <div style={{ border: "1px solid var(--bg-hover)", borderRadius: 8, padding: "10px 12px", background: "var(--bg-surface)", fontSize: 12, color: "var(--text-muted)" }}>
+        Loading preview…
+      </div>
+    );
+  }
+  if (!preview) return null;
+  const badge = _mobileStatusBadge(preview.merge_kind, preview.error);
+  const commits = preview.commits ?? [];
+  const files = preview.changed_files ?? [];
+  const showTabs = preview.merge_kind !== "error" && preview.merge_kind !== "up_to_date";
+
+  return (
+    <div style={{ border: "1px solid var(--bg-hover)", borderRadius: 8, background: "var(--bg-surface)", display: "flex", flexDirection: "column", fontSize: 12 }}>
+      <div style={{ padding: "8px 10px", borderBottom: showTabs ? "1px solid var(--bg-hover)" : "none" }}>
+        <div style={{ display: "inline-block", padding: "2px 8px", borderRadius: 4, background: badge.bg, color: badge.color, fontWeight: 600, marginRight: 6 }}>
+          {badge.label}
+        </div>
+        {preview.merge_kind !== "error" && (
+          <div style={{ marginTop: 4, color: "var(--text-muted)", fontSize: 11 }}>
+            <span style={{ color: "var(--accent-blue)", fontFamily: "monospace" }}>{source}</span>:{" "}
+            <span style={{ color: "var(--text-body)" }}>{preview.ahead ?? 0}</span> ahead /{" "}
+            <span style={{ color: "var(--text-body)" }}>{preview.behind ?? 0}</span> behind{" "}
+            <span style={{ color: "var(--accent-amber)", fontFamily: "monospace" }}>{target}</span>
+            {loading && <span style={{ color: "var(--text-faint)", marginLeft: 6 }}>(refreshing…)</span>}
+          </div>
+        )}
+      </div>
+
+      {showTabs && (
+        <>
+          <div style={{ display: "flex", borderBottom: "1px solid var(--bg-hover)" }}>
+            <_MobileMergeTabBtn active={tab === "commits"} onClick={() => setTab("commits")}>
+              Commits{commits.length > 0 ? ` (${commits.length})` : ""}
+            </_MobileMergeTabBtn>
+            <_MobileMergeTabBtn active={tab === "diff"} onClick={() => setTab("diff")}>
+              Code{files.length > 0 ? ` (${files.length})` : ""}
+            </_MobileMergeTabBtn>
+          </div>
+
+          {tab === "commits" ? (
+            commits.length === 0 ? (
+              <div style={{ padding: "10px 12px", color: "var(--text-muted)" }}>(no commits)</div>
+            ) : (
+              <div style={{ maxHeight: 220, overflowY: "auto" }}>
+                {commits.map(c => (
+                  <div key={c.hash} style={{ padding: "6px 10px", borderBottom: "1px solid var(--bg-hover)" }}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                      <span style={{ fontFamily: "monospace", color: "var(--accent-amber)", fontSize: 11 }}>{c.short}</span>
+                      <span style={{ color: "var(--text-faint)", fontSize: 10, marginLeft: "auto" }}>{c.author}</span>
+                    </div>
+                    <div style={{ color: "var(--text-body)", fontSize: 12, marginTop: 2, wordBreak: "break-word" }}>
+                      {c.subject}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          ) : (
+            <_MobileDiffTabBody
+              files={files}
+              conflictSet={conflictSet}
+              selectedFile={selectedFile}
+              onSelectFile={setSelectedFile}
+              diff={diff}
+              diffLoading={diffLoading}
+              diffError={diffError}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function _MobileMergeTabBtn({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        flex: 1,
+        background: active ? "var(--bg-base)" : "transparent",
+        color: active ? "var(--accent-blue)" : "var(--text-secondary)",
+        border: "none",
+        borderBottom: active ? "2px solid var(--accent-blue)" : "2px solid transparent",
+        padding: "8px 0", fontSize: 13, cursor: "pointer", fontWeight: active ? 600 : 400,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function _MobileDiffTabBody({
+  files, conflictSet, selectedFile, onSelectFile,
+  diff, diffLoading, diffError,
+}: {
+  files: Array<{ path: string; status: string }>;
+  conflictSet: Set<string>;
+  selectedFile: string | null;
+  onSelectFile: (p: string) => void;
+  diff: string;
+  diffLoading: boolean;
+  diffError: string | null;
+}) {
+  if (files.length === 0) {
+    return <div style={{ padding: "10px 12px", color: "var(--text-muted)" }}>(no file changes)</div>;
+  }
+  return (
+    <div>
+      {/* File chips, horizontally scrollable */}
+      <div style={{ display: "flex", gap: 6, padding: "8px 10px", overflowX: "auto", borderBottom: "1px solid var(--bg-hover)" }}>
+        {files.map(f => {
+          const isConflict = conflictSet.has(f.path);
+          const isActive = f.path === selectedFile;
+          return (
+            <button
+              key={f.path}
+              onClick={() => onSelectFile(f.path)}
+              title={f.path}
+              style={{
+                flexShrink: 0, padding: "4px 8px", fontSize: 11, fontFamily: "monospace",
+                border: isActive ? "1px solid var(--accent-blue)" : "1px solid var(--bg-hover)",
+                background: isActive ? "rgba(88,166,255,0.15)" : "var(--bg-base)",
+                color: isConflict ? "var(--accent-red)" : "var(--text-body)",
+                borderRadius: 4, cursor: "pointer", maxWidth: 200,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+              }}
+            >
+              <span style={{ color: _MERGE_STATUS_COLOR[f.status] || "var(--text-muted)", marginRight: 4 }}>{f.status}</span>
+              {f.path.split("/").pop()}
+              {isConflict && <span style={{ marginLeft: 4 }}>⚠</span>}
+            </button>
+          );
+        })}
+      </div>
+      {/* Diff viewer */}
+      <div style={{ maxHeight: 280, overflow: "auto", background: "var(--bg-base)" }}>
+        {diffLoading ? (
+          <div style={{ padding: 12, color: "var(--text-muted)" }}>Loading diff…</div>
+        ) : diffError ? (
+          <div style={{ padding: 12, color: "var(--accent-red)" }}>{diffError}</div>
+        ) : !diff ? (
+          <div style={{ padding: 12, color: "var(--text-muted)" }}>(empty diff)</div>
+        ) : (
+          <pre style={{ margin: 0, padding: "6px 10px", fontSize: 11, fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,"Courier New",monospace', whiteSpace: "pre" }}>
+            {diff.split("\n").map((ln, i) => {
+              let color = "var(--text-body)"; let bg = "transparent";
+              if (ln.startsWith("+++") || ln.startsWith("---")) color = "var(--text-faint)";
+              else if (ln.startsWith("@@")) { color = "var(--accent-blue)"; bg = "rgba(88,166,255,0.08)"; }
+              else if (ln.startsWith("+")) { color = "var(--accent-green)"; bg = "rgba(63,185,80,0.08)"; }
+              else if (ln.startsWith("-")) { color = "var(--accent-red)"; bg = "rgba(248,81,73,0.08)"; }
+              else if (ln.startsWith("diff --git")) color = "var(--text-faint)";
+              return <div key={i} style={{ color, background: bg, whiteSpace: "pre" }}>{ln || " "}</div>;
+            })}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MobileMergeResolver({
+  sessionId, status, onStatusChange, onCompleted, setMsg,
+}: {
+  sessionId: string;
+  status: MergeStatus;
+  onStatusChange: (s: MergeStatus) => void;
+  onCompleted: () => void;
+  setMsg: (m: { text: string; ok: boolean } | null) => void;
+}) {
+  const files = status.conflicted_files;
+  const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"abort" | "continue" | null>(null);
+  const [confirmAbort, setConfirmAbort] = useState(false);
+
+  const handleContinue = async () => {
+    setBusy("continue");
+    try {
+      const r = await gitMergeContinue(sessionId);
+      setMsg({ text: r.output || "Merge completed.", ok: true });
+      onCompleted();
+    } catch (e) {
+      setMsg({ text: String(e), ok: false });
+    } finally { setBusy(null); }
+  };
+  const doAbort = async () => {
+    setBusy("abort");
+    try {
+      const r = await gitMergeAbort(sessionId);
+      setMsg({ text: r.output || "Merge aborted.", ok: true });
+      onCompleted();
+    } catch (e) {
+      setMsg({ text: String(e), ok: false });
+    } finally { setBusy(null); setConfirmAbort(false); }
+  };
+
+  const allResolved = files.length === 0;
+
+  if (activeFile) {
+    return (
+      <MobileFileResolver
+        sessionId={sessionId}
+        path={activeFile}
+        onBack={() => setActiveFile(null)}
+        onResolved={(s) => { onStatusChange(s); setActiveFile(null); }}
+        setMsg={setMsg}
+      />
+    );
+  }
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+      <div style={{ padding: "10px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+        <div style={{ fontSize: 13, color: "var(--text-body)" }}>
+          Merging <span style={{ fontFamily: "monospace", color: "var(--accent-amber)" }}>{status.merge_head}</span> → <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{status.current_branch}</span>
+        </div>
+        <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
+          {allResolved ? "All conflicts resolved." : `${files.length} file${files.length === 1 ? "" : "s"} remaining`}
+        </div>
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {files.length === 0 ? (
+          <div style={{ padding: 32, textAlign: "center", color: "var(--accent-green)", fontSize: 14 }}>✓ All resolved — tap Continue Merge below.</div>
+        ) : (
+          files.map(f => (
+            <button
+              key={f}
+              onClick={() => setActiveFile(f)}
+              style={{
+                display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between",
+                padding: "14px 16px", background: "transparent", border: "none",
+                borderBottom: "1px solid var(--border-subtle)",
+                color: "var(--text-bright)", fontSize: 13, fontFamily: "monospace", textAlign: "left", cursor: "pointer",
+              }}
+            >
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{f}</span>
+              <span style={{ fontSize: 16, color: "var(--text-muted)", flexShrink: 0, marginLeft: 8 }}>›</span>
+            </button>
+          ))
+        )}
+      </div>
+
+      <div style={{ flexShrink: 0, padding: "12px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-surface)", display: "flex", gap: 8 }}>
+        <button
+          onClick={() => setConfirmAbort(true)} disabled={busy !== null}
+          style={{ flex: 1, background: "var(--bg-hover)", color: "var(--accent-red)", border: "1px solid var(--accent-red)", borderRadius: 6, padding: "10px 14px", fontSize: 13 }}
+        >
+          {busy === "abort" ? "Aborting…" : "Abort"}
+        </button>
+        <button
+          disabled={!allResolved || busy !== null}
+          onClick={handleContinue}
+          style={{
+            flex: 1,
+            background: allResolved && busy === null ? "var(--accent-green)" : "var(--bg-hover)",
+            color: allResolved && busy === null ? "#fff" : "var(--text-faint)",
+            border: "none", borderRadius: 6, padding: "10px 14px", fontSize: 13, fontWeight: 600,
+          }}
+        >
+          {busy === "continue" ? "Committing…" : "Continue"}
+        </button>
+      </div>
+
+      {confirmAbort && (
+        <div onClick={busy ? undefined : () => setConfirmAbort(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 300, display: "flex", alignItems: "flex-end" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", background: "var(--bg-surface)", borderRadius: "16px 16px 0 0", padding: "16px 16px 28px", display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 4px" }} />
+            <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-bright)" }}>Abort merge?</div>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.5 }}>
+              This restores the working tree to its state before the merge started. Any resolutions you've saved will be lost.
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button onClick={() => setConfirmAbort(false)} disabled={busy !== null}
+                style={{ flex: 1, background: "var(--bg-hover)", color: "var(--text-secondary)", border: "none", borderRadius: 6, padding: "10px 14px", fontSize: 13 }}>Cancel</button>
+              <button onClick={doAbort} disabled={busy !== null}
+                style={{ flex: 1, background: "var(--accent-red)", color: "#fff", border: "none", borderRadius: 6, padding: "10px 14px", fontSize: 13, fontWeight: 600 }}>
+                {busy === "abort" ? "Aborting…" : "Abort Merge"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MobileFileResolver({
+  sessionId, path, onBack, onResolved, setMsg,
+}: {
+  sessionId: string;
+  path: string;
+  onBack: () => void;
+  onResolved: (s: MergeStatus) => void;
+  setMsg: (m: { text: string; ok: boolean } | null) => void;
+}) {
+  const [versions, setVersions] = useState<ConflictFileVersions | null>(null);
+  const [result, setResult] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [tab, setTab] = useState<"result" | "ours" | "theirs">("result");
+
+  useEffect(() => {
+    setLoading(true);
+    getMergeConflictFile(sessionId, path)
+      .then(v => { setVersions(v); setResult(v.working); })
+      .catch(e => setMsg({ text: String(e), ok: false }))
+      .finally(() => setLoading(false));
+  }, [sessionId, path, setMsg]);
+
+  const hunks = useMemo(() => parseConflictHunks(result), [result]);
+  const acceptHunk = (hunk: ConflictHunk, choice: "ours" | "theirs" | "both") => {
+    const replacement = choice === "ours" ? hunk.ours : choice === "theirs" ? hunk.theirs : [...hunk.ours, ...hunk.theirs];
+    setResult(prev => replaceLines(prev, hunk.startLine, hunk.endLine, replacement));
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const r = await gitResolveFile(sessionId, path, result);
+      setMsg({ text: `Resolved ${path}`, ok: true });
+      onResolved(r.status);
+    } catch (e) {
+      setMsg({ text: String(e), ok: false });
+    } finally { setSaving(false); }
+  };
+
+  const hasMarkers = hunks.length > 0;
+  const codeStyle: React.CSSProperties = {
+    margin: 0, padding: "10px 12px", fontSize: 11, lineHeight: 1.5,
+    fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,monospace',
+    whiteSpace: "pre", color: "var(--text-body)", overflow: "auto",
+  };
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "8px 12px", display: "flex", alignItems: "center", gap: 8 }}>
+        <button onClick={onBack} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 20, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ flex: 1, minWidth: 0, fontSize: 12, fontFamily: "monospace", color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{path}</span>
+      </div>
+
+      <div style={{ flexShrink: 0, display: "flex", borderBottom: "1px solid var(--border)", background: "var(--bg-surface)" }}>
+        {([
+          ["result", "Result", "var(--text-body)"],
+          ["ours", "Ours", "var(--accent-blue)"],
+          ["theirs", "Theirs", "var(--accent-amber)"],
+        ] as const).map(([id, label, color]) => (
+          <button
+            key={id} onClick={() => setTab(id)}
+            style={{
+              flex: 1, background: "transparent", border: "none",
+              borderBottom: tab === id ? `2px solid ${color}` : "2px solid transparent",
+              color: tab === id ? color : "var(--text-faint)",
+              fontSize: 12, fontWeight: 600, padding: "8px 0", cursor: "pointer",
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto", background: "var(--bg-base)" }}>
+        {loading || !versions ? (
+          <div style={{ padding: 40, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>
+        ) : tab === "ours" ? (
+          <pre style={codeStyle}>{versions.ours}</pre>
+        ) : tab === "theirs" ? (
+          <pre style={codeStyle}>{versions.theirs}</pre>
+        ) : (
+          <MobileResultHunkView content={result} hunks={hunks} onAccept={acceptHunk} />
+        )}
+      </div>
+
+      <div style={{ flexShrink: 0, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-surface)", display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 11, color: "var(--text-muted)", flex: 1 }}>
+          {hasMarkers ? `${hunks.length} unresolved hunk${hunks.length === 1 ? "" : "s"}` : "No markers — ready"}
+        </span>
+        <button
+          disabled={hasMarkers || saving}
+          onClick={handleSave}
+          style={{
+            background: !hasMarkers && !saving ? "var(--accent-blue)" : "var(--bg-hover)",
+            color: !hasMarkers && !saving ? "#fff" : "var(--text-faint)",
+            border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 13, fontWeight: 600,
+          }}
+        >
+          {saving ? "Saving…" : "Mark Resolved"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MobileResultHunkView({
+  content, hunks, onAccept,
+}: {
+  content: string;
+  hunks: ConflictHunk[];
+  onAccept: (h: ConflictHunk, choice: "ours" | "theirs" | "both") => void;
+}) {
+  const lines = content.split("\n");
+  type Segment = { kind: "text"; text: string } | { kind: "hunk"; hunk: ConflictHunk };
+  const segments: Segment[] = [];
+  let cursor = 0;
+  for (const h of hunks) {
+    if (h.startLine > cursor) segments.push({ kind: "text", text: lines.slice(cursor, h.startLine).join("\n") });
+    segments.push({ kind: "hunk", hunk: h });
+    cursor = h.endLine + 1;
+  }
+  if (cursor < lines.length) segments.push({ kind: "text", text: lines.slice(cursor).join("\n") });
+
+  const codeStyle: React.CSSProperties = {
+    margin: 0, padding: "4px 12px", fontSize: 11, lineHeight: 1.5,
+    fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,monospace',
+    whiteSpace: "pre", color: "var(--text-body)", overflow: "auto",
+  };
+
+  return (
+    <div>
+      {segments.length === 0 && (
+        <div style={{ padding: 16, fontSize: 13, color: "var(--text-muted)" }}>(empty)</div>
+      )}
+      {segments.map((seg, i) => {
+        if (seg.kind === "text") {
+          if (!seg.text) return null;
+          return <pre key={i} style={codeStyle}>{seg.text}</pre>;
+        }
+        const h = seg.hunk;
+        return (
+          <div key={i} style={{ margin: "8px 10px", border: "1px solid var(--accent-amber)", borderRadius: 6, overflow: "hidden", background: "var(--bg-surface)" }}>
+            <div style={{ padding: "8px 10px", background: "rgba(187,128,9,0.15)", display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ fontSize: 11, color: "var(--accent-amber)", fontWeight: 600 }}>Conflict</div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => onAccept(h, "ours")} style={{ flex: 1, background: "var(--accent-blue)", color: "#fff", border: "none", borderRadius: 4, padding: "6px 0", fontSize: 11 }}>Ours</button>
+                <button onClick={() => onAccept(h, "theirs")} style={{ flex: 1, background: "var(--accent-amber)", color: "#000", border: "none", borderRadius: 4, padding: "6px 0", fontSize: 11 }}>Theirs</button>
+                <button onClick={() => onAccept(h, "both")} style={{ flex: 1, background: "var(--bg-hover)", color: "var(--text-body)", border: "1px solid var(--border)", borderRadius: 4, padding: "6px 0", fontSize: 11 }}>Both</button>
+              </div>
+            </div>
+            <div style={{ borderTop: "1px solid var(--border-subtle)", background: "rgba(88,166,255,0.06)" }}>
+              <div style={{ padding: "2px 10px", fontSize: 10, color: "var(--accent-blue)", background: "rgba(88,166,255,0.12)" }}>Ours</div>
+              <pre style={codeStyle}>{h.ours.join("\n")}</pre>
+            </div>
+            <div style={{ borderTop: "1px solid var(--border-subtle)", background: "rgba(187,128,9,0.06)" }}>
+              <div style={{ padding: "2px 10px", fontSize: 10, color: "var(--accent-amber)", background: "rgba(187,128,9,0.12)" }}>Theirs</div>
+              <pre style={codeStyle}>{h.theirs.join("\n")}</pre>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
 /* ─── Mobile Schedule Panel ─── */
+type DelayUnit = "seconds" | "minutes" | "hours";
+const _UNIT_SECS: Record<DelayUnit, number> = { seconds: 1, minutes: 60, hours: 3600 };
+function _toSeconds(value: string, unit: DelayUnit): number {
+  return Math.max(1, parseInt(value, 10) || 1) * _UNIT_SECS[unit];
+}
+
 function MobileSchedulePanel({
   sessionId, tasks, onTasksChange, onClose,
 }: {
@@ -1137,22 +2231,39 @@ function MobileSchedulePanel({
   onClose: () => void;
 }) {
   const [prompt, setPrompt] = useState("");
-  const [delayMins, setDelayMins] = useState("5");
-  const [delaySecs, setDelaySecs] = useState("0");
+  const [delayValue, setDelayValue] = useState("5");
+  const [delayUnit, setDelayUnit] = useState<DelayUnit>("minutes");
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  // Loop value/unit mirror After until the user explicitly edits them
+  // (same UX as the PC ScheduleForm).
+  const [loopValue, setLoopValue] = useState("5");
+  const [loopUnit, setLoopUnit] = useState<DelayUnit>("minutes");
+  const [loopValueTouched, setLoopValueTouched] = useState(false);
+  const [loopUnitTouched, setLoopUnitTouched] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState("");
+
+  useEffect(() => { if (!loopValueTouched) setLoopValue(delayValue); }, [delayValue, loopValueTouched]);
+  useEffect(() => { if (!loopUnitTouched) setLoopUnit(delayUnit); }, [delayUnit, loopUnitTouched]);
 
   const pendingTasks = tasks.filter(t => t.status === "pending");
 
   const submit = async () => {
     if (!prompt.trim()) return;
-    const delay = (parseInt(delayMins) || 0) * 60 + (parseInt(delaySecs) || 0);
+    const delay = _toSeconds(delayValue, delayUnit);
     if (delay <= 0) { setErr("Delay must be > 0"); return; }
+    let loop_seconds: number | null = null;
+    if (loopEnabled) {
+      loop_seconds = _toSeconds(loopValue, loopUnit);
+      if (loop_seconds <= 0) { setErr("Loop interval must be > 0"); return; }
+    }
     setSubmitting(true); setErr("");
     try {
-      const t = await createTask(sessionId, prompt.trim(), delay);
+      const t = await createTask(sessionId, prompt.trim(), delay, loop_seconds);
       onTasksChange([...tasks, t]);
-      setPrompt(""); setDelayMins("5"); setDelaySecs("0");
+      setPrompt(""); setDelayValue("5"); setDelayUnit("minutes");
+      setLoopEnabled(false); setLoopValue("5"); setLoopUnit("minutes");
+      setLoopValueTouched(false); setLoopUnitTouched(false);
     } catch (e) { setErr(String(e)); }
     finally { setSubmitting(false); }
   };
@@ -1181,22 +2292,62 @@ function MobileSchedulePanel({
             rows={3}
             style={{ background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 8, padding: "8px 10px", color: "var(--text-primary)", fontSize: 14, resize: "none", outline: "none", width: "100%", boxSizing: "border-box", fontFamily: "inherit" }}
           />
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <span style={{ fontSize: 13, color: "var(--text-muted)", flexShrink: 0 }}>Delay:</span>
-            <input type="number" min="0" value={delayMins} onChange={(e) => setDelayMins(e.target.value)}
-              style={{ width: 52, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, padding: "4px 6px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "center" }} />
-            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>min</span>
-            <input type="number" min="0" max="59" value={delaySecs} onChange={(e) => setDelaySecs(e.target.value)}
-              style={{ width: 52, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, padding: "4px 6px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "center" }} />
-            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>sec</span>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)", width: 48, flexShrink: 0 }}>After</span>
+            <input
+              type="number" min={1} value={delayValue}
+              onChange={(e) => setDelayValue(e.target.value)}
+              style={{ width: 72, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, padding: "6px 8px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "right" }}
+            />
+            <select
+              value={delayUnit}
+              onChange={(e) => setDelayUnit(e.target.value as DelayUnit)}
+              style={{ background: "var(--bg-hover)", border: "1px solid #374151", borderRadius: 6, color: "var(--text-primary)", fontSize: 13, padding: "6px 8px", cursor: "pointer" }}
+            >
+              <option value="seconds">seconds</option>
+              <option value="minutes">minutes</option>
+              <option value="hours">hours</option>
+            </select>
+            <label
+              title="Repeat this prompt at a fixed interval after each fire"
+              style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto", cursor: "pointer", fontSize: 13, color: loopEnabled ? "#a78bfa" : "var(--text-muted)" }}
+            >
+              <input
+                type="checkbox"
+                checked={loopEnabled}
+                onChange={(e) => setLoopEnabled(e.target.checked)}
+                style={{ cursor: "pointer", margin: 0, width: 16, height: 16 }}
+              />
+              <span>↻ Loop</span>
+            </label>
           </div>
+          {loopEnabled && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <span style={{ fontSize: 13, color: "#a78bfa", width: 48, flexShrink: 0 }}>Every</span>
+              <input
+                type="number" min={1} value={loopValue}
+                onChange={(e) => { setLoopValue(e.target.value); setLoopValueTouched(true); }}
+                style={{ width: 72, background: "var(--bg-base)", border: "1px solid #7c3aed", borderRadius: 6, padding: "6px 8px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "right" }}
+              />
+              <select
+                value={loopUnit}
+                onChange={(e) => { setLoopUnit(e.target.value as DelayUnit); setLoopUnitTouched(true); }}
+                style={{ background: "var(--bg-hover)", border: "1px solid #7c3aed", borderRadius: 6, color: "var(--text-primary)", fontSize: 13, padding: "6px 8px", cursor: "pointer" }}
+              >
+                <option value="seconds">seconds</option>
+                <option value="minutes">minutes</option>
+                <option value="hours">hours</option>
+              </select>
+              <span style={{ fontSize: 11, color: "var(--text-faint)", marginLeft: "auto" }}>after each fire</span>
+            </div>
+          )}
           {err && <div style={{ fontSize: 12, color: "var(--accent-red)" }}>{err}</div>}
           <button
             onClick={submit}
             disabled={submitting || !prompt.trim()}
-            style={{ background: submitting || !prompt.trim() ? "var(--bg-hover)" : "var(--accent-green)", color: submitting || !prompt.trim() ? "var(--text-faint)" : "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 14, cursor: submitting || !prompt.trim() ? "default" : "pointer" }}
+            style={{ background: submitting || !prompt.trim() ? "var(--bg-hover)" : loopEnabled ? "#7c3aed" : "var(--accent-green)", color: submitting || !prompt.trim() ? "var(--text-faint)" : "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 14, cursor: submitting || !prompt.trim() ? "default" : "pointer" }}
           >
-            {submitting ? "Scheduling…" : "Schedule"}
+            {submitting ? "Scheduling…" : loopEnabled ? "Schedule loop" : "Schedule"}
           </button>
         </div>
 
@@ -1712,10 +2863,26 @@ const ROW1_NAV = [
   { label: "→",   seq: "\x1b[C", title: "Arrow Right" },
 ];
 
-function MobileShellPanel({ cwd, res, onClose }: { cwd: string; res: AttachResponse; onClose: () => void }) {
+// Must match EmbeddedTerminalPanel so PC & mobile pick up the same cached
+// term_id when the user switches viewports for the same session.
+const MOBILE_TERM_CACHE_PREFIX = "cmTermLastTermId:v1:";
+const mobileTermCacheKey = (sid: string) => MOBILE_TERM_CACHE_PREFIX + sid;
+const MOBILE_TERM_HEARTBEAT_MS = 30_000;
+const MOBILE_TERM_POLL_MS = 4000;
+
+function MobileShellPanel({ sessionId, cwd, onClose, onMinimize, minimized, fontFamily }: { sessionId: string; cwd: string; onClose: () => void; onMinimize?: () => void; minimized?: boolean; fontFamily?: string }) {
   const sendRawRef = useRef<((data: string) => void) | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
+
+  const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
+  const [attached, setAttached] = useState<{ termId: string; wsUrl: string; name: string | null; isNamed: boolean } | null>(null);
+  const [picking, setPicking] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // Track visual viewport so the panel stays above the soft keyboard
   useEffect(() => {
@@ -1723,7 +2890,7 @@ function MobileShellPanel({ cwd, res, onClose }: { cwd: string; res: AttachRespo
     if (!vv) return;
     const update = () => {
       const el = containerRef.current;
-      if (!el) return;
+      if (!el || minimized) return;
       el.style.top = `${vv.offsetTop}px`;
       el.style.height = `${vv.height}px`;
     };
@@ -1731,7 +2898,155 @@ function MobileShellPanel({ cwd, res, onClose }: { cwd: string; res: AttachRespo
     vv.addEventListener("scroll", update);
     update();
     return () => { vv.removeEventListener("resize", update); vv.removeEventListener("scroll", update); };
-  }, []);
+  }, [minimized]);
+
+  const refreshList = useCallback(async () => {
+    try {
+      const r = await listTerminals(sessionId);
+      setTerminals(r.items);
+    } catch { /* swallow */ }
+  }, [sessionId]);
+
+  const openEphemeral = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await createTerminal(sessionId, {});
+      setAttached({ termId: r.term_id, wsUrl: r.ws_url, name: r.name, isNamed: r.is_named });
+      setPicking(false);
+      await refreshList();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, busy, refreshList]);
+
+  const attachExisting = useCallback(async (term: TerminalInfo) => {
+    if (busy) return;
+    if (attached && attached.termId === term.term_id) {
+      setPicking(false);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const t = await issueTerminalToken(sessionId, term.term_id);
+      setAttached({ termId: term.term_id, wsUrl: t.ws_url, name: term.name, isNamed: term.is_named });
+      setPicking(false);
+      await refreshList();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, busy, attached, refreshList]);
+
+  const saveAsNamed = useCallback(async (name: string) => {
+    if (!attached || busy) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setRenameError(null);
+    try {
+      const r = await renameTerminal(sessionId, attached.termId, trimmed);
+      setAttached((a) => (a ? { ...a, name: r.name, isNamed: r.is_named } : a));
+      setRenaming(false);
+      setRenameValue("");
+      await refreshList();
+    } catch (e) {
+      setRenameError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, attached, busy, refreshList]);
+
+  const deleteCurrent = useCallback(async () => {
+    if (!attached || busy) return;
+    const label = attached.name ? `"${attached.name}"` : "this ephemeral terminal";
+    if (!confirm(`Delete ${label}? Any running processes inside will be killed.`)) return;
+    setBusy(true);
+    try {
+      await deleteTerminal(sessionId, attached.termId);
+      setAttached(null);
+      await refreshList();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, attached, busy, refreshList]);
+
+  // Auto-attach: try cached term_id first, fall back to a fresh ephemeral.
+  // Mirrors EmbeddedTerminalPanel so reopening the panel reattaches instead
+  // of leaving an orphaned ephemeral behind.
+  useEffect(() => {
+    if (attached) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const cachedId = localStorage.getItem(mobileTermCacheKey(sessionId));
+        if (cachedId) {
+          try {
+            const t = await issueTerminalToken(sessionId, cachedId);
+            if (cancelled) return;
+            setAttached({
+              termId: t.term_id,
+              wsUrl: t.ws_url,
+              name: t.name ?? null,
+              isNamed: !!t.is_named,
+            });
+            listTerminals(sessionId).then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
+            return;
+          } catch {
+            localStorage.removeItem(mobileTermCacheKey(sessionId));
+          }
+        }
+        const r = await listTerminals(sessionId);
+        if (cancelled) return;
+        setTerminals(r.items);
+        const c = await createTerminal(sessionId, {});
+        if (cancelled) return;
+        setAttached({ termId: c.term_id, wsUrl: c.ws_url, name: c.name, isNamed: c.is_named });
+        listTerminals(sessionId).then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [sessionId, attached]);
+
+  // Persist currently-attached term_id for next mount.
+  useEffect(() => {
+    if (!attached) return;
+    try { localStorage.setItem(mobileTermCacheKey(sessionId), attached.termId); }
+    catch { /* quota — ignore */ }
+  }, [sessionId, attached]);
+
+  // Heartbeat keepalive (also runs while minimized).
+  useEffect(() => {
+    if (!attached) return;
+    const tick = async () => {
+      try {
+        await heartbeatTerminal(sessionId, attached.termId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/gone|404|410/i.test(msg)) {
+          try { localStorage.removeItem(mobileTermCacheKey(sessionId)); } catch { /* ignore */ }
+          setAttached(null);
+        }
+      }
+    };
+    const id = setInterval(tick, MOBILE_TERM_HEARTBEAT_MS);
+    return () => clearInterval(id);
+  }, [sessionId, attached]);
+
+  // Periodic list refresh (for attach_count badges in picker).
+  useEffect(() => {
+    const id = setInterval(refreshList, MOBILE_TERM_POLL_MS);
+    return () => clearInterval(id);
+  }, [refreshList]);
 
   const sendKey = (seq: string) => sendRawRef.current?.(seq);
   const sendCtrlLetter = (letter: string) => {
@@ -1746,27 +3061,186 @@ function MobileShellPanel({ cwd, res, onClose }: { cwd: string; res: AttachRespo
     cursor: "pointer", padding: 0, userSelect: "none",
   };
 
+  const named = terminals.filter(t => t.is_named);
+  const ephemeral = terminals.filter(t => !t.is_named);
+  const currentLabel = attached
+    ? (attached.name ? `📌 ${attached.name}` : `▶ ephemeral (${attached.termId.slice(0, 6)})`)
+    : (busy ? "(connecting…)" : "(no terminal)");
+
   return (
-    <div ref={containerRef} style={{ position: "fixed", left: 0, right: 0, top: 0, height: "100%", background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+    <div ref={containerRef} style={{ position: "fixed", left: 0, right: 0, top: 0, height: "100%", background: "var(--bg-base)", zIndex: 200, display: minimized ? "none" : "flex", flexDirection: "column" }}>
       {/* Header */}
-      <div style={{ padding: "10px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
-        <span style={{ fontSize: 13, color: "var(--text-secondary)", fontFamily: "monospace", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          &gt;_ {cwd}
-        </span>
+      <div style={{ padding: "10px 12px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+        <button onClick={onClose} title="Close terminal" style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <button
+          onClick={() => setPicking(p => !p)}
+          title="Switch terminal"
+          disabled={busy}
+          style={{
+            background: "var(--bg-hover)", color: "var(--text-body)",
+            fontSize: 12, padding: "5px 10px", border: "none", borderRadius: 6,
+            display: "flex", alignItems: "center", gap: 5, flex: 1, minWidth: 0,
+            fontFamily: "monospace", cursor: busy ? "default" : "pointer",
+          }}
+        >
+          <span style={{ flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{currentLabel}</span>
+          <span style={{ fontSize: 9, color: "var(--text-muted)", flexShrink: 0 }}>▾</span>
+        </button>
+        {attached && !attached.isNamed && !renaming && (
+          <button
+            onClick={() => { setRenameValue(""); setRenameError(null); setRenaming(true); }}
+            disabled={busy}
+            title="Save (name) this terminal so it persists"
+            style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 12, padding: "5px 9px", border: "none", borderRadius: 6, lineHeight: 1 }}
+          >💾</button>
+        )}
+        {attached && (
+          <button
+            onClick={deleteCurrent}
+            disabled={busy}
+            title="Delete this terminal"
+            style={{ background: "var(--bg-hover)", color: "var(--text-muted)", fontSize: 12, padding: "5px 9px", border: "none", borderRadius: 6, lineHeight: 1 }}
+          >🗑</button>
+        )}
+        {onMinimize && (
+          <button onClick={onMinimize} title="Minimize (keep alive)" style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-secondary)", fontSize: 16, padding: "2px 10px", cursor: "pointer", lineHeight: 1, borderRadius: 6 }}>
+            ─
+          </button>
+        )}
       </div>
+
+      {/* cwd */}
+      <div style={{ padding: "4px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", fontSize: 11, color: "var(--text-faint)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 0 }}>
+        &gt;_ {cwd}
+      </div>
+
+      {/* Rename form */}
+      {attached && renaming && (
+        <div style={{ padding: "8px 12px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+          <input
+            autoFocus
+            value={renameValue}
+            onChange={(e) => { setRenameValue(e.target.value); if (renameError) setRenameError(null); }}
+            onKeyDown={(e) => { if (e.key === "Escape") { setRenaming(false); setRenameError(null); } }}
+            placeholder="terminal name"
+            style={{
+              flex: 1, fontSize: 13, padding: "6px 8px",
+              background: "var(--bg-base)",
+              border: `1px solid ${renameError ? "var(--accent-red, #f85149)" : "var(--border)"}`,
+              color: "var(--text-body)",
+              borderRadius: 4,
+            }}
+          />
+          <button
+            onClick={() => saveAsNamed(renameValue)}
+            disabled={!renameValue.trim() || busy}
+            style={{
+              background: renameValue.trim() ? "var(--accent-blue)" : "var(--text-faintest)",
+              color: "#fff", fontSize: 12, padding: "6px 12px", border: "none", borderRadius: 4, fontWeight: 600,
+            }}
+          >OK</button>
+          <button
+            onClick={() => { setRenaming(false); setRenameError(null); }}
+            style={{ background: "var(--bg-hover)", color: "var(--text-muted)", fontSize: 12, padding: "6px 10px", border: "none", borderRadius: 4 }}
+          >✕</button>
+        </div>
+      )}
+      {renameError && (
+        <div style={{ padding: "4px 14px 8px", fontSize: 11, color: "var(--accent-red, #f85149)", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+          {renameError}
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <div style={{ padding: "8px 12px", fontSize: 12, color: "var(--accent-red, #f85149)", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+          {error}
+        </div>
+      )}
+
       {/* Terminal */}
       <div style={{ flex: 1, overflow: "hidden", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
-        <TerminalPane
-          key={res.session_id + res.ws_token}
-          sessionId={res.session_id}
-          wsUrl={res.ws_url}
-          onDisconnect={onClose}
-          defaultFit
-          showWideToggle
-          sendRawRef={sendRawRef}
-        />
+        {attached && (
+          <TerminalPane
+            key={attached.termId + attached.wsUrl + (fontFamily || "")}
+            sessionId={attached.termId}
+            wsUrl={attached.wsUrl}
+            scrollMode="tmux"
+            onDisconnect={() => setAttached(null)}
+            defaultFit
+            showWideToggle
+            fontFamily={fontFamily}
+            sendRawRef={sendRawRef}
+          />
+        )}
       </div>
+
+      {/* Picker bottom sheet */}
+      {picking && (
+        <>
+          <div onClick={() => setPicking(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 210 }} />
+          <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, background: "var(--bg-surface)", borderTop: "1px solid var(--border-strong)", borderRadius: "12px 12px 0 0", padding: "12px 0 24px", zIndex: 211, maxHeight: "70%", overflowY: "auto", boxShadow: "0 -4px 16px rgba(0,0,0,0.4)" }}>
+            <div style={{ width: 40, height: 4, background: "var(--text-faintest)", borderRadius: 2, margin: "0 auto 12px" }} />
+            <div style={{ fontSize: 10, color: "var(--text-faint)", padding: "4px 16px", textTransform: "uppercase", letterSpacing: 0.6 }}>Named</div>
+            {named.length === 0 && (
+              <div style={{ padding: "6px 16px", fontSize: 12, color: "var(--text-muted)" }}>(none — save current to name it)</div>
+            )}
+            {named.map(t => (
+              <button
+                key={t.term_id}
+                onClick={() => attachExisting(t)}
+                style={{
+                  display: "flex", width: "100%", textAlign: "left", padding: "10px 16px",
+                  background: attached?.termId === t.term_id ? "rgba(88,166,255,0.12)" : "transparent",
+                  color: attached?.termId === t.term_id ? "var(--accent-blue)" : "var(--text-body)",
+                  border: "none", fontSize: 13, gap: 8, alignItems: "center",
+                  cursor: "pointer", fontFamily: "monospace",
+                }}
+              >
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>📌 {t.name}</span>
+                {t.attach_count > 0 && (
+                  <span style={{ fontSize: 10, padding: "2px 6px", background: "rgba(34,197,94,0.18)", color: "#22c55e", borderRadius: 3 }}>
+                    👥{t.attach_count}
+                  </span>
+                )}
+              </button>
+            ))}
+
+            <div style={{ fontSize: 10, color: "var(--text-faint)", padding: "10px 16px 4px", textTransform: "uppercase", letterSpacing: 0.6 }}>Ephemeral</div>
+            {ephemeral.length === 0 && (
+              <div style={{ padding: "6px 16px", fontSize: 12, color: "var(--text-muted)" }}>(none)</div>
+            )}
+            {ephemeral.map(t => (
+              <button
+                key={t.term_id}
+                onClick={() => attachExisting(t)}
+                style={{
+                  display: "flex", width: "100%", textAlign: "left", padding: "10px 16px",
+                  background: attached?.termId === t.term_id ? "rgba(88,166,255,0.12)" : "transparent",
+                  color: attached?.termId === t.term_id ? "var(--accent-blue)" : "var(--text-body)",
+                  border: "none", fontSize: 13, gap: 8, alignItems: "center",
+                  cursor: "pointer", fontFamily: "monospace",
+                }}
+              >
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>▶ {t.term_id.slice(0, 8)}</span>
+                {t.attach_count > 0 && (
+                  <span style={{ fontSize: 10, padding: "2px 6px", background: "rgba(34,197,94,0.18)", color: "#22c55e", borderRadius: 3 }}>
+                    👥{t.attach_count}
+                  </span>
+                )}
+              </button>
+            ))}
+
+            <div style={{ borderTop: "1px solid var(--border-subtle)", marginTop: 8, paddingTop: 8 }}>
+              <button
+                onClick={() => openEphemeral()}
+                disabled={busy}
+                style={{ display: "block", width: "100%", textAlign: "left", padding: "12px 16px", background: "transparent", border: "none", color: "var(--accent-blue)", fontSize: 13, cursor: "pointer", fontFamily: "monospace" }}
+              >+ New ephemeral terminal</button>
+            </div>
+          </div>
+        </>
+      )}
       {/* Toolbar — two rows, always above keyboard */}
       <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderTop: "1px solid var(--border)" }}>
         {/* Row 1: CTRL toggle + navigation */}
@@ -1833,20 +3307,6 @@ const FILE_CODE_EXTS = new Set([
   "c","h","cpp","cc","cxx","hpp","rb","php","swift","cs","sql","graphql","proto",
   "tf","hcl","yaml","yml","toml","json","r","lua",
 ]);
-const FILE_EXT_ICONS: Record<string,string> = {
-  py:"🐍",js:"📜",ts:"📘",tsx:"⚛️",jsx:"⚛️",json:"{}",yaml:"📋",yml:"📋",
-  toml:"📋",md:"📝",txt:"📄",csv:"📊",sql:"🗄️",css:"🎨",scss:"🎨",
-  html:"🌐",htm:"🌐",sh:"⚙️",bash:"⚙️",go:"🔵",rs:"🦀",java:"☕",
-  c:"🔷",cpp:"🔷",h:"🔷",rb:"💎",swift:"🍎",db:"🗄️",sqlite:"🗄️",sqlite3:"🗄️",pdf:"📕",
-};
-const FILE_SPECIAL_ICONS: Record<string,string> = {
-  Makefile:"⚙️",Dockerfile:"🐳",".gitignore":"🔍",".env":"🔑","package.json":"📦",
-};
-function mobileFileIcon(name: string): string {
-  if (FILE_SPECIAL_ICONS[name]) return FILE_SPECIAL_ICONS[name];
-  const ext = name.split(".").pop()?.toLowerCase() || "";
-  return FILE_EXT_ICONS[ext] || "📄";
-}
 function mobileFormatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1048576) return `${(bytes/1024).toFixed(1)}K`;
@@ -2431,17 +3891,17 @@ function MobileFileBrowserPanel({
     finally { setGitDetailLoading(false); }
   }, [sessionId, sheetTarget, gitCommit]);
 
+  const [dlModalInfo, setDlModalInfo] = useState<DirInfoResponse | null>(null);
   const handleDownloadZip = useCallback(async () => {
     setZipBusy(true);
     try {
       const info = await getDirInfo(sessionId, "");
-      const compress = info.total_size > 16 * 1024 * 1024;
       if (info.total_size > 100 * 1024 * 1024) {
-        if (!window.confirm(`Workspace is ${(info.total_size / 1024 / 1024).toFixed(1)}MB. Download anyway?`)) {
-          setZipBusy(false); return;
-        }
+        setDlModalInfo(info);
+      } else {
+        const compress = info.total_size > 16 * 1024 * 1024;
+        await downloadDirZip(sessionId, "", [], compress);
       }
-      await downloadDirZip(sessionId, "", [], compress);
     } catch (e) { alert(String(e)); }
     finally { setZipBusy(false); }
   }, [sessionId]);
@@ -2544,7 +4004,7 @@ function MobileFileBrowserPanel({
               onTouchCancel={onEntryTouchEnd}
               style={{ padding: `10px 12px 10px ${indent}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: entry.is_skipped ? "default" : "pointer", userSelect: "none", WebkitTouchCallout: "none" }}>
               <span style={{ fontSize: 10, color: "var(--text-faint)", width: 10, flexShrink: 0 }}>{entry.is_skipped ? "" : expanded ? "▼" : "▶"}</span>
-              <span style={{ fontSize: 16 }}>📁</span>
+              <FileIcon isDir isOpen={expanded} size={16} />
               <span style={{ fontSize: 14, color: entry.is_skipped ? "var(--text-faint)" : "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {entry.name}{entry.is_skipped && <span style={{ fontSize: 11, color: "var(--text-faint)" }}> (skipped)</span>}
               </span>
@@ -2563,7 +4023,7 @@ function MobileFileBrowserPanel({
           onTouchEnd={onEntryTouchEnd}
           onTouchCancel={onEntryTouchEnd}
           style={{ padding: `10px 12px 10px ${indent + 18}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: clickable ? "pointer" : "default", userSelect: "none", WebkitTouchCallout: "none" }}>
-          <span style={{ fontSize: 15 }}>{mobileFileIcon(entry.name)}</span>
+          <FileIcon name={entry.name} size={15} />
           <span style={{ fontSize: 14, color: clickable ? "var(--text-primary)" : "var(--text-faint)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
           {entry.size != null && <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{mobileFormatSize(entry.size)}</span>}
         </div>
@@ -2637,7 +4097,7 @@ function MobileFileBrowserPanel({
       <div style={{ padding: "4px 8px 6px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 4, flexShrink: 0, overflowX: "auto" }}>
         <button title="Search" onClick={() => setSheet("search")} style={toolbarBtnStyle}>🔍</button>
         <button title="New file" onClick={() => setSheet("newFile")} style={toolbarBtnStyle}>✚</button>
-        <button title="New folder" onClick={() => setSheet("newFolder")} style={toolbarBtnStyle}>📁</button>
+        <button title="New folder" onClick={() => setSheet("newFolder")} style={{ ...toolbarBtnStyle, display: "flex", alignItems: "center", justifyContent: "center" }}><NewFolderIcon size={15} color="var(--text-body)" /></button>
         <button title="Upload" onClick={() => setSheet("upload")} style={toolbarBtnStyle}>⬆</button>
         <button title="Download workspace .zip" disabled={zipBusy} onClick={handleDownloadZip}
           style={{ ...toolbarBtnStyle, opacity: zipBusy ? 0.4 : 1 }}>{zipBusy ? "…" : "💾"}</button>
@@ -2698,6 +4158,14 @@ function MobileFileBrowserPanel({
           gitDiff={gitDiff} gitFull={gitFull} gitDetailLoading={gitDetailLoading}
           onPickGitCommit={openGitCommit}
           onBackToGitHistory={() => setSheet("gitHistory")}
+        />
+      )}
+      {dlModalInfo && (
+        <DownloadExclusionModal
+          sessionId={sessionId}
+          basePath=""
+          info={dlModalInfo}
+          onClose={() => setDlModalInfo(null)}
         />
       )}
     </div>
@@ -2825,7 +4293,7 @@ function MobileFileSheet(props: MobileFileSheetProps) {
                   <div key={entry.path}
                     onClick={() => props.onPickSearchResult(entry)}
                     style={{ padding: "8px 4px", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ fontSize: 14 }}>{entry.type === "dir" ? "📁" : mobileFileIcon(entry.name)}</span>
+                    <FileIcon name={entry.name} isDir={entry.type === "dir"} size={14} />
                     <span style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</div>
                       <div style={{ fontSize: 10, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.path}</div>
@@ -3042,7 +4510,7 @@ function relTime(iso: string): string {
 
 function SessionDrawer({
   open, onClose, onOpen, currentSession, onNewSession,
-  onImport, onLogout, onSwitchToAdmin, theme, onToggleTheme, username,
+  onImport, onLogout, onSwitchToAdmin, theme, onToggleTheme, username, onOpenSettings,
 }: {
   open: boolean; onClose: () => void;
   onOpen: (s: SessionMeta) => void;
@@ -3054,6 +4522,7 @@ function SessionDrawer({
   theme?: "dark" | "light";
   onToggleTheme?: () => void;
   username: string;
+  onOpenSettings?: () => void;
 }) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [loading, setLoading] = useState(false);
@@ -3264,6 +4733,9 @@ function SessionDrawer({
                 {theme === "light" ? "🌙" : "☀️"}
               </button>
             )}
+            {onOpenSettings && (
+              <button onClick={() => { onClose(); onOpenSettings(); }} style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 7, color: "var(--text-muted)", fontSize: 14, padding: "4px 8px", cursor: "pointer" }} title="Settings">⚙</button>
+            )}
             {onSwitchToAdmin && (
               <button onClick={() => { onSwitchToAdmin(); onClose(); }} style={{ background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 7, color: "var(--accent-blue)", fontSize: 12, padding: "4px 10px", cursor: "pointer" }}>
                 Admin
@@ -3279,13 +4751,16 @@ function SessionDrawer({
   );
 }
 
-function DetailView({ session: initialSession, onBack, username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: {
+function DetailView({ session: initialSession, onBack, username, onLogout, onSwitchToAdmin, theme, onToggleTheme, terminalFont, onTerminalFontChange }: {
   session: SessionMeta; onBack: () => void; username: string;
   onLogout: () => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void;
+  terminalFont?: string; onTerminalFontChange?: (font: string) => void;
 }) {
   const [session, setSession] = useState(initialSession);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [showCaps, setShowCaps] = useState(false);
+  const [showJsonl, setShowJsonl] = useState(false);
   const [fontSize, setFontSize] = useState<number>(() => Number(localStorage.getItem("cm_mobile_font") || 13));
   const changeFontSize = (delta: number) => setFontSize(prev => {
     const next = Math.min(20, Math.max(10, prev + delta));
@@ -3298,7 +4773,8 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const [showTasks, setShowTasks] = useState(false);
   const [showGoals, setShowGoals] = useState(false);
   const [showAuqs, setShowAuqs] = useState(false);
-  const [shellRes, setShellRes] = useState<AttachResponse | null>(null);
+  const [shellOpen, setShellOpen] = useState(false);
+  const [shellMinimized, setShellMinimized] = useState(false);
   const [showResumeSelect, setShowResumeSelect] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -3338,11 +4814,12 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const showGitRef = useRef(false);
   const showScheduleRef = useRef(false);
   const showFilesRef = useRef(false);
-  const shellResRef = useRef<AttachResponse | null>(null);
+  const shellOpenRef = useRef(false);
   const filesBackHandlerRef = useRef<(() => void) | null>(null);
   const showResumeSelectRef = useRef(false);
   const showModelPickerRef = useRef(false);
   const showCapsRef = useRef(false);
+  const showJsonlRef = useRef(false);
   const stopResponseRef = useRef<(() => void) | null>(null);
   const convRefreshRef = useRef<(() => void) | null>(null);
   const showTasksRef = useRef(false);
@@ -3354,10 +4831,11 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   showTasksRef.current = showTasks;
   showGoalsRef.current = showGoals;
   showAuqsRef.current = showAuqs;
-  shellResRef.current = shellRes;
+  shellOpenRef.current = shellOpen;
   showResumeSelectRef.current = showResumeSelect;
   showModelPickerRef.current = showModelPicker;
   showCapsRef.current = showCaps;
+  showJsonlRef.current = showJsonl;
 
   // Push history entry when this view mounts; handle all back navigation here.
   useEffect(() => {
@@ -3370,10 +4848,11 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       if (showTasksRef.current) { setShowTasks(false); return; }
       if (showGoalsRef.current) { setShowGoals(false); return; }
       if (showAuqsRef.current) { setShowAuqs(false); return; }
-      if (shellResRef.current) { setShellRes(null); return; }
+      if (shellOpenRef.current) { setShellOpen(false); setShellMinimized(false); return; }
       if (showResumeSelectRef.current) { setShowResumeSelect(false); return; }
       if (showModelPickerRef.current) { setShowModelPicker(false); return; }
       if (showCapsRef.current) { setShowCaps(false); return; }
+      if (showJsonlRef.current) { setShowJsonl(false); return; }
       onBack();
     };
     window.addEventListener("popstate", handlePop);
@@ -3388,10 +4867,11 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   useEffect(() => { if (showGoals) history.pushState({ mobileDetail: true, sub: "goals" }, ""); }, [showGoals]);
   useEffect(() => { if (showAuqs) history.pushState({ mobileDetail: true, sub: "auqs" }, ""); }, [showAuqs]);
   useEffect(() => { if (showFiles) history.pushState({ mobileDetail: true, sub: "files" }, ""); }, [showFiles]);
-  useEffect(() => { if (shellRes) history.pushState({ mobileDetail: true, sub: "shell" }, ""); }, [shellRes]);
+  useEffect(() => { if (shellOpen) history.pushState({ mobileDetail: true, sub: "shell" }, ""); }, [shellOpen]);
   useEffect(() => { if (showResumeSelect) history.pushState({ mobileDetail: true, sub: "resumeSelect" }, ""); }, [showResumeSelect]);
   useEffect(() => { if (showModelPicker) history.pushState({ mobileDetail: true, sub: "modelPicker" }, ""); }, [showModelPicker]);
   useEffect(() => { if (showCaps) history.pushState({ mobileDetail: true, sub: "caps" }, ""); }, [showCaps]);
+  useEffect(() => { if (showJsonl) history.pushState({ mobileDetail: true, sub: "jsonl" }, ""); }, [showJsonl]);
 
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTask[]>(initialSession.scheduled_tasks ?? []);
 
@@ -3512,8 +4992,11 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
           type Btn = { icon: React.ReactNode; onClick: () => void; color: string; bg: string; title: string; disabled?: boolean };
           const canStop = !isTerminated && session.is_streaming;
           const btns: Btn[] = [
-            { icon: <img src={terminalIcon} style={svgStyle} />, title: "Shell", onClick: async () => { try { const r = await openShell(session.id); setShellRes(r); } catch (e) { alert(String(e)); } }, color: iconMuted, bg: "transparent" },
-            { icon: "📁", title: "Files", onClick: () => setShowFiles(true), color: iconMuted, bg: "transparent" },
+            { icon: <img src={terminalIcon} style={svgStyle} />, title: "Shell", onClick: () => {
+                if (shellOpen) { setShellMinimized(false); return; }
+                setShellOpen(true); setShellMinimized(false);
+              }, color: shellOpen && shellMinimized ? "var(--accent-blue)" : iconMuted, bg: "transparent" },
+            { icon: <FileIcon isDir size={14} />, title: "Files", onClick: () => setShowFiles(true), color: iconMuted, bg: "transparent" },
             { icon: <img src={gitIcon} style={svgStyle} />, title: "Git", onClick: () => setShowGit(true), color: iconMuted, bg: "transparent" },
             {
               icon: pendingCount > 0
@@ -3548,6 +5031,18 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
               ? { icon: "▶", title: "Resume", onClick: async () => { try { await resumeSession(session.id); setSession((s) => ({ ...s, status: "running" })); } catch (e) { alert(String(e)); } }, color: "var(--accent-green)", bg: "transparent" }
               : { icon: "⏹", title: "Terminate", onClick: async () => { try { await terminateSession(session.id); onBack(); } catch {} }, color: "var(--accent-red)", bg: "transparent" },
             { icon: "⚙", title: "Claude Capabilities", onClick: () => setShowCaps(true), color: iconMuted, bg: "transparent" },
+            {
+              icon: <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: -0.3 }}>HTML</span>,
+              title: "Export chat as HTML",
+              onClick: async () => { try { await downloadConversationHtml(session); } catch (e) { alert(String(e)); } },
+              color: iconMuted, bg: "transparent",
+            },
+            ...(session.claude_session_id ? [{
+              icon: <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: -0.3 }}>JSON</span>,
+              title: "Preview conversation.jsonl",
+              onClick: () => setShowJsonl(true),
+              color: iconMuted, bg: "transparent",
+            }] : []),
           ];
           // With 12+ buttons, even-grid would shrink each below tap-target size on narrow
           // phones. Use flex with a min-width per button and let it scroll horizontally
@@ -3577,9 +5072,32 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         theme={theme}
         onToggleTheme={onToggleTheme}
         username={username}
+        onOpenSettings={() => setShowSettings(true)}
+      />
+      <MobileSettingsPanel
+        open={showSettings} onClose={() => setShowSettings(false)}
+        theme={theme} onToggleTheme={onToggleTheme}
+        terminalFont={terminalFont} onTerminalFontChange={onTerminalFontChange}
       />
 
-      {shellRes && <MobileShellPanel cwd={session.cwd} res={shellRes} onClose={() => history.back()} />}
+      {shellOpen && <MobileShellPanel sessionId={session.id} cwd={session.cwd} onClose={() => history.back()} onMinimize={() => setShellMinimized(true)} minimized={shellMinimized} fontFamily={terminalFont} />}
+      {shellOpen && shellMinimized && (
+        <button
+          onClick={() => setShellMinimized(false)}
+          title="Restore terminal"
+          style={{
+            position: "fixed", right: 14, bottom: 84, zIndex: 199,
+            background: "var(--bg-surface)", border: "1px solid var(--accent-blue)",
+            color: "var(--accent-blue)", borderRadius: 22, padding: "8px 14px",
+            fontSize: 13, fontFamily: "monospace", fontWeight: 600,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.4)", cursor: "pointer",
+            display: "flex", alignItems: "center", gap: 6,
+          }}
+        >
+          <span>&gt;_</span>
+          <span style={{ fontSize: 11, color: "var(--text-muted)", fontWeight: 400 }}>Terminal</span>
+        </button>
+      )}
       {showFiles && (
         <MobileFileBrowserPanel
           sessionId={session.id}
@@ -3607,6 +5125,16 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       {showTasks && <MobileTasksPanel sessionId={session.id} onClose={() => history.back()} />}
       {showGoals && <MobileGoalsPanel sessionId={session.id} onClose={() => history.back()} />}
       {showAuqs && <MobileAuqsPanel sessionId={session.id} onClose={() => history.back()} />}
+      {showJsonl && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 3000, background: "var(--bg-base)", display: "flex", flexDirection: "column" }}>
+          <JsonlPreviewModal
+            inline
+            sessionId={session.id}
+            sessionTitle={session.project}
+            onClose={() => history.back()}
+          />
+        </div>
+      )}
 
       {showModelPicker && (
         <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}
@@ -3689,9 +5217,10 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       {tuiWs && (
         <div style={{ flex: 1, minHeight: 0, display: viewMode === "tui" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
           <TuiPane
-            key={tuiWs.token}
+            key={tuiWs.token + (terminalFont || "")}
             wsUrl={tuiWs.url}
             theme={theme}
+            fontFamily={terminalFont}
             scrollToBottomRef={tuiScrollBottomRef}
             sendRawRef={tuiSendRawRef}
           />
@@ -3743,9 +5272,9 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       {showImport && (
         <MobileBrowseExternalPanel
           onClose={() => setShowImport(false)}
-          onLoad={async (ext) => {
+          onLoad={async (ext, tool) => {
             const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
-            const s = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id });
+            const s = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id, tool });
             setShowImport(false); setSession(s);
           }}
         />
@@ -3762,8 +5291,112 @@ function parseSessionHash(): string | null {
 }
 
 /* ─── Top-level Mobile Page ─── */
+// ────────────────────────────────────────────────────────────────────────────
+// MobileSettingsPanel — bottom sheet for theme + terminal font
+// ────────────────────────────────────────────────────────────────────────────
+function MobileSettingsPanel({ open, onClose, theme, onToggleTheme, terminalFont, onTerminalFontChange }: {
+  open: boolean; onClose: () => void;
+  theme?: "dark" | "light"; onToggleTheme?: () => void;
+  terminalFont?: string; onTerminalFontChange?: (font: string) => void;
+}) {
+  const [fontList, setFontList] = useState<FontInfo[]>([]);
+  const [fontLoading, setFontLoading] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || fontList.length > 0) return;
+    setFontLoading(true);
+    getSystemFonts().then(f => { setFontList(f); setFontLoading(false); }).catch(() => setFontLoading(false));
+  }, [open, fontList.length]);
+
+  if (!open) return null;
+
+  const filtered = fontList.filter(f => !filter || f.family.toLowerCase().includes(filter.toLowerCase()));
+
+  const applyFont = async (family: string) => {
+    try {
+      const c = await setTerminalFont(family);
+      onTerminalFontChange?.(c.terminal_font);
+      setMsg(`Set to "${family}". Reattach session to take full effect.`);
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 3500, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxHeight: "85vh", background: "var(--bg-surface)", borderRadius: "12px 12px 0 0", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-bright)" }}>⚙ Settings</span>
+          <button onClick={onClose} style={{ background: "var(--bg-hover)", border: "none", color: "var(--text-secondary)", fontSize: 13, padding: "4px 12px", borderRadius: 6, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 20 }}>
+          {/* Theme */}
+          {onToggleTheme && (
+            <section>
+              <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.6, color: "var(--text-faint)", marginBottom: 8, fontWeight: 600 }}>Theme</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => { if (theme !== "dark") onToggleTheme(); }}
+                  style={{ flex: 1, padding: "10px 12px", borderRadius: 8, fontSize: 13, border: `1px solid ${theme === "dark" ? "var(--accent-blue)" : "var(--border)"}`, background: theme === "dark" ? "rgba(88,166,255,0.12)" : "var(--bg-base)", color: theme === "dark" ? "var(--accent-blue)" : "var(--text-body)", cursor: "pointer" }}
+                >🌙 Dark</button>
+                <button
+                  onClick={() => { if (theme !== "light") onToggleTheme(); }}
+                  style={{ flex: 1, padding: "10px 12px", borderRadius: 8, fontSize: 13, border: `1px solid ${theme === "light" ? "var(--accent-blue)" : "var(--border)"}`, background: theme === "light" ? "rgba(88,166,255,0.12)" : "var(--bg-base)", color: theme === "light" ? "var(--accent-blue)" : "var(--text-body)", cursor: "pointer" }}
+                >☀️ Light</button>
+              </div>
+            </section>
+          )}
+          {/* Terminal font */}
+          <section>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.6, color: "var(--text-faint)", marginBottom: 8, fontWeight: 600 }}>Terminal Font</div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+              Current: <code style={{ color: "var(--text-secondary)" }}>{terminalFont || "(default)"}</code>
+            </div>
+            <input
+              placeholder="Filter fonts..."
+              value={filter}
+              onChange={e => setFilter(e.target.value)}
+              style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", marginBottom: 8, background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-body)", fontSize: 13, outline: "none" }}
+            />
+            <div style={{ maxHeight: "40vh", overflowY: "auto", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-base)" }}>
+              {fontLoading && <div style={{ padding: 12, fontSize: 12, color: "var(--text-muted)" }}>Loading…</div>}
+              {!fontLoading && filtered.length === 0 && (
+                <div style={{ padding: 12, fontSize: 12, color: "var(--text-muted)" }}>No matching fonts.</div>
+              )}
+              {filtered.map(f => {
+                const isActive = f.family === terminalFont;
+                return (
+                  <div
+                    key={f.family}
+                    onClick={() => applyFont(f.family)}
+                    style={{ padding: "10px 12px", cursor: "pointer", fontSize: 13, borderBottom: "1px solid var(--bg-hover)", background: isActive ? "rgba(88,166,255,0.1)" : "transparent", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}
+                  >
+                    <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                      {f.recommended && (
+                        <span style={{ fontSize: 10, padding: "1px 5px", background: "rgba(88,166,255,0.15)", color: "var(--accent-blue)", borderRadius: 3 }}>★</span>
+                      )}
+                      <span style={{ color: isActive ? "var(--accent-blue)" : "var(--text-body)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.family}</span>
+                    </span>
+                    <span style={{ fontFamily: f.family, fontSize: 12, color: "var(--text-muted)", flexShrink: 0 }}>AaBb 你好 123</span>
+                  </div>
+                );
+              })}
+            </div>
+            {msg && <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-muted)" }}>{msg}</div>}
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function MobilePage({ username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: { username: string; onLogout: () => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void }) {
   const [openSession, setOpenSession] = useState<SessionMeta | null>(null);
+  const [terminalFont, setTerminalFontState] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    getConfig().then(c => setTerminalFontState(c.terminal_font || undefined)).catch(() => {});
+  }, []);
 
   // On mount: if URL already has #/s/{id}, load that session directly
   useEffect(() => {
@@ -3795,8 +5428,8 @@ export function MobilePage({ username, onLogout, onSwitchToAdmin, theme, onToggl
     setOpenSession(null);
   };
 
-  if (openSession) return <DetailView session={openSession} onBack={closeDetail} username={username} onLogout={onLogout} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
-  return <ListView username={username} onLogout={onLogout} onOpen={openDetail} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
+  if (openSession) return <DetailView session={openSession} onBack={closeDetail} username={username} onLogout={onLogout} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} terminalFont={terminalFont} onTerminalFontChange={setTerminalFontState} />;
+  return <ListView username={username} onLogout={onLogout} onOpen={openDetail} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} terminalFont={terminalFont} onTerminalFontChange={setTerminalFontState} />;
 }
 
 /* ─── Shared micro styles ─── */
