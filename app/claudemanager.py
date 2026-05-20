@@ -57,9 +57,12 @@ term_mgr = TerminalManager(
     tmux,
     idle_grace_getter=lambda: float(get_term_idle_grace_seconds()),
     standby_grace_getter=lambda: float(get_term_standby_grace_seconds()),
+    # Persist alongside data.db so terminals survive a backend restart as long
+    # as their tmux session is still alive.
+    persist_path=_db_path.parent / "terms.json",
 )
-# Reap any leftover cmterm-* tmux sessions from a previous run (in-memory refcounts
-# are gone, so we can't reattach reliably).
+# Reconcile persisted records with live cmterm-* tmux sessions: restore the
+# matches and reap the rest.
 try:
     term_mgr.reap_orphan_tmux_sessions()
 except Exception:
