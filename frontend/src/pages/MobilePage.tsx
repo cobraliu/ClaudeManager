@@ -59,12 +59,15 @@ import {
   getExternalPreview,
   type ExternalPreview,
   getMergeStatus,
+  getMergePreview,
+  getMergeFileDiff,
   gitMergeStart,
   gitMergeAbort,
   gitMergeContinue,
   getMergeConflictFile,
   gitResolveFile,
   type MergeStatus,
+  type MergePreview,
   type ConflictFileVersions,
   listModels,
   setSessionModel,
@@ -1563,6 +1566,8 @@ function MobileMergePanel({
   const [starting, setStarting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [preview, setPreview] = useState<MergePreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   const refresh = useCallback(() =>
     getMergeStatus(sessionId).then(s => { setStatus(s); return s; }).catch(e => { setErr(String(e)); return null; }),
@@ -1577,6 +1582,24 @@ function MobileMergePanel({
       : branches.current || branches.local[0];
     setTarget(def);
   }, [target, branches]);
+
+  // Debounced preview fetch.
+  useEffect(() => {
+    if (!source || !target || source === target) { setPreview(null); return; }
+    let cancelled = false;
+    setPreviewLoading(true);
+    const handle = setTimeout(async () => {
+      try {
+        const p = await getMergePreview(sessionId, source, target);
+        if (!cancelled) setPreview(p);
+      } catch (e) {
+        if (!cancelled) setPreview({ merge_kind: "error", error: String(e) });
+      } finally {
+        if (!cancelled) setPreviewLoading(false);
+      }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(handle); };
+  }, [sessionId, source, target]);
 
   const handleStart = async () => {
     if (!source || !target) return;
@@ -1637,6 +1660,15 @@ function MobileMergePanel({
           {source && target && source === target && (
             <div style={{ fontSize: 12, color: "var(--accent-amber)" }}>Source and target must differ.</div>
           )}
+          {source && target && source !== target && (
+            <MobileMergePreviewBlock
+              sessionId={sessionId}
+              preview={preview}
+              loading={previewLoading}
+              source={source}
+              target={target}
+            />
+          )}
           <button
             disabled={!source || !target || source === target || starting}
             onClick={handleStart}
@@ -1666,6 +1698,227 @@ function MobileMergePanel({
           {msg.text}
         </div>
       )}
+    </div>
+  );
+}
+
+const _MERGE_STATUS_COLOR: Record<string, string> = {
+  M: "var(--accent-amber)", A: "var(--accent-green)", D: "var(--accent-red)",
+  R: "var(--accent-blue)", C: "var(--accent-blue)",
+};
+
+function _mobileStatusBadge(kind: MergePreview["merge_kind"], err?: string): { label: string; color: string; bg: string } {
+  switch (kind) {
+    case "up_to_date": return { label: "✓ Up to date", color: "var(--accent-green)", bg: "rgba(63,185,80,0.12)" };
+    case "fast_forward": return { label: "→ Fast-forward", color: "var(--accent-blue)", bg: "rgba(88,166,255,0.12)" };
+    case "clean": return { label: "✓ Clean merge", color: "var(--accent-green)", bg: "rgba(63,185,80,0.12)" };
+    case "conflict": return { label: "⚠ Would conflict", color: "var(--accent-amber)", bg: "rgba(187,128,9,0.15)" };
+    case "error": return { label: err ? `✕ ${err}` : "✕ Error", color: "var(--accent-red)", bg: "rgba(248,81,73,0.12)" };
+  }
+}
+
+function MobileMergePreviewBlock({
+  sessionId, preview, loading, source, target,
+}: {
+  sessionId: string;
+  preview: MergePreview | null;
+  loading: boolean;
+  source: string;
+  target: string;
+}) {
+  const [tab, setTab] = useState<"commits" | "diff">("commits");
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [diff, setDiff] = useState<string>("");
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const conflictSet = useMemo(
+    () => new Set(preview?.conflicting_files ?? []),
+    [preview],
+  );
+
+  useEffect(() => {
+    const files = preview?.changed_files;
+    if (!files || files.length === 0) { setSelectedFile(null); return; }
+    if (!selectedFile || !files.find(f => f.path === selectedFile)) {
+      setSelectedFile(files[0].path);
+    }
+  }, [preview, selectedFile]);
+
+  useEffect(() => {
+    if (tab !== "diff" || !selectedFile) { setDiff(""); setDiffError(null); return; }
+    let cancelled = false;
+    setDiffLoading(true);
+    setDiffError(null);
+    getMergeFileDiff(sessionId, source, target, selectedFile)
+      .then(r => {
+        if (cancelled) return;
+        if (r.error) { setDiffError(r.error); setDiff(""); }
+        else { setDiff(r.diff || ""); }
+      })
+      .catch(e => { if (!cancelled) { setDiffError(String(e)); setDiff(""); } })
+      .finally(() => { if (!cancelled) setDiffLoading(false); });
+    return () => { cancelled = true; };
+  }, [sessionId, source, target, selectedFile, tab]);
+
+  if (loading && !preview) {
+    return (
+      <div style={{ border: "1px solid var(--bg-hover)", borderRadius: 8, padding: "10px 12px", background: "var(--bg-surface)", fontSize: 12, color: "var(--text-muted)" }}>
+        Loading preview…
+      </div>
+    );
+  }
+  if (!preview) return null;
+  const badge = _mobileStatusBadge(preview.merge_kind, preview.error);
+  const commits = preview.commits ?? [];
+  const files = preview.changed_files ?? [];
+  const showTabs = preview.merge_kind !== "error" && preview.merge_kind !== "up_to_date";
+
+  return (
+    <div style={{ border: "1px solid var(--bg-hover)", borderRadius: 8, background: "var(--bg-surface)", display: "flex", flexDirection: "column", fontSize: 12 }}>
+      <div style={{ padding: "8px 10px", borderBottom: showTabs ? "1px solid var(--bg-hover)" : "none" }}>
+        <div style={{ display: "inline-block", padding: "2px 8px", borderRadius: 4, background: badge.bg, color: badge.color, fontWeight: 600, marginRight: 6 }}>
+          {badge.label}
+        </div>
+        {preview.merge_kind !== "error" && (
+          <div style={{ marginTop: 4, color: "var(--text-muted)", fontSize: 11 }}>
+            <span style={{ color: "var(--accent-blue)", fontFamily: "monospace" }}>{source}</span>:{" "}
+            <span style={{ color: "var(--text-body)" }}>{preview.ahead ?? 0}</span> ahead /{" "}
+            <span style={{ color: "var(--text-body)" }}>{preview.behind ?? 0}</span> behind{" "}
+            <span style={{ color: "var(--accent-amber)", fontFamily: "monospace" }}>{target}</span>
+            {loading && <span style={{ color: "var(--text-faint)", marginLeft: 6 }}>(refreshing…)</span>}
+          </div>
+        )}
+      </div>
+
+      {showTabs && (
+        <>
+          <div style={{ display: "flex", borderBottom: "1px solid var(--bg-hover)" }}>
+            <_MobileMergeTabBtn active={tab === "commits"} onClick={() => setTab("commits")}>
+              Commits{commits.length > 0 ? ` (${commits.length})` : ""}
+            </_MobileMergeTabBtn>
+            <_MobileMergeTabBtn active={tab === "diff"} onClick={() => setTab("diff")}>
+              Code{files.length > 0 ? ` (${files.length})` : ""}
+            </_MobileMergeTabBtn>
+          </div>
+
+          {tab === "commits" ? (
+            commits.length === 0 ? (
+              <div style={{ padding: "10px 12px", color: "var(--text-muted)" }}>(no commits)</div>
+            ) : (
+              <div style={{ maxHeight: 220, overflowY: "auto" }}>
+                {commits.map(c => (
+                  <div key={c.hash} style={{ padding: "6px 10px", borderBottom: "1px solid var(--bg-hover)" }}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                      <span style={{ fontFamily: "monospace", color: "var(--accent-amber)", fontSize: 11 }}>{c.short}</span>
+                      <span style={{ color: "var(--text-faint)", fontSize: 10, marginLeft: "auto" }}>{c.author}</span>
+                    </div>
+                    <div style={{ color: "var(--text-body)", fontSize: 12, marginTop: 2, wordBreak: "break-word" }}>
+                      {c.subject}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          ) : (
+            <_MobileDiffTabBody
+              files={files}
+              conflictSet={conflictSet}
+              selectedFile={selectedFile}
+              onSelectFile={setSelectedFile}
+              diff={diff}
+              diffLoading={diffLoading}
+              diffError={diffError}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function _MobileMergeTabBtn({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        flex: 1,
+        background: active ? "var(--bg-base)" : "transparent",
+        color: active ? "var(--accent-blue)" : "var(--text-secondary)",
+        border: "none",
+        borderBottom: active ? "2px solid var(--accent-blue)" : "2px solid transparent",
+        padding: "8px 0", fontSize: 13, cursor: "pointer", fontWeight: active ? 600 : 400,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function _MobileDiffTabBody({
+  files, conflictSet, selectedFile, onSelectFile,
+  diff, diffLoading, diffError,
+}: {
+  files: Array<{ path: string; status: string }>;
+  conflictSet: Set<string>;
+  selectedFile: string | null;
+  onSelectFile: (p: string) => void;
+  diff: string;
+  diffLoading: boolean;
+  diffError: string | null;
+}) {
+  if (files.length === 0) {
+    return <div style={{ padding: "10px 12px", color: "var(--text-muted)" }}>(no file changes)</div>;
+  }
+  return (
+    <div>
+      {/* File chips, horizontally scrollable */}
+      <div style={{ display: "flex", gap: 6, padding: "8px 10px", overflowX: "auto", borderBottom: "1px solid var(--bg-hover)" }}>
+        {files.map(f => {
+          const isConflict = conflictSet.has(f.path);
+          const isActive = f.path === selectedFile;
+          return (
+            <button
+              key={f.path}
+              onClick={() => onSelectFile(f.path)}
+              title={f.path}
+              style={{
+                flexShrink: 0, padding: "4px 8px", fontSize: 11, fontFamily: "monospace",
+                border: isActive ? "1px solid var(--accent-blue)" : "1px solid var(--bg-hover)",
+                background: isActive ? "rgba(88,166,255,0.15)" : "var(--bg-base)",
+                color: isConflict ? "var(--accent-red)" : "var(--text-body)",
+                borderRadius: 4, cursor: "pointer", maxWidth: 200,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+              }}
+            >
+              <span style={{ color: _MERGE_STATUS_COLOR[f.status] || "var(--text-muted)", marginRight: 4 }}>{f.status}</span>
+              {f.path.split("/").pop()}
+              {isConflict && <span style={{ marginLeft: 4 }}>⚠</span>}
+            </button>
+          );
+        })}
+      </div>
+      {/* Diff viewer */}
+      <div style={{ maxHeight: 280, overflow: "auto", background: "var(--bg-base)" }}>
+        {diffLoading ? (
+          <div style={{ padding: 12, color: "var(--text-muted)" }}>Loading diff…</div>
+        ) : diffError ? (
+          <div style={{ padding: 12, color: "var(--accent-red)" }}>{diffError}</div>
+        ) : !diff ? (
+          <div style={{ padding: 12, color: "var(--text-muted)" }}>(empty diff)</div>
+        ) : (
+          <pre style={{ margin: 0, padding: "6px 10px", fontSize: 11, fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,"Courier New",monospace', whiteSpace: "pre" }}>
+            {diff.split("\n").map((ln, i) => {
+              let color = "var(--text-body)"; let bg = "transparent";
+              if (ln.startsWith("+++") || ln.startsWith("---")) color = "var(--text-faint)";
+              else if (ln.startsWith("@@")) { color = "var(--accent-blue)"; bg = "rgba(88,166,255,0.08)"; }
+              else if (ln.startsWith("+")) { color = "var(--accent-green)"; bg = "rgba(63,185,80,0.08)"; }
+              else if (ln.startsWith("-")) { color = "var(--accent-red)"; bg = "rgba(248,81,73,0.08)"; }
+              else if (ln.startsWith("diff --git")) color = "var(--text-faint)";
+              return <div key={i} style={{ color, background: bg, whiteSpace: "pre" }}>{ln || " "}</div>;
+            })}
+          </pre>
+        )}
+      </div>
     </div>
   );
 }

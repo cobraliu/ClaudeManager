@@ -40,7 +40,7 @@ from app.services.git_service import (
     git_add_commit, git_checkout_branch, git_checkout_remote_branch, git_clone,
     git_conflict_file_versions, git_file_diff, git_file_log, git_file_show,
     git_get_remote, git_graph_log, git_init, git_is_dirty, git_list_branches, git_log,
-    git_merge_abort, git_merge_continue, git_merge_start, git_merge_status,
+    git_merge_abort, git_merge_continue, git_merge_file_diff, git_merge_preview, git_merge_start, git_merge_status,
     git_pull, git_push, git_resolve_file, git_search_commits, git_set_remote,
     git_show_commit, is_git_repo,
     make_commit_message, make_commit_summary,
@@ -1540,6 +1540,20 @@ def _require_session_repo(session_id: str, user_id: str):
 def get_merge_status(session_id: str, user_id: CurrentUser) -> dict:
     session = _require_session_repo(session_id, user_id)
     return git_merge_status(session.cwd)
+
+
+@router.get("/{session_id}/git/merge/preview")
+def preview_merge(session_id: str, source: str, target: str, user_id: CurrentUser) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    return git_merge_preview(session.cwd, source, target)
+
+
+@router.get("/{session_id}/git/merge/file-diff")
+def preview_merge_file_diff(
+    session_id: str, source: str, target: str, path: str, user_id: CurrentUser,
+) -> dict:
+    session = _require_session_repo(session_id, user_id)
+    return git_merge_file_diff(session.cwd, source, target, path)
 
 
 @router.post("/{session_id}/git/merge/start")

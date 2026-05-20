@@ -991,6 +991,38 @@ export function getMergeStatus(sessionId: string): Promise<MergeStatus> {
   return request(`/api/sessions/${sessionId}/git/merge/status`);
 }
 
+export interface MergePreviewCommit {
+  hash: string;
+  short: string;
+  author: string;
+  date: string;
+  subject: string;
+}
+
+export interface MergePreview {
+  merge_kind: "up_to_date" | "fast_forward" | "clean" | "conflict" | "error";
+  ahead?: number;
+  behind?: number;
+  commits?: MergePreviewCommit[];
+  changed_files?: Array<{ path: string; status: string }>;
+  conflicting_files?: string[];
+  error?: string;
+}
+
+export function getMergePreview(
+  sessionId: string, source: string, target: string,
+): Promise<MergePreview> {
+  const q = `source=${encodeURIComponent(source)}&target=${encodeURIComponent(target)}`;
+  return request(`/api/sessions/${sessionId}/git/merge/preview?${q}`);
+}
+
+export function getMergeFileDiff(
+  sessionId: string, source: string, target: string, path: string,
+): Promise<{ diff: string; error?: string }> {
+  const q = `source=${encodeURIComponent(source)}&target=${encodeURIComponent(target)}&path=${encodeURIComponent(path)}`;
+  return request(`/api/sessions/${sessionId}/git/merge/file-diff?${q}`);
+}
+
 export function gitMergeStart(sessionId: string, source: string, target: string): Promise<MergeStartResult> {
   return request(`/api/sessions/${sessionId}/git/merge/start`, {
     method: "POST",
