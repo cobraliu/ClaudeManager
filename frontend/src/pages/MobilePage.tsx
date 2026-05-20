@@ -105,6 +105,7 @@ import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
 import { downloadConversationHtml } from "../lib/exportChat";
 import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
 import { GitGraph } from "../components/GitGraph";
+import { FileIcon, NewFolderIcon } from "../components/FileIcon";
 import type { DirInfoResponse } from "../api/sessionApi";
 
 const MOBILE_PAGE_SIZE = 10;
@@ -2668,20 +2669,6 @@ const FILE_CODE_EXTS = new Set([
   "c","h","cpp","cc","cxx","hpp","rb","php","swift","cs","sql","graphql","proto",
   "tf","hcl","yaml","yml","toml","json","r","lua",
 ]);
-const FILE_EXT_ICONS: Record<string,string> = {
-  py:"🐍",js:"📜",ts:"📘",tsx:"⚛️",jsx:"⚛️",json:"{}",yaml:"📋",yml:"📋",
-  toml:"📋",md:"📝",txt:"📄",csv:"📊",sql:"🗄️",css:"🎨",scss:"🎨",
-  html:"🌐",htm:"🌐",sh:"⚙️",bash:"⚙️",go:"🔵",rs:"🦀",java:"☕",
-  c:"🔷",cpp:"🔷",h:"🔷",rb:"💎",swift:"🍎",db:"🗄️",sqlite:"🗄️",sqlite3:"🗄️",pdf:"📕",
-};
-const FILE_SPECIAL_ICONS: Record<string,string> = {
-  Makefile:"⚙️",Dockerfile:"🐳",".gitignore":"🔍",".env":"🔑","package.json":"📦",
-};
-function mobileFileIcon(name: string): string {
-  if (FILE_SPECIAL_ICONS[name]) return FILE_SPECIAL_ICONS[name];
-  const ext = name.split(".").pop()?.toLowerCase() || "";
-  return FILE_EXT_ICONS[ext] || "📄";
-}
 function mobileFormatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1048576) return `${(bytes/1024).toFixed(1)}K`;
@@ -3379,7 +3366,7 @@ function MobileFileBrowserPanel({
               onTouchCancel={onEntryTouchEnd}
               style={{ padding: `10px 12px 10px ${indent}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: entry.is_skipped ? "default" : "pointer", userSelect: "none", WebkitTouchCallout: "none" }}>
               <span style={{ fontSize: 10, color: "var(--text-faint)", width: 10, flexShrink: 0 }}>{entry.is_skipped ? "" : expanded ? "▼" : "▶"}</span>
-              <span style={{ fontSize: 16 }}>📁</span>
+              <FileIcon isDir isOpen={expanded} size={16} />
               <span style={{ fontSize: 14, color: entry.is_skipped ? "var(--text-faint)" : "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {entry.name}{entry.is_skipped && <span style={{ fontSize: 11, color: "var(--text-faint)" }}> (skipped)</span>}
               </span>
@@ -3398,7 +3385,7 @@ function MobileFileBrowserPanel({
           onTouchEnd={onEntryTouchEnd}
           onTouchCancel={onEntryTouchEnd}
           style={{ padding: `10px 12px 10px ${indent + 18}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: clickable ? "pointer" : "default", userSelect: "none", WebkitTouchCallout: "none" }}>
-          <span style={{ fontSize: 15 }}>{mobileFileIcon(entry.name)}</span>
+          <FileIcon name={entry.name} size={15} />
           <span style={{ fontSize: 14, color: clickable ? "var(--text-primary)" : "var(--text-faint)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
           {entry.size != null && <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{mobileFormatSize(entry.size)}</span>}
         </div>
@@ -3472,7 +3459,7 @@ function MobileFileBrowserPanel({
       <div style={{ padding: "4px 8px 6px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 4, flexShrink: 0, overflowX: "auto" }}>
         <button title="Search" onClick={() => setSheet("search")} style={toolbarBtnStyle}>🔍</button>
         <button title="New file" onClick={() => setSheet("newFile")} style={toolbarBtnStyle}>✚</button>
-        <button title="New folder" onClick={() => setSheet("newFolder")} style={toolbarBtnStyle}>📁</button>
+        <button title="New folder" onClick={() => setSheet("newFolder")} style={{ ...toolbarBtnStyle, display: "flex", alignItems: "center", justifyContent: "center" }}><NewFolderIcon size={15} color="var(--text-body)" /></button>
         <button title="Upload" onClick={() => setSheet("upload")} style={toolbarBtnStyle}>⬆</button>
         <button title="Download workspace .zip" disabled={zipBusy} onClick={handleDownloadZip}
           style={{ ...toolbarBtnStyle, opacity: zipBusy ? 0.4 : 1 }}>{zipBusy ? "…" : "💾"}</button>
@@ -3668,7 +3655,7 @@ function MobileFileSheet(props: MobileFileSheetProps) {
                   <div key={entry.path}
                     onClick={() => props.onPickSearchResult(entry)}
                     style={{ padding: "8px 4px", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ fontSize: 14 }}>{entry.type === "dir" ? "📁" : mobileFileIcon(entry.name)}</span>
+                    <FileIcon name={entry.name} isDir={entry.type === "dir"} size={14} />
                     <span style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</div>
                       <div style={{ fontSize: 10, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.path}</div>
@@ -4372,7 +4359,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
                 if (shellRes) { setShellMinimized(false); return; }
                 try { const r = await openShell(session.id); setShellRes(r); setShellMinimized(false); } catch (e) { alert(String(e)); }
               }, color: shellRes && shellMinimized ? "var(--accent-blue)" : iconMuted, bg: "transparent" },
-            { icon: "📁", title: "Files", onClick: () => setShowFiles(true), color: iconMuted, bg: "transparent" },
+            { icon: <FileIcon isDir size={14} />, title: "Files", onClick: () => setShowFiles(true), color: iconMuted, bg: "transparent" },
             { icon: <img src={gitIcon} style={svgStyle} />, title: "Git", onClick: () => setShowGit(true), color: iconMuted, bg: "transparent" },
             {
               icon: pendingCount > 0
