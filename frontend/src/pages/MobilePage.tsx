@@ -1963,6 +1963,12 @@ function MobileResultHunkView({
 }
 
 /* ─── Mobile Schedule Panel ─── */
+type DelayUnit = "seconds" | "minutes" | "hours";
+const _UNIT_SECS: Record<DelayUnit, number> = { seconds: 1, minutes: 60, hours: 3600 };
+function _toSeconds(value: string, unit: DelayUnit): number {
+  return Math.max(1, parseInt(value, 10) || 1) * _UNIT_SECS[unit];
+}
+
 function MobileSchedulePanel({
   sessionId, tasks, onTasksChange, onClose,
 }: {
@@ -1972,22 +1978,39 @@ function MobileSchedulePanel({
   onClose: () => void;
 }) {
   const [prompt, setPrompt] = useState("");
-  const [delayMins, setDelayMins] = useState("5");
-  const [delaySecs, setDelaySecs] = useState("0");
+  const [delayValue, setDelayValue] = useState("5");
+  const [delayUnit, setDelayUnit] = useState<DelayUnit>("minutes");
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  // Loop value/unit mirror After until the user explicitly edits them
+  // (same UX as the PC ScheduleForm).
+  const [loopValue, setLoopValue] = useState("5");
+  const [loopUnit, setLoopUnit] = useState<DelayUnit>("minutes");
+  const [loopValueTouched, setLoopValueTouched] = useState(false);
+  const [loopUnitTouched, setLoopUnitTouched] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState("");
+
+  useEffect(() => { if (!loopValueTouched) setLoopValue(delayValue); }, [delayValue, loopValueTouched]);
+  useEffect(() => { if (!loopUnitTouched) setLoopUnit(delayUnit); }, [delayUnit, loopUnitTouched]);
 
   const pendingTasks = tasks.filter(t => t.status === "pending");
 
   const submit = async () => {
     if (!prompt.trim()) return;
-    const delay = (parseInt(delayMins) || 0) * 60 + (parseInt(delaySecs) || 0);
+    const delay = _toSeconds(delayValue, delayUnit);
     if (delay <= 0) { setErr("Delay must be > 0"); return; }
+    let loop_seconds: number | null = null;
+    if (loopEnabled) {
+      loop_seconds = _toSeconds(loopValue, loopUnit);
+      if (loop_seconds <= 0) { setErr("Loop interval must be > 0"); return; }
+    }
     setSubmitting(true); setErr("");
     try {
-      const t = await createTask(sessionId, prompt.trim(), delay);
+      const t = await createTask(sessionId, prompt.trim(), delay, loop_seconds);
       onTasksChange([...tasks, t]);
-      setPrompt(""); setDelayMins("5"); setDelaySecs("0");
+      setPrompt(""); setDelayValue("5"); setDelayUnit("minutes");
+      setLoopEnabled(false); setLoopValue("5"); setLoopUnit("minutes");
+      setLoopValueTouched(false); setLoopUnitTouched(false);
     } catch (e) { setErr(String(e)); }
     finally { setSubmitting(false); }
   };
@@ -2016,22 +2039,62 @@ function MobileSchedulePanel({
             rows={3}
             style={{ background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 8, padding: "8px 10px", color: "var(--text-primary)", fontSize: 14, resize: "none", outline: "none", width: "100%", boxSizing: "border-box", fontFamily: "inherit" }}
           />
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <span style={{ fontSize: 13, color: "var(--text-muted)", flexShrink: 0 }}>Delay:</span>
-            <input type="number" min="0" value={delayMins} onChange={(e) => setDelayMins(e.target.value)}
-              style={{ width: 52, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, padding: "4px 6px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "center" }} />
-            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>min</span>
-            <input type="number" min="0" max="59" value={delaySecs} onChange={(e) => setDelaySecs(e.target.value)}
-              style={{ width: 52, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, padding: "4px 6px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "center" }} />
-            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>sec</span>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)", width: 48, flexShrink: 0 }}>After</span>
+            <input
+              type="number" min={1} value={delayValue}
+              onChange={(e) => setDelayValue(e.target.value)}
+              style={{ width: 72, background: "var(--bg-base)", border: "1px solid #374151", borderRadius: 6, padding: "6px 8px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "right" }}
+            />
+            <select
+              value={delayUnit}
+              onChange={(e) => setDelayUnit(e.target.value as DelayUnit)}
+              style={{ background: "var(--bg-hover)", border: "1px solid #374151", borderRadius: 6, color: "var(--text-primary)", fontSize: 13, padding: "6px 8px", cursor: "pointer" }}
+            >
+              <option value="seconds">seconds</option>
+              <option value="minutes">minutes</option>
+              <option value="hours">hours</option>
+            </select>
+            <label
+              title="Repeat this prompt at a fixed interval after each fire"
+              style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto", cursor: "pointer", fontSize: 13, color: loopEnabled ? "#a78bfa" : "var(--text-muted)" }}
+            >
+              <input
+                type="checkbox"
+                checked={loopEnabled}
+                onChange={(e) => setLoopEnabled(e.target.checked)}
+                style={{ cursor: "pointer", margin: 0, width: 16, height: 16 }}
+              />
+              <span>↻ Loop</span>
+            </label>
           </div>
+          {loopEnabled && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <span style={{ fontSize: 13, color: "#a78bfa", width: 48, flexShrink: 0 }}>Every</span>
+              <input
+                type="number" min={1} value={loopValue}
+                onChange={(e) => { setLoopValue(e.target.value); setLoopValueTouched(true); }}
+                style={{ width: 72, background: "var(--bg-base)", border: "1px solid #7c3aed", borderRadius: 6, padding: "6px 8px", color: "var(--text-primary)", fontSize: 14, outline: "none", textAlign: "right" }}
+              />
+              <select
+                value={loopUnit}
+                onChange={(e) => { setLoopUnit(e.target.value as DelayUnit); setLoopUnitTouched(true); }}
+                style={{ background: "var(--bg-hover)", border: "1px solid #7c3aed", borderRadius: 6, color: "var(--text-primary)", fontSize: 13, padding: "6px 8px", cursor: "pointer" }}
+              >
+                <option value="seconds">seconds</option>
+                <option value="minutes">minutes</option>
+                <option value="hours">hours</option>
+              </select>
+              <span style={{ fontSize: 11, color: "var(--text-faint)", marginLeft: "auto" }}>after each fire</span>
+            </div>
+          )}
           {err && <div style={{ fontSize: 12, color: "var(--accent-red)" }}>{err}</div>}
           <button
             onClick={submit}
             disabled={submitting || !prompt.trim()}
-            style={{ background: submitting || !prompt.trim() ? "var(--bg-hover)" : "var(--accent-green)", color: submitting || !prompt.trim() ? "var(--text-faint)" : "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 14, cursor: submitting || !prompt.trim() ? "default" : "pointer" }}
+            style={{ background: submitting || !prompt.trim() ? "var(--bg-hover)" : loopEnabled ? "#7c3aed" : "var(--accent-green)", color: submitting || !prompt.trim() ? "var(--text-faint)" : "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 14, cursor: submitting || !prompt.trim() ? "default" : "pointer" }}
           >
-            {submitting ? "Scheduling…" : "Schedule"}
+            {submitting ? "Scheduling…" : loopEnabled ? "Schedule loop" : "Schedule"}
           </button>
         </div>
 
