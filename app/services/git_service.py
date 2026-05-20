@@ -548,14 +548,20 @@ def git_push(cwd: str) -> dict:
 
 
 def git_pull(cwd: str) -> dict:
-    """Pull current branch from its upstream. Returns {ok, output}."""
+    """Pull current branch. Uses tracking upstream if set; otherwise falls
+    back to origin/<current-branch> so locally-created branches still pull."""
+    current = git_current_branch(cwd)
+    if not current:
+        return {"ok": False, "output": "not on a branch"}
+    has_upstream = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    ).returncode == 0
+    args = ["git", "pull", "--ff-only"]
+    if not has_upstream:
+        args += ["origin", current]
     result = subprocess.run(
-        ["git", "pull", "--ff-only"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=60,
+        args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=60,
     )
     out = (result.stdout + result.stderr).strip()
     return {"ok": result.returncode == 0, "output": out}
@@ -574,16 +580,83 @@ def git_current_branch(cwd: str) -> str:
 
 
 def git_list_branches(cwd: str) -> dict:
-    """Return {current: str, local: [str, ...]} for local branches only."""
+    """Return {current, local, remote_only} for the branch picker.
+
+    remote_only: branches under refs/remotes/origin/ that don't have a local
+    counterpart (excluding origin/HEAD). The picker uses these to offer
+    "fetch + track + checkout" in one action.
+    """
     current = git_current_branch(cwd)
-    result = subprocess.run(
+    local_res = subprocess.run(
         ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
         cwd=cwd, capture_output=True, text=True, encoding="utf-8",
     )
-    if result.returncode != 0:
-        return {"current": current, "local": []}
-    local = [b.strip() for b in result.stdout.splitlines() if b.strip()]
-    return {"current": current, "local": local}
+    local = [b.strip() for b in (local_res.stdout if local_res.returncode == 0 else "").splitlines() if b.strip()]
+
+    remote_res = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    remote_only: list[str] = []
+    if remote_res.returncode == 0:
+        local_set = set(local)
+        for line in remote_res.stdout.splitlines():
+            ref = line.strip()
+            if not ref or ref == "origin/HEAD" or "/HEAD" in ref:
+                continue
+            # Strip "origin/" prefix to get the branch name.
+            if not ref.startswith("origin/"):
+                continue
+            name = ref[len("origin/"):]
+            if name and name not in local_set:
+                remote_only.append(name)
+    return {"current": current, "local": local, "remote_only": remote_only}
+
+
+def git_checkout_remote_branch(cwd: str, branch: str, stash: bool = False) -> dict:
+    """Fetch origin, create a local tracking branch, then check it out.
+
+    Used when the picker selects a branch that exists on origin but has no
+    local counterpart. Conflict semantics match git_checkout_branch.
+    """
+    fetch_res = subprocess.run(
+        ["git", "fetch", "origin", branch],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+    if fetch_res.returncode != 0:
+        return {"ok": False, "output": (fetch_res.stdout + fetch_res.stderr).strip(), "conflict": False}
+
+    stashed = False
+    if stash:
+        current = git_current_branch(cwd) or "detached"
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"claudemanager: WIP on {current} (switching to {branch}) @ {ts}"
+        stash_res = subprocess.run(
+            ["git", "stash", "push", "-u", "-m", msg],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        )
+        if stash_res.returncode != 0:
+            return {"ok": False, "output": stash_res.stderr.strip(), "conflict": False}
+        stashed = "No local changes" not in (stash_res.stdout + stash_res.stderr)
+
+    result = subprocess.run(
+        ["git", "checkout", "-b", branch, "--track", f"origin/{branch}"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    out = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        return {"ok": True, "output": out, "conflict": False, "stashed": stashed}
+
+    if "would be overwritten by checkout" in out or "would be overwritten by merge" in out:
+        conflicting: list[str] = []
+        for line in out.splitlines():
+            stripped = line.strip()
+            if line.startswith("\t") and stripped:
+                conflicting.append(stripped)
+        return {"ok": False, "output": out, "conflict": True, "conflicting_files": conflicting}
+
+    return {"ok": False, "output": out, "conflict": False}
 
 
 def git_checkout_branch(cwd: str, branch: str, stash: bool = False) -> dict:

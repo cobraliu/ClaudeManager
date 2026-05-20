@@ -23,7 +23,7 @@ export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, compac
   const [info, setInfo] = useState<GitBranchInfo | null>(null);
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
-  const [pendingBranch, setPendingBranch] = useState<string | null>(null);
+  const [pending, setPending] = useState<{ branch: string; remote: boolean } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const reload = useCallback(() => {
@@ -45,18 +45,18 @@ export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, compac
   }, [open]);
 
   const current = info?.current ?? "";
-  const branches = (info?.local ?? []).filter(b =>
-    !filter.trim() || b.toLowerCase().includes(filter.trim().toLowerCase())
-  );
+  const f = filter.trim().toLowerCase();
+  const localBranches = (info?.local ?? []).filter(b => !f || b.toLowerCase().includes(f));
+  const remoteBranches = (info?.remote_only ?? []).filter(b => !f || b.toLowerCase().includes(f));
 
-  const handlePick = (branch: string) => {
-    if (branch === current) { setOpen(false); return; }
+  const handlePick = (branch: string, remote: boolean) => {
+    if (!remote && branch === current) { setOpen(false); return; }
     setOpen(false);
-    setPendingBranch(branch);
+    setPending({ branch, remote });
   };
 
   const onSuccess = (branch: string) => {
-    setPendingBranch(null);
+    setPending(null);
     reload();
     onBranchChanged?.(branch);
   };
@@ -83,8 +83,8 @@ export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, compac
         <span style={{ color: "var(--text-faint)", fontSize: 9 }}>▾</span>
       </button>
 
-      {open && info && info.local.length > 0 && (
-        <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 2, zIndex: 100, background: "var(--bg-surface)", border: "1px solid var(--border-strong)", borderRadius: 6, boxShadow: "0 4px 12px rgba(0,0,0,0.4)", minWidth: 220, maxWidth: 320 }}>
+      {open && info && (info.local.length > 0 || (info.remote_only ?? []).length > 0) && (
+        <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 2, zIndex: 100, background: "var(--bg-surface)", border: "1px solid var(--border-strong)", borderRadius: 6, boxShadow: "0 4px 12px rgba(0,0,0,0.4)", minWidth: 240, maxWidth: 340 }}>
           <div style={{ padding: 6, borderBottom: "1px solid var(--bg-hover)" }}>
             <input
               autoFocus
@@ -94,31 +94,58 @@ export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, compac
               style={{ width: "100%", background: "var(--bg-base)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "3px 6px", color: "var(--text-body)", fontSize: 11, outline: "none" }}
             />
           </div>
-          <div style={{ maxHeight: 280, overflowY: "auto", padding: "4px 0" }}>
-            {branches.length === 0 ? (
+          <div style={{ maxHeight: 320, overflowY: "auto", padding: "4px 0" }}>
+            {localBranches.length === 0 && remoteBranches.length === 0 && (
               <div style={{ padding: "6px 10px", fontSize: 11, color: "var(--text-faint)" }}>No matches</div>
-            ) : branches.map(b => (
-              <div
-                key={b}
-                onClick={() => handlePick(b)}
-                style={{ padding: "4px 10px", fontSize: 12, fontFamily: "monospace", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, background: b === current ? "rgba(88,166,255,0.12)" : "transparent", color: b === current ? "var(--accent-blue)" : "var(--text-body)" }}
-                onMouseEnter={(e) => { if (b !== current) (e.currentTarget as HTMLDivElement).style.background = "var(--bg-hover)"; }}
-                onMouseLeave={(e) => { if (b !== current) (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
-              >
-                <span style={{ width: 10, textAlign: "center" }}>{b === current ? "✓" : ""}</span>
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b}</span>
-              </div>
-            ))}
+            )}
+            {localBranches.length > 0 && (
+              <>
+                <div style={{ padding: "2px 10px", fontSize: 9, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Local</div>
+                {localBranches.map(b => (
+                  <div
+                    key={`local-${b}`}
+                    onClick={() => handlePick(b, false)}
+                    style={{ padding: "4px 10px", fontSize: 12, fontFamily: "monospace", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, background: b === current ? "rgba(88,166,255,0.12)" : "transparent", color: b === current ? "var(--accent-blue)" : "var(--text-body)" }}
+                    onMouseEnter={(e) => { if (b !== current) (e.currentTarget as HTMLDivElement).style.background = "var(--bg-hover)"; }}
+                    onMouseLeave={(e) => { if (b !== current) (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
+                  >
+                    <span style={{ width: 10, textAlign: "center" }}>{b === current ? "✓" : ""}</span>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b}</span>
+                  </div>
+                ))}
+              </>
+            )}
+            {remoteBranches.length > 0 && (
+              <>
+                <div style={{ padding: "6px 10px 2px", fontSize: 9, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: "0.05em", borderTop: localBranches.length > 0 ? "1px solid var(--bg-hover)" : "none", marginTop: localBranches.length > 0 ? 4 : 0 }}>Remote (origin) — picking will fetch & track</div>
+                {remoteBranches.map(b => (
+                  <div
+                    key={`remote-${b}`}
+                    onClick={() => handlePick(b, true)}
+                    style={{ padding: "4px 10px", fontSize: 12, fontFamily: "monospace", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, color: "var(--text-body)" }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = "var(--bg-hover)"; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
+                    title="Fetch from origin and create a local tracking branch"
+                  >
+                    <span style={{ width: 10, textAlign: "center", color: "var(--accent-amber)" }}>↓</span>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <span style={{ color: "var(--text-faint)" }}>origin/</span>{b}
+                    </span>
+                  </div>
+                ))}
+              </>
+            )}
           </div>
         </div>
       )}
 
-      {pendingBranch && (
+      {pending && (
         <BranchCheckoutConfirm
           sessionId={sessionId}
-          branch={pendingBranch}
-          onCancel={() => setPendingBranch(null)}
-          onDone={() => onSuccess(pendingBranch)}
+          branch={pending.branch}
+          remote={pending.remote}
+          onCancel={() => setPending(null)}
+          onDone={() => onSuccess(pending.branch)}
         />
       )}
     </div>
@@ -127,10 +154,11 @@ export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, compac
 
 /* ─── Branch checkout confirm — also reused by Revert (see ConfirmAffectingChangeModal) ─── */
 function BranchCheckoutConfirm({
-  sessionId, branch, onCancel, onDone,
+  sessionId, branch, remote = false, onCancel, onDone,
 }: {
   sessionId: string;
   branch: string;
+  remote?: boolean;
   onCancel: () => void;
   onDone: () => void;
 }) {
@@ -154,7 +182,7 @@ function BranchCheckoutConfirm({
     setBusy(true);
     setErr(null);
     try {
-      await gitCheckoutBranch(sessionId, branch, { stash });
+      await gitCheckoutBranch(sessionId, branch, { stash, remote });
       onDone();
     } catch (e) {
       if (e instanceof GitCheckoutConflictError) {
@@ -178,12 +206,20 @@ function BranchCheckoutConfirm({
         onClick={(e) => e.stopPropagation()}
       >
         <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--bg-hover)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-body)" }}>Checkout branch</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-body)" }}>
+            {remote ? "Fetch & track remote branch" : "Checkout branch"}
+          </span>
           <button onClick={onCancel} disabled={busy} style={{ background: "var(--text-faintest)", color: "var(--text-secondary)", fontSize: 12, padding: "3px 8px" }}>✕</button>
         </div>
         <div style={{ padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10, fontSize: 12, color: "var(--text-body)" }}>
           <div>
-            Switching to branch <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{branch}</span>
+            {remote ? (
+              <>
+                Will run <span style={{ fontFamily: "monospace", color: "var(--text-muted)" }}>git fetch origin {branch}</span>, then <span style={{ fontFamily: "monospace", color: "var(--text-muted)" }}>git checkout -b {branch} --track origin/{branch}</span>.
+              </>
+            ) : (
+              <>Switching to branch <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{branch}</span></>
+            )}
             {conflict === null && (
               <span style={{ color: "var(--text-muted)" }}> · uncommitted edits will be carried over if they don't conflict.</span>
             )}

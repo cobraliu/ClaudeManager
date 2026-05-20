@@ -969,6 +969,7 @@ export interface CommitDetail {
 export interface GitBranchInfo {
   current: string;
   local: string[];
+  remote_only?: string[];
   dirty?: boolean;
 }
 
@@ -1019,13 +1020,13 @@ export class GitCheckoutConflictError extends Error {
 export async function gitCheckoutBranch(
   sessionId: string,
   branch: string,
-  opts: { stash?: boolean } = {},
+  opts: { stash?: boolean; remote?: boolean } = {},
 ): Promise<{ ok: boolean; branch: string; output: string; stashed?: boolean }> {
   const token = getToken();
   const resp = await fetch(`/api/sessions/${sessionId}/git/checkout`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ branch, stash: opts.stash ?? false }),
+    body: JSON.stringify({ branch, stash: opts.stash ?? false, remote: opts.remote ?? false }),
   });
   if (resp.status === 409) {
     const body = await resp.json().catch(() => ({}));

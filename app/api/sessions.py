@@ -36,7 +36,8 @@ from app.services.cursor_session_reader import (
     list_all_cursor_sessions_global,
 )
 from app.services.git_service import (
-    git_add_commit, git_checkout_branch, git_clone, git_file_diff, git_file_log, git_file_show,
+    git_add_commit, git_checkout_branch, git_checkout_remote_branch, git_clone,
+    git_file_diff, git_file_log, git_file_show,
     git_get_remote, git_graph_log, git_init, git_is_dirty, git_list_branches, git_log,
     git_pull, git_push, git_search_commits, git_set_remote, git_show_commit, is_git_repo,
     make_commit_message, make_commit_summary,
@@ -1393,6 +1394,8 @@ def list_active_cwd_sessions(session_id: str, user_id: CurrentUser) -> dict:
 class GitCheckoutRequest(BaseModel):
     branch: str = Field(min_length=1, max_length=200)
     stash: bool = False
+    # remote=True → fetch origin/<branch> and create a local tracking branch first.
+    remote: bool = False
 
 
 @router.post("/{session_id}/git/checkout")
@@ -1405,7 +1408,10 @@ def checkout_git_branch(
         raise HTTPException(status_code=404, detail="session not found")
     if not is_git_repo(session.cwd):
         raise HTTPException(status_code=400, detail="not a git repo")
-    result = git_checkout_branch(session.cwd, body.branch, stash=body.stash)
+    if body.remote:
+        result = git_checkout_remote_branch(session.cwd, body.branch, stash=body.stash)
+    else:
+        result = git_checkout_branch(session.cwd, body.branch, stash=body.stash)
     if not result["ok"]:
         if result.get("conflict"):
             raise HTTPException(
