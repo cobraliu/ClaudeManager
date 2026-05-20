@@ -321,31 +321,75 @@ class TerminalManager:
                 return
 
     def _sweep_once(self) -> None:
-        """One sweeper tick: drive idle→standby and standby→kill transitions."""
-        # Read once per tick — keeps the sweeper cheap while still picking up
-        # live config changes without a restart.
+        """One sweeper tick: drive idle→standby and standby→kill transitions.
+
+        Terminals whose pane shell still has descendant processes (a running
+        command, a backgrounded job, an editor) are spared at both transitions
+        — the heartbeat may have lapsed because the browser closed, but the
+        work inside tmux is still live.
+        """
         idle_grace = float(self._idle_grace_getter())
         standby_grace = float(self._standby_grace_getter())
         now = time.time()
-        to_kill: list[TermRecord] = []
+
+        # Pass 1: collect candidates under the lock (cheap).
+        idle_candidates: list[TermRecord] = []   # ready to enter standby
+        kill_candidates: list[TermRecord] = []   # ready to be killed
         with self._lock:
             for rec in list(self._terms.values()):
                 if rec.is_immortal or rec.attach_count > 0:
                     continue
                 if rec.standby_at is None:
                     if now - rec.last_holder_at > idle_grace:
-                        rec.standby_at = now
-                        logger.info(
-                            "term.standby id=%s idle-for=%.0fs",
-                            rec.term_id, now - rec.last_holder_at,
-                        )
+                        idle_candidates.append(rec)
                 else:
                     if now - rec.standby_at > standby_grace:
-                        to_kill.append(rec)
-                        self._terms.pop(rec.term_id, None)
-                        stale = [t for t, tid in self._tokens.items() if tid == rec.term_id]
-                        for t in stale:
-                            self._tokens.pop(t, None)
+                        kill_candidates.append(rec)
+
+        # Pass 2: probe tmux/proc outside the lock (potentially slow).
+        idle_busy: dict[str, bool] = {
+            r.term_id: self._tmux.has_active_children(r.tmux_name)
+            for r in idle_candidates
+        }
+        kill_busy: dict[str, bool] = {
+            r.term_id: self._tmux.has_active_children(r.tmux_name)
+            for r in kill_candidates
+        }
+
+        # Pass 3: apply transitions under the lock.
+        to_kill: list[TermRecord] = []
+        with self._lock:
+            for rec in idle_candidates:
+                if rec.term_id not in self._terms:
+                    continue
+                if idle_busy.get(rec.term_id):
+                    # Active command running — refresh the idle clock so we
+                    # don't churn through this check every tick.
+                    rec.last_holder_at = now
+                    logger.debug("term.busy-skip-standby id=%s", rec.term_id)
+                    continue
+                rec.standby_at = now
+                logger.info(
+                    "term.standby id=%s idle-for=%.0fs",
+                    rec.term_id, now - rec.last_holder_at,
+                )
+            for rec in kill_candidates:
+                if rec.term_id not in self._terms:
+                    continue
+                if kill_busy.get(rec.term_id):
+                    # Revive: pull it back out of standby, restart the idle
+                    # clock. No promotion to `kept` — once the command
+                    # finishes, the term re-enters the normal lifecycle.
+                    rec.standby_at = None
+                    rec.last_holder_at = now
+                    logger.info("term.busy-revive id=%s", rec.term_id)
+                    continue
+                to_kill.append(rec)
+                self._terms.pop(rec.term_id, None)
+                stale = [t for t, tid in self._tokens.items() if tid == rec.term_id]
+                for t in stale:
+                    self._tokens.pop(t, None)
+
         for rec in to_kill:
             try:
                 self._tmux.terminate(rec.tmux_name)

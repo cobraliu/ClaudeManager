@@ -275,6 +275,22 @@ class TmuxService:
         except (TmuxError, ValueError, IndexError):
             return None
 
+    def has_active_children(self, session_name: str) -> bool:
+        """Return True if the pane's shell has any descendant processes.
+
+        Used by the sweeper to keep an ephemeral terminal alive while it has
+        work in flight (a build, an editor, a backgrounded job) even after the
+        browser disconnects and the heartbeat lapses. A clean bash prompt has
+        no descendants, so this only fires when something is actually running.
+        """
+        pid = self.get_pane_pid(session_name)
+        if pid is None:
+            return False
+        try:
+            return bool(self._get_descendants(pid))
+        except OSError:
+            return False
+
     def resolve_claude_session_id_by_inner_id(self, inner_id: str, timeout: float = 15.0) -> tuple[str | None, int | None]:
         """Resolve Claude session ID for a new session using the PID file written by the wrapper sh.
         Returns (sessionId, pid) — either or both may be None on failure."""
