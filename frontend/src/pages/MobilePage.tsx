@@ -52,6 +52,14 @@ import {
   browseCursorSessions,
   getExternalPreview,
   type ExternalPreview,
+  getMergeStatus,
+  gitMergeStart,
+  gitMergeAbort,
+  gitMergeContinue,
+  getMergeConflictFile,
+  gitResolveFile,
+  type MergeStatus,
+  type ConflictFileVersions,
   listModels,
   setSessionModel,
   getSystemFonts,
@@ -961,6 +969,7 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
   const [detailFiles, setDetailFiles] = useState<GitDiffFile[]>([]);
   const [diffFile, setDiffFile] = useState<GitDiffFile | null>(null);
   const [committing, setCommitting] = useState(false);
+  const [showMerge, setShowMerge] = useState(false);
 
   useEffect(() => {
     setLoading(true);
@@ -1123,6 +1132,12 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
                 style={{ fontSize: 11, padding: "3px 8px", background: "var(--bg-hover)", color: "var(--text-secondary)", border: "1px solid #374151", borderRadius: 5 }}
               >
                 .gitignore
+              </button>
+              <button
+                onClick={() => setShowMerge(true)}
+                style={{ fontSize: 11, padding: "3px 8px", background: "var(--bg-hover)", color: "var(--accent-amber)", border: "1px solid #5a4527", borderRadius: 5 }}
+              >
+                Merge
               </button>
             </>
           )}
@@ -1459,6 +1474,479 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
           </div>
         </div>
       )}
+
+      {showMerge && (
+        <MobileMergePanel
+          sessionId={sessionId}
+          branches={branches}
+          onClose={() => setShowMerge(false)}
+          onCompleted={async () => {
+            // Refresh log + branches after a successful merge/abort
+            try {
+              const [info, br] = await Promise.all([
+                getGitInfo(sessionId).catch(() => null),
+                getGitBranches(sessionId).catch(() => branches),
+              ]);
+              if (info) setLog(info.log);
+              setBranches(br);
+            } catch {}
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ─── Mobile Merge Panel ─── */
+
+interface ConflictHunk {
+  startLine: number;
+  endLine: number;
+  ours: string[];
+  theirs: string[];
+}
+
+function parseConflictHunks(content: string): ConflictHunk[] {
+  const lines = content.split("\n");
+  const hunks: ConflictHunk[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].startsWith("<<<<<<<")) {
+      const startLine = i;
+      const ours: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("=======") && !lines[i].startsWith(">>>>>>>")) {
+        ours.push(lines[i]); i++;
+      }
+      const theirs: string[] = [];
+      if (i < lines.length && lines[i].startsWith("=======")) {
+        i++;
+        while (i < lines.length && !lines[i].startsWith(">>>>>>>")) { theirs.push(lines[i]); i++; }
+      }
+      if (i < lines.length && lines[i].startsWith(">>>>>>>")) {
+        hunks.push({ startLine, endLine: i, ours, theirs }); i++;
+      }
+    } else { i++; }
+  }
+  return hunks;
+}
+
+function replaceLines(content: string, startLine: number, endLine: number, replacement: string[]): string {
+  const lines = content.split("\n");
+  lines.splice(startLine, endLine - startLine + 1, ...replacement);
+  return lines.join("\n");
+}
+
+function MobileMergePanel({
+  sessionId, branches, onClose, onCompleted,
+}: {
+  sessionId: string;
+  branches: GitBranchInfo;
+  onClose: () => void;
+  onCompleted: () => void;
+}) {
+  const [status, setStatus] = useState<MergeStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [source, setSource] = useState<string>("");
+  const [target, setTarget] = useState<string>("");
+  const [starting, setStarting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
+
+  const refresh = useCallback(() =>
+    getMergeStatus(sessionId).then(s => { setStatus(s); return s; }).catch(e => { setErr(String(e)); return null; }),
+  [sessionId]);
+
+  useEffect(() => { refresh().finally(() => setLoading(false)); }, [refresh]);
+
+  useEffect(() => {
+    if (target || !branches.local.length) return;
+    const def = branches.local.includes("main") ? "main"
+      : branches.local.includes("master") ? "master"
+      : branches.current || branches.local[0];
+    setTarget(def);
+  }, [target, branches]);
+
+  const handleStart = async () => {
+    if (!source || !target) return;
+    if (source === target) { setErr("Source and target must be different branches."); return; }
+    setStarting(true); setErr(null);
+    try {
+      const r = await gitMergeStart(sessionId, source, target);
+      if (r.up_to_date) { setMsg({ text: `${target} is already up to date with ${source}.`, ok: true }); onCompleted(); return; }
+      if (r.clean) { setMsg({ text: `Merged ${source} into ${target} cleanly.`, ok: true }); onCompleted(); return; }
+      await refresh();
+    } catch (e) {
+      setErr(String(e).replace(/^Error:\s*/, ""));
+    } finally { setStarting(false); }
+  };
+
+  const selectStyle: React.CSSProperties = {
+    background: "var(--bg-surface)", color: "var(--text-body)",
+    border: "1px solid var(--border)", borderRadius: 6,
+    padding: "8px 10px", fontSize: 14, fontFamily: "monospace", width: "100%",
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 280, display: "flex", flexDirection: "column" }}>
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Merge</span>
+      </div>
+
+      {loading ? (
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)" }}>Loading merge status…</div>
+      ) : status?.in_progress ? (
+        <MobileMergeResolver
+          sessionId={sessionId}
+          status={status}
+          onStatusChange={setStatus}
+          onCompleted={() => { setStatus(null); onCompleted(); onClose(); }}
+          setMsg={setMsg}
+        />
+      ) : branches.local.length < 2 ? (
+        <div style={{ padding: 20, color: "var(--text-muted)", fontSize: 13 }}>Need at least 2 local branches to merge.</div>
+      ) : (
+        <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Merge a source branch into a target branch.</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ fontSize: 12, color: "var(--text-muted)" }}>Source</label>
+            <select value={source} onChange={(e) => setSource(e.target.value)} style={selectStyle}>
+              <option value="">— select source —</option>
+              {branches.local.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ fontSize: 12, color: "var(--text-muted)" }}>Target</label>
+            <select value={target} onChange={(e) => setTarget(e.target.value)} style={selectStyle}>
+              <option value="">— select target —</option>
+              {branches.local.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          {source && target && source === target && (
+            <div style={{ fontSize: 12, color: "var(--accent-amber)" }}>Source and target must differ.</div>
+          )}
+          <button
+            disabled={!source || !target || source === target || starting}
+            onClick={handleStart}
+            style={{
+              background: !source || !target || source === target ? "var(--bg-hover)" : "var(--accent-blue)",
+              color: !source || !target || source === target ? "var(--text-faint)" : "#fff",
+              fontSize: 14, padding: "10px 18px", borderRadius: 8, border: "none", marginTop: 4,
+            }}
+          >
+            {starting ? "Merging…" : "Start Merge"}
+          </button>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
+            Checks out <span style={{ fontFamily: "monospace" }}>{target || "<target>"}</span> (if not already), then runs
+            {" "}<span style={{ fontFamily: "monospace" }}>git merge --no-ff --no-edit {source || "<source>"}</span>.
+            On conflict, you'll get a per-file resolver.
+          </div>
+          {err && (
+            <div style={{ background: "rgba(248,81,73,0.12)", border: "1px solid var(--accent-red)", borderRadius: 6, padding: "10px 12px", color: "var(--text-body)", fontSize: 12, whiteSpace: "pre-wrap" }}>
+              {err}
+            </div>
+          )}
+        </div>
+      )}
+
+      {msg && (
+        <div onClick={() => setMsg(null)} style={{ position: "absolute", bottom: 16, left: 16, right: 16, background: "var(--bg-hover)", border: `1px solid ${msg.ok ? "var(--accent-green)" : "var(--accent-red)"}`, borderRadius: 8, padding: "10px 14px", color: msg.ok ? "var(--accent-green)" : "var(--accent-red)", fontSize: 13 }}>
+          {msg.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MobileMergeResolver({
+  sessionId, status, onStatusChange, onCompleted, setMsg,
+}: {
+  sessionId: string;
+  status: MergeStatus;
+  onStatusChange: (s: MergeStatus) => void;
+  onCompleted: () => void;
+  setMsg: (m: { text: string; ok: boolean } | null) => void;
+}) {
+  const files = status.conflicted_files;
+  const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"abort" | "continue" | null>(null);
+  const [confirmAbort, setConfirmAbort] = useState(false);
+
+  const handleContinue = async () => {
+    setBusy("continue");
+    try {
+      const r = await gitMergeContinue(sessionId);
+      setMsg({ text: r.output || "Merge completed.", ok: true });
+      onCompleted();
+    } catch (e) {
+      setMsg({ text: String(e), ok: false });
+    } finally { setBusy(null); }
+  };
+  const doAbort = async () => {
+    setBusy("abort");
+    try {
+      const r = await gitMergeAbort(sessionId);
+      setMsg({ text: r.output || "Merge aborted.", ok: true });
+      onCompleted();
+    } catch (e) {
+      setMsg({ text: String(e), ok: false });
+    } finally { setBusy(null); setConfirmAbort(false); }
+  };
+
+  const allResolved = files.length === 0;
+
+  if (activeFile) {
+    return (
+      <MobileFileResolver
+        sessionId={sessionId}
+        path={activeFile}
+        onBack={() => setActiveFile(null)}
+        onResolved={(s) => { onStatusChange(s); setActiveFile(null); }}
+        setMsg={setMsg}
+      />
+    );
+  }
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+      <div style={{ padding: "10px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+        <div style={{ fontSize: 13, color: "var(--text-body)" }}>
+          Merging <span style={{ fontFamily: "monospace", color: "var(--accent-amber)" }}>{status.merge_head}</span> → <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{status.current_branch}</span>
+        </div>
+        <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
+          {allResolved ? "All conflicts resolved." : `${files.length} file${files.length === 1 ? "" : "s"} remaining`}
+        </div>
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {files.length === 0 ? (
+          <div style={{ padding: 32, textAlign: "center", color: "var(--accent-green)", fontSize: 14 }}>✓ All resolved — tap Continue Merge below.</div>
+        ) : (
+          files.map(f => (
+            <button
+              key={f}
+              onClick={() => setActiveFile(f)}
+              style={{
+                display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between",
+                padding: "14px 16px", background: "transparent", border: "none",
+                borderBottom: "1px solid var(--border-subtle)",
+                color: "var(--text-bright)", fontSize: 13, fontFamily: "monospace", textAlign: "left", cursor: "pointer",
+              }}
+            >
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{f}</span>
+              <span style={{ fontSize: 16, color: "var(--text-muted)", flexShrink: 0, marginLeft: 8 }}>›</span>
+            </button>
+          ))
+        )}
+      </div>
+
+      <div style={{ flexShrink: 0, padding: "12px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-surface)", display: "flex", gap: 8 }}>
+        <button
+          onClick={() => setConfirmAbort(true)} disabled={busy !== null}
+          style={{ flex: 1, background: "var(--bg-hover)", color: "var(--accent-red)", border: "1px solid var(--accent-red)", borderRadius: 6, padding: "10px 14px", fontSize: 13 }}
+        >
+          {busy === "abort" ? "Aborting…" : "Abort"}
+        </button>
+        <button
+          disabled={!allResolved || busy !== null}
+          onClick={handleContinue}
+          style={{
+            flex: 1,
+            background: allResolved && busy === null ? "var(--accent-green)" : "var(--bg-hover)",
+            color: allResolved && busy === null ? "#fff" : "var(--text-faint)",
+            border: "none", borderRadius: 6, padding: "10px 14px", fontSize: 13, fontWeight: 600,
+          }}
+        >
+          {busy === "continue" ? "Committing…" : "Continue"}
+        </button>
+      </div>
+
+      {confirmAbort && (
+        <div onClick={busy ? undefined : () => setConfirmAbort(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 300, display: "flex", alignItems: "flex-end" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", background: "var(--bg-surface)", borderRadius: "16px 16px 0 0", padding: "16px 16px 28px", display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 4px" }} />
+            <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-bright)" }}>Abort merge?</div>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.5 }}>
+              This restores the working tree to its state before the merge started. Any resolutions you've saved will be lost.
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button onClick={() => setConfirmAbort(false)} disabled={busy !== null}
+                style={{ flex: 1, background: "var(--bg-hover)", color: "var(--text-secondary)", border: "none", borderRadius: 6, padding: "10px 14px", fontSize: 13 }}>Cancel</button>
+              <button onClick={doAbort} disabled={busy !== null}
+                style={{ flex: 1, background: "var(--accent-red)", color: "#fff", border: "none", borderRadius: 6, padding: "10px 14px", fontSize: 13, fontWeight: 600 }}>
+                {busy === "abort" ? "Aborting…" : "Abort Merge"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MobileFileResolver({
+  sessionId, path, onBack, onResolved, setMsg,
+}: {
+  sessionId: string;
+  path: string;
+  onBack: () => void;
+  onResolved: (s: MergeStatus) => void;
+  setMsg: (m: { text: string; ok: boolean } | null) => void;
+}) {
+  const [versions, setVersions] = useState<ConflictFileVersions | null>(null);
+  const [result, setResult] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [tab, setTab] = useState<"result" | "ours" | "theirs">("result");
+
+  useEffect(() => {
+    setLoading(true);
+    getMergeConflictFile(sessionId, path)
+      .then(v => { setVersions(v); setResult(v.working); })
+      .catch(e => setMsg({ text: String(e), ok: false }))
+      .finally(() => setLoading(false));
+  }, [sessionId, path, setMsg]);
+
+  const hunks = useMemo(() => parseConflictHunks(result), [result]);
+  const acceptHunk = (hunk: ConflictHunk, choice: "ours" | "theirs" | "both") => {
+    const replacement = choice === "ours" ? hunk.ours : choice === "theirs" ? hunk.theirs : [...hunk.ours, ...hunk.theirs];
+    setResult(prev => replaceLines(prev, hunk.startLine, hunk.endLine, replacement));
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const r = await gitResolveFile(sessionId, path, result);
+      setMsg({ text: `Resolved ${path}`, ok: true });
+      onResolved(r.status);
+    } catch (e) {
+      setMsg({ text: String(e), ok: false });
+    } finally { setSaving(false); }
+  };
+
+  const hasMarkers = hunks.length > 0;
+  const codeStyle: React.CSSProperties = {
+    margin: 0, padding: "10px 12px", fontSize: 11, lineHeight: 1.5,
+    fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,monospace',
+    whiteSpace: "pre", color: "var(--text-body)", overflow: "auto",
+  };
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "8px 12px", display: "flex", alignItems: "center", gap: 8 }}>
+        <button onClick={onBack} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 20, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <span style={{ flex: 1, minWidth: 0, fontSize: 12, fontFamily: "monospace", color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{path}</span>
+      </div>
+
+      <div style={{ flexShrink: 0, display: "flex", borderBottom: "1px solid var(--border)", background: "var(--bg-surface)" }}>
+        {([
+          ["result", "Result", "var(--text-body)"],
+          ["ours", "Ours", "var(--accent-blue)"],
+          ["theirs", "Theirs", "var(--accent-amber)"],
+        ] as const).map(([id, label, color]) => (
+          <button
+            key={id} onClick={() => setTab(id)}
+            style={{
+              flex: 1, background: "transparent", border: "none",
+              borderBottom: tab === id ? `2px solid ${color}` : "2px solid transparent",
+              color: tab === id ? color : "var(--text-faint)",
+              fontSize: 12, fontWeight: 600, padding: "8px 0", cursor: "pointer",
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto", background: "var(--bg-base)" }}>
+        {loading || !versions ? (
+          <div style={{ padding: 40, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>
+        ) : tab === "ours" ? (
+          <pre style={codeStyle}>{versions.ours}</pre>
+        ) : tab === "theirs" ? (
+          <pre style={codeStyle}>{versions.theirs}</pre>
+        ) : (
+          <MobileResultHunkView content={result} hunks={hunks} onAccept={acceptHunk} />
+        )}
+      </div>
+
+      <div style={{ flexShrink: 0, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-surface)", display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 11, color: "var(--text-muted)", flex: 1 }}>
+          {hasMarkers ? `${hunks.length} unresolved hunk${hunks.length === 1 ? "" : "s"}` : "No markers — ready"}
+        </span>
+        <button
+          disabled={hasMarkers || saving}
+          onClick={handleSave}
+          style={{
+            background: !hasMarkers && !saving ? "var(--accent-blue)" : "var(--bg-hover)",
+            color: !hasMarkers && !saving ? "#fff" : "var(--text-faint)",
+            border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 13, fontWeight: 600,
+          }}
+        >
+          {saving ? "Saving…" : "Mark Resolved"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MobileResultHunkView({
+  content, hunks, onAccept,
+}: {
+  content: string;
+  hunks: ConflictHunk[];
+  onAccept: (h: ConflictHunk, choice: "ours" | "theirs" | "both") => void;
+}) {
+  const lines = content.split("\n");
+  type Segment = { kind: "text"; text: string } | { kind: "hunk"; hunk: ConflictHunk };
+  const segments: Segment[] = [];
+  let cursor = 0;
+  for (const h of hunks) {
+    if (h.startLine > cursor) segments.push({ kind: "text", text: lines.slice(cursor, h.startLine).join("\n") });
+    segments.push({ kind: "hunk", hunk: h });
+    cursor = h.endLine + 1;
+  }
+  if (cursor < lines.length) segments.push({ kind: "text", text: lines.slice(cursor).join("\n") });
+
+  const codeStyle: React.CSSProperties = {
+    margin: 0, padding: "4px 12px", fontSize: 11, lineHeight: 1.5,
+    fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,monospace',
+    whiteSpace: "pre", color: "var(--text-body)", overflow: "auto",
+  };
+
+  return (
+    <div>
+      {segments.length === 0 && (
+        <div style={{ padding: 16, fontSize: 13, color: "var(--text-muted)" }}>(empty)</div>
+      )}
+      {segments.map((seg, i) => {
+        if (seg.kind === "text") {
+          if (!seg.text) return null;
+          return <pre key={i} style={codeStyle}>{seg.text}</pre>;
+        }
+        const h = seg.hunk;
+        return (
+          <div key={i} style={{ margin: "8px 10px", border: "1px solid var(--accent-amber)", borderRadius: 6, overflow: "hidden", background: "var(--bg-surface)" }}>
+            <div style={{ padding: "8px 10px", background: "rgba(187,128,9,0.15)", display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ fontSize: 11, color: "var(--accent-amber)", fontWeight: 600 }}>Conflict</div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => onAccept(h, "ours")} style={{ flex: 1, background: "var(--accent-blue)", color: "#fff", border: "none", borderRadius: 4, padding: "6px 0", fontSize: 11 }}>Ours</button>
+                <button onClick={() => onAccept(h, "theirs")} style={{ flex: 1, background: "var(--accent-amber)", color: "#000", border: "none", borderRadius: 4, padding: "6px 0", fontSize: 11 }}>Theirs</button>
+                <button onClick={() => onAccept(h, "both")} style={{ flex: 1, background: "var(--bg-hover)", color: "var(--text-body)", border: "1px solid var(--border)", borderRadius: 4, padding: "6px 0", fontSize: 11 }}>Both</button>
+              </div>
+            </div>
+            <div style={{ borderTop: "1px solid var(--border-subtle)", background: "rgba(88,166,255,0.06)" }}>
+              <div style={{ padding: "2px 10px", fontSize: 10, color: "var(--accent-blue)", background: "rgba(88,166,255,0.12)" }}>Ours</div>
+              <pre style={codeStyle}>{h.ours.join("\n")}</pre>
+            </div>
+            <div style={{ borderTop: "1px solid var(--border-subtle)", background: "rgba(187,128,9,0.06)" }}>
+              <div style={{ padding: "2px 10px", fontSize: 10, color: "var(--accent-amber)", background: "rgba(187,128,9,0.12)" }}>Theirs</div>
+              <pre style={codeStyle}>{h.theirs.join("\n")}</pre>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
