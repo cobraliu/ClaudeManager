@@ -47,6 +47,9 @@ import {
   browseExternalSessions,
   listModels,
   setSessionModel,
+  getSystemFonts,
+  setTerminalFont,
+  type FontInfo,
   listSessionTodos,
   listGoals,
   listSessionAuqs,
@@ -81,6 +84,10 @@ import { PromptText } from "../components/SessionCard";
 import { UsageBar } from "../components/UsageBar";
 import { WsClient } from "../lib/wsClient";
 import { ClaudeCapsModal } from "../components/ClaudeCapsModal";
+import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
+import { downloadConversationHtml } from "../lib/exportChat";
+import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
+import type { DirInfoResponse } from "../api/sessionApi";
 
 const MOBILE_PAGE_SIZE = 10;
 const POLL_INTERVAL = 1000;
@@ -409,7 +416,7 @@ function _writeListCache(items: SessionMeta[], total: number) {
   } catch { /* quota — ignore */ }
 }
 
-function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggleTheme }: { username: string; onLogout: () => void; onOpen: (s: SessionMeta) => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void }) {
+function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggleTheme, terminalFont, onTerminalFontChange }: { username: string; onLogout: () => void; onOpen: (s: SessionMeta) => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void; terminalFont?: string; onTerminalFontChange?: (font: string) => void }) {
   const isAdmin = localStorage.getItem("role") === "admin";
   const cached = _readListCache();
   const [sessions, setSessions] = useState<SessionMeta[]>(cached?.items ?? []);
@@ -422,6 +429,7 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
   const [showImport, setShowImport] = useState(false);
   const [workspaceBase, setWorkspaceBase] = useState("/workspace");
   const [restarting, setRestarting] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [showAllSessions, setShowAllSessions] = useState<boolean>(
     () => localStorage.getItem("mobileShowAllSessions") === "1",
   );
@@ -521,6 +529,10 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
               {theme === "light" ? "🌙" : "☀️"}
             </button>
           )}
+          <button onClick={() => setShowSettings(true)} title="Settings"
+            style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-muted)", fontSize: 14, padding: "4px 7px", cursor: "pointer" }}>
+            ⚙
+          </button>
           {onSwitchToAdmin && (
             <button onClick={onSwitchToAdmin}
               style={{ fontSize: 12, padding: "5px 10px", background: "rgba(88,166,255,0.12)", color: "var(--accent-blue)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 6 }}>
@@ -646,6 +658,11 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
           }}
         />
       )}
+      <MobileSettingsPanel
+        open={showSettings} onClose={() => setShowSettings(false)}
+        theme={theme} onToggleTheme={onToggleTheme}
+        terminalFont={terminalFont} onTerminalFontChange={onTerminalFontChange}
+      />
     </div>
   );
 }
@@ -1712,7 +1729,7 @@ const ROW1_NAV = [
   { label: "→",   seq: "\x1b[C", title: "Arrow Right" },
 ];
 
-function MobileShellPanel({ cwd, res, onClose }: { cwd: string; res: AttachResponse; onClose: () => void }) {
+function MobileShellPanel({ cwd, res, onClose, fontFamily }: { cwd: string; res: AttachResponse; onClose: () => void; fontFamily?: string }) {
   const sendRawRef = useRef<((data: string) => void) | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
@@ -1758,12 +1775,13 @@ function MobileShellPanel({ cwd, res, onClose }: { cwd: string; res: AttachRespo
       {/* Terminal */}
       <div style={{ flex: 1, overflow: "hidden", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
         <TerminalPane
-          key={res.session_id + res.ws_token}
+          key={res.session_id + res.ws_token + (fontFamily || "")}
           sessionId={res.session_id}
           wsUrl={res.ws_url}
           onDisconnect={onClose}
           defaultFit
           showWideToggle
+          fontFamily={fontFamily}
           sendRawRef={sendRawRef}
         />
       </div>
@@ -2431,17 +2449,17 @@ function MobileFileBrowserPanel({
     finally { setGitDetailLoading(false); }
   }, [sessionId, sheetTarget, gitCommit]);
 
+  const [dlModalInfo, setDlModalInfo] = useState<DirInfoResponse | null>(null);
   const handleDownloadZip = useCallback(async () => {
     setZipBusy(true);
     try {
       const info = await getDirInfo(sessionId, "");
-      const compress = info.total_size > 16 * 1024 * 1024;
       if (info.total_size > 100 * 1024 * 1024) {
-        if (!window.confirm(`Workspace is ${(info.total_size / 1024 / 1024).toFixed(1)}MB. Download anyway?`)) {
-          setZipBusy(false); return;
-        }
+        setDlModalInfo(info);
+      } else {
+        const compress = info.total_size > 16 * 1024 * 1024;
+        await downloadDirZip(sessionId, "", [], compress);
       }
-      await downloadDirZip(sessionId, "", [], compress);
     } catch (e) { alert(String(e)); }
     finally { setZipBusy(false); }
   }, [sessionId]);
@@ -2698,6 +2716,14 @@ function MobileFileBrowserPanel({
           gitDiff={gitDiff} gitFull={gitFull} gitDetailLoading={gitDetailLoading}
           onPickGitCommit={openGitCommit}
           onBackToGitHistory={() => setSheet("gitHistory")}
+        />
+      )}
+      {dlModalInfo && (
+        <DownloadExclusionModal
+          sessionId={sessionId}
+          basePath=""
+          info={dlModalInfo}
+          onClose={() => setDlModalInfo(null)}
         />
       )}
     </div>
@@ -3042,7 +3068,7 @@ function relTime(iso: string): string {
 
 function SessionDrawer({
   open, onClose, onOpen, currentSession, onNewSession,
-  onImport, onLogout, onSwitchToAdmin, theme, onToggleTheme, username,
+  onImport, onLogout, onSwitchToAdmin, theme, onToggleTheme, username, onOpenSettings,
 }: {
   open: boolean; onClose: () => void;
   onOpen: (s: SessionMeta) => void;
@@ -3054,6 +3080,7 @@ function SessionDrawer({
   theme?: "dark" | "light";
   onToggleTheme?: () => void;
   username: string;
+  onOpenSettings?: () => void;
 }) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [loading, setLoading] = useState(false);
@@ -3264,6 +3291,9 @@ function SessionDrawer({
                 {theme === "light" ? "🌙" : "☀️"}
               </button>
             )}
+            {onOpenSettings && (
+              <button onClick={() => { onClose(); onOpenSettings(); }} style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 7, color: "var(--text-muted)", fontSize: 14, padding: "4px 8px", cursor: "pointer" }} title="Settings">⚙</button>
+            )}
             {onSwitchToAdmin && (
               <button onClick={() => { onSwitchToAdmin(); onClose(); }} style={{ background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", borderRadius: 7, color: "var(--accent-blue)", fontSize: 12, padding: "4px 10px", cursor: "pointer" }}>
                 Admin
@@ -3279,13 +3309,16 @@ function SessionDrawer({
   );
 }
 
-function DetailView({ session: initialSession, onBack, username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: {
+function DetailView({ session: initialSession, onBack, username, onLogout, onSwitchToAdmin, theme, onToggleTheme, terminalFont, onTerminalFontChange }: {
   session: SessionMeta; onBack: () => void; username: string;
   onLogout: () => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void;
+  terminalFont?: string; onTerminalFontChange?: (font: string) => void;
 }) {
   const [session, setSession] = useState(initialSession);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [showCaps, setShowCaps] = useState(false);
+  const [showJsonl, setShowJsonl] = useState(false);
   const [fontSize, setFontSize] = useState<number>(() => Number(localStorage.getItem("cm_mobile_font") || 13));
   const changeFontSize = (delta: number) => setFontSize(prev => {
     const next = Math.min(20, Math.max(10, prev + delta));
@@ -3343,6 +3376,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const showResumeSelectRef = useRef(false);
   const showModelPickerRef = useRef(false);
   const showCapsRef = useRef(false);
+  const showJsonlRef = useRef(false);
   const stopResponseRef = useRef<(() => void) | null>(null);
   const convRefreshRef = useRef<(() => void) | null>(null);
   const showTasksRef = useRef(false);
@@ -3358,6 +3392,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   showResumeSelectRef.current = showResumeSelect;
   showModelPickerRef.current = showModelPicker;
   showCapsRef.current = showCaps;
+  showJsonlRef.current = showJsonl;
 
   // Push history entry when this view mounts; handle all back navigation here.
   useEffect(() => {
@@ -3374,6 +3409,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       if (showResumeSelectRef.current) { setShowResumeSelect(false); return; }
       if (showModelPickerRef.current) { setShowModelPicker(false); return; }
       if (showCapsRef.current) { setShowCaps(false); return; }
+      if (showJsonlRef.current) { setShowJsonl(false); return; }
       onBack();
     };
     window.addEventListener("popstate", handlePop);
@@ -3392,6 +3428,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   useEffect(() => { if (showResumeSelect) history.pushState({ mobileDetail: true, sub: "resumeSelect" }, ""); }, [showResumeSelect]);
   useEffect(() => { if (showModelPicker) history.pushState({ mobileDetail: true, sub: "modelPicker" }, ""); }, [showModelPicker]);
   useEffect(() => { if (showCaps) history.pushState({ mobileDetail: true, sub: "caps" }, ""); }, [showCaps]);
+  useEffect(() => { if (showJsonl) history.pushState({ mobileDetail: true, sub: "jsonl" }, ""); }, [showJsonl]);
 
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTask[]>(initialSession.scheduled_tasks ?? []);
 
@@ -3548,6 +3585,18 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
               ? { icon: "▶", title: "Resume", onClick: async () => { try { await resumeSession(session.id); setSession((s) => ({ ...s, status: "running" })); } catch (e) { alert(String(e)); } }, color: "var(--accent-green)", bg: "transparent" }
               : { icon: "⏹", title: "Terminate", onClick: async () => { try { await terminateSession(session.id); onBack(); } catch {} }, color: "var(--accent-red)", bg: "transparent" },
             { icon: "⚙", title: "Claude Capabilities", onClick: () => setShowCaps(true), color: iconMuted, bg: "transparent" },
+            {
+              icon: <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: -0.3 }}>HTML</span>,
+              title: "Export chat as HTML",
+              onClick: async () => { try { await downloadConversationHtml(session); } catch (e) { alert(String(e)); } },
+              color: iconMuted, bg: "transparent",
+            },
+            ...(session.claude_session_id ? [{
+              icon: <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: -0.3 }}>JSON</span>,
+              title: "Preview conversation.jsonl",
+              onClick: () => setShowJsonl(true),
+              color: iconMuted, bg: "transparent",
+            }] : []),
           ];
           // With 12+ buttons, even-grid would shrink each below tap-target size on narrow
           // phones. Use flex with a min-width per button and let it scroll horizontally
@@ -3577,9 +3626,15 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         theme={theme}
         onToggleTheme={onToggleTheme}
         username={username}
+        onOpenSettings={() => setShowSettings(true)}
+      />
+      <MobileSettingsPanel
+        open={showSettings} onClose={() => setShowSettings(false)}
+        theme={theme} onToggleTheme={onToggleTheme}
+        terminalFont={terminalFont} onTerminalFontChange={onTerminalFontChange}
       />
 
-      {shellRes && <MobileShellPanel cwd={session.cwd} res={shellRes} onClose={() => history.back()} />}
+      {shellRes && <MobileShellPanel cwd={session.cwd} res={shellRes} onClose={() => history.back()} fontFamily={terminalFont} />}
       {showFiles && (
         <MobileFileBrowserPanel
           sessionId={session.id}
@@ -3607,6 +3662,16 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       {showTasks && <MobileTasksPanel sessionId={session.id} onClose={() => history.back()} />}
       {showGoals && <MobileGoalsPanel sessionId={session.id} onClose={() => history.back()} />}
       {showAuqs && <MobileAuqsPanel sessionId={session.id} onClose={() => history.back()} />}
+      {showJsonl && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 3000, background: "var(--bg-base)", display: "flex", flexDirection: "column" }}>
+          <JsonlPreviewModal
+            inline
+            sessionId={session.id}
+            sessionTitle={session.project}
+            onClose={() => history.back()}
+          />
+        </div>
+      )}
 
       {showModelPicker && (
         <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}
@@ -3689,9 +3754,10 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       {tuiWs && (
         <div style={{ flex: 1, minHeight: 0, display: viewMode === "tui" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
           <TuiPane
-            key={tuiWs.token}
+            key={tuiWs.token + (terminalFont || "")}
             wsUrl={tuiWs.url}
             theme={theme}
+            fontFamily={terminalFont}
             scrollToBottomRef={tuiScrollBottomRef}
             sendRawRef={tuiSendRawRef}
           />
@@ -3762,8 +3828,112 @@ function parseSessionHash(): string | null {
 }
 
 /* ─── Top-level Mobile Page ─── */
+// ────────────────────────────────────────────────────────────────────────────
+// MobileSettingsPanel — bottom sheet for theme + terminal font
+// ────────────────────────────────────────────────────────────────────────────
+function MobileSettingsPanel({ open, onClose, theme, onToggleTheme, terminalFont, onTerminalFontChange }: {
+  open: boolean; onClose: () => void;
+  theme?: "dark" | "light"; onToggleTheme?: () => void;
+  terminalFont?: string; onTerminalFontChange?: (font: string) => void;
+}) {
+  const [fontList, setFontList] = useState<FontInfo[]>([]);
+  const [fontLoading, setFontLoading] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || fontList.length > 0) return;
+    setFontLoading(true);
+    getSystemFonts().then(f => { setFontList(f); setFontLoading(false); }).catch(() => setFontLoading(false));
+  }, [open, fontList.length]);
+
+  if (!open) return null;
+
+  const filtered = fontList.filter(f => !filter || f.family.toLowerCase().includes(filter.toLowerCase()));
+
+  const applyFont = async (family: string) => {
+    try {
+      const c = await setTerminalFont(family);
+      onTerminalFontChange?.(c.terminal_font);
+      setMsg(`Set to "${family}". Reattach session to take full effect.`);
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 3500, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxHeight: "85vh", background: "var(--bg-surface)", borderRadius: "12px 12px 0 0", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-bright)" }}>⚙ Settings</span>
+          <button onClick={onClose} style={{ background: "var(--bg-hover)", border: "none", color: "var(--text-secondary)", fontSize: 13, padding: "4px 12px", borderRadius: 6, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 20 }}>
+          {/* Theme */}
+          {onToggleTheme && (
+            <section>
+              <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.6, color: "var(--text-faint)", marginBottom: 8, fontWeight: 600 }}>Theme</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => { if (theme !== "dark") onToggleTheme(); }}
+                  style={{ flex: 1, padding: "10px 12px", borderRadius: 8, fontSize: 13, border: `1px solid ${theme === "dark" ? "var(--accent-blue)" : "var(--border)"}`, background: theme === "dark" ? "rgba(88,166,255,0.12)" : "var(--bg-base)", color: theme === "dark" ? "var(--accent-blue)" : "var(--text-body)", cursor: "pointer" }}
+                >🌙 Dark</button>
+                <button
+                  onClick={() => { if (theme !== "light") onToggleTheme(); }}
+                  style={{ flex: 1, padding: "10px 12px", borderRadius: 8, fontSize: 13, border: `1px solid ${theme === "light" ? "var(--accent-blue)" : "var(--border)"}`, background: theme === "light" ? "rgba(88,166,255,0.12)" : "var(--bg-base)", color: theme === "light" ? "var(--accent-blue)" : "var(--text-body)", cursor: "pointer" }}
+                >☀️ Light</button>
+              </div>
+            </section>
+          )}
+          {/* Terminal font */}
+          <section>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.6, color: "var(--text-faint)", marginBottom: 8, fontWeight: 600 }}>Terminal Font</div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+              Current: <code style={{ color: "var(--text-secondary)" }}>{terminalFont || "(default)"}</code>
+            </div>
+            <input
+              placeholder="Filter fonts..."
+              value={filter}
+              onChange={e => setFilter(e.target.value)}
+              style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", marginBottom: 8, background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-body)", fontSize: 13, outline: "none" }}
+            />
+            <div style={{ maxHeight: "40vh", overflowY: "auto", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-base)" }}>
+              {fontLoading && <div style={{ padding: 12, fontSize: 12, color: "var(--text-muted)" }}>Loading…</div>}
+              {!fontLoading && filtered.length === 0 && (
+                <div style={{ padding: 12, fontSize: 12, color: "var(--text-muted)" }}>No matching fonts.</div>
+              )}
+              {filtered.map(f => {
+                const isActive = f.family === terminalFont;
+                return (
+                  <div
+                    key={f.family}
+                    onClick={() => applyFont(f.family)}
+                    style={{ padding: "10px 12px", cursor: "pointer", fontSize: 13, borderBottom: "1px solid var(--bg-hover)", background: isActive ? "rgba(88,166,255,0.1)" : "transparent", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}
+                  >
+                    <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                      {f.recommended && (
+                        <span style={{ fontSize: 10, padding: "1px 5px", background: "rgba(88,166,255,0.15)", color: "var(--accent-blue)", borderRadius: 3 }}>★</span>
+                      )}
+                      <span style={{ color: isActive ? "var(--accent-blue)" : "var(--text-body)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.family}</span>
+                    </span>
+                    <span style={{ fontFamily: f.family, fontSize: 12, color: "var(--text-muted)", flexShrink: 0 }}>AaBb 你好 123</span>
+                  </div>
+                );
+              })}
+            </div>
+            {msg && <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-muted)" }}>{msg}</div>}
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function MobilePage({ username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: { username: string; onLogout: () => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void }) {
   const [openSession, setOpenSession] = useState<SessionMeta | null>(null);
+  const [terminalFont, setTerminalFontState] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    getConfig().then(c => setTerminalFontState(c.terminal_font || undefined)).catch(() => {});
+  }, []);
 
   // On mount: if URL already has #/s/{id}, load that session directly
   useEffect(() => {
@@ -3795,8 +3965,8 @@ export function MobilePage({ username, onLogout, onSwitchToAdmin, theme, onToggl
     setOpenSession(null);
   };
 
-  if (openSession) return <DetailView session={openSession} onBack={closeDetail} username={username} onLogout={onLogout} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
-  return <ListView username={username} onLogout={onLogout} onOpen={openDetail} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
+  if (openSession) return <DetailView session={openSession} onBack={closeDetail} username={username} onLogout={onLogout} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} terminalFont={terminalFont} onTerminalFontChange={setTerminalFontState} />;
+  return <ListView username={username} onLogout={onLogout} onOpen={openDetail} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} terminalFont={terminalFont} onTerminalFontChange={setTerminalFontState} />;
 }
 
 /* ─── Shared micro styles ─── */
