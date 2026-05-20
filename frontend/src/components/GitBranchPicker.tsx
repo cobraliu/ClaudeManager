@@ -15,19 +15,50 @@ interface Props {
   refreshKey?: number;
   /** Called after a successful branch switch so consumers can refresh their data. */
   onBranchChanged?: (branch: string) => void;
+  /** Called whenever branch info is (re)loaded — used by parents to size the toolbar. */
+  onInfoLoaded?: (info: GitBranchInfo) => void;
   /** Compact = small button suitable for the FILES header. */
   compact?: boolean;
+  /** Icon-only mode — abbreviates the branch name (e.g., "f·foo-bar"). */
+  iconOnly?: boolean;
+  /** When set, overrides the button's maxWidth — used by parent to grow into spare row width. */
+  maxWidth?: number;
 }
 
-export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, compact = true }: Props) {
+export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, onInfoLoaded, compact = true, iconOnly = false, maxWidth }: Props) {
   const [info, setInfo] = useState<GitBranchInfo | null>(null);
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
   const [pending, setPending] = useState<{ branch: string; remote: boolean } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [popupPos, setPopupPos] = useState<{ top: number; left: number } | null>(null);
+
+  // Recompute popup position whenever it opens / window scrolls / resizes.
+  useEffect(() => {
+    if (!open) { setPopupPos(null); return; }
+    const update = () => {
+      const r = buttonRef.current?.getBoundingClientRect();
+      if (r) setPopupPos({ top: r.bottom + 2, left: r.left });
+    };
+    update();
+    window.addEventListener("scroll", update, true);
+    window.addEventListener("resize", update);
+    return () => {
+      window.removeEventListener("scroll", update, true);
+      window.removeEventListener("resize", update);
+    };
+  }, [open]);
+
+  // Stabilize the callback via ref so identity changes from the parent don't
+  // re-trigger getGitBranches() on every render.
+  const onInfoLoadedRef = useRef(onInfoLoaded);
+  useEffect(() => { onInfoLoadedRef.current = onInfoLoaded; }, [onInfoLoaded]);
 
   const reload = useCallback(() => {
-    getGitBranches(sessionId).then(setInfo).catch(() => setInfo({ current: "", local: [] }));
+    getGitBranches(sessionId)
+      .then(i => { setInfo(i); onInfoLoadedRef.current?.(i); })
+      .catch(() => { const empty: GitBranchInfo = { current: "", local: [] }; setInfo(empty); onInfoLoadedRef.current?.(empty); });
   }, [sessionId]);
 
   useEffect(() => { reload(); }, [reload, refreshKey]);
@@ -61,13 +92,19 @@ export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, compac
     onBranchChanged?.(branch);
   };
 
-  const btnStyle: React.CSSProperties = compact
-    ? { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "1px 6px", fontSize: 11, color: "var(--text-secondary)", cursor: "pointer", maxWidth: 200, overflow: "hidden" }
-    : { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "3px 10px", fontSize: 12, color: "var(--text-secondary)", cursor: "pointer", maxWidth: 260 };
+  const baseBtnStyle: React.CSSProperties = iconOnly
+    ? { display: "inline-flex", alignItems: "center", gap: 3, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "1px 4px", fontSize: 11, color: "var(--text-secondary)", cursor: "pointer", minWidth: 0, overflow: "hidden" }
+    : compact
+      ? { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "1px 6px", fontSize: 11, color: "var(--text-secondary)", cursor: "pointer", maxWidth: 200, overflow: "hidden", minWidth: 0 }
+      : { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "3px 10px", fontSize: 12, color: "var(--text-secondary)", cursor: "pointer", maxWidth: 260 };
+  // When parent passes maxWidth (computed from spare row width), honor it so the
+  // picker expands to use the leftover space when the branch name is truncated.
+  const btnStyle: React.CSSProperties = maxWidth !== undefined ? { ...baseBtnStyle, maxWidth } : baseBtnStyle;
 
   return (
-    <div ref={containerRef} style={{ position: "relative", display: "inline-block" }}>
+    <div ref={containerRef} style={{ position: "relative", display: "inline-block", minWidth: 0 }}>
       <button
+        ref={buttonRef}
         onClick={() => setOpen(o => !o)}
         style={btnStyle}
         title={current ? `Branch: ${current}` : "Not on a branch"}
@@ -76,15 +113,30 @@ export function GitBranchPicker({ sessionId, refreshKey, onBranchChanged, compac
         <svg width={10} height={10} viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0 }}>
           <path d="M11.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122V6A2.5 2.5 0 0110 8.5H6a1 1 0 00-1 1v1.128a2.251 2.251 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.492 2.492 0 016 7h4a1 1 0 001-1v-.628A2.25 2.25 0 019.5 3.25zM4.25 12a.75.75 0 100 1.5.75.75 0 000-1.5zM3.5 3.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0z" />
         </svg>
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
-          {current || "(detached)"}
+        {/* Always show the branch name so users know the active branch without
+            opening the dropdown. In iconOnly (narrowest) mode, abbreviate long
+            names as `<first>.<last7>` (e.g., "feature/foo-bar" → "f.foo-bar"). */}
+        <span
+          style={{
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            direction: iconOnly ? "ltr" : "rtl",
+            textAlign: "left",
+            flexShrink: 1,
+            minWidth: 0,
+          }}
+        >
+          {iconOnly
+            ? (current && current.length > 8 ? `${current[0]}·${current.slice(-7)}` : current || "(detached)")
+            : <bdi style={{ unicodeBidi: "plaintext" }}>{current || "(detached)"}</bdi>}
         </span>
-        {info?.dirty && <span title="Working tree has uncommitted changes" style={{ color: "var(--accent-amber)", fontSize: 10 }}>●</span>}
-        <span style={{ color: "var(--text-faint)", fontSize: 9 }}>▾</span>
+        {info?.dirty && <span title="Working tree has uncommitted changes" style={{ color: "var(--accent-amber)", fontSize: 10, flexShrink: 0 }}>●</span>}
+        <span style={{ color: "var(--text-faint)", fontSize: 9, flexShrink: 0 }}>▾</span>
       </button>
 
-      {open && info && (info.local.length > 0 || (info.remote_only ?? []).length > 0) && (
-        <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 2, zIndex: 100, background: "var(--bg-surface)", border: "1px solid var(--border-strong)", borderRadius: 6, boxShadow: "0 4px 12px rgba(0,0,0,0.4)", minWidth: 240, maxWidth: 340 }}>
+      {open && popupPos && info && (info.local.length > 0 || (info.remote_only ?? []).length > 0) && (
+        <div style={{ position: "fixed", top: popupPos.top, left: popupPos.left, zIndex: 4000, background: "var(--bg-surface)", border: "1px solid var(--border-strong)", borderRadius: 6, boxShadow: "0 4px 12px rgba(0,0,0,0.4)", minWidth: 260, maxWidth: 360 }}>
           <div style={{ padding: 6, borderBottom: "1px solid var(--bg-hover)" }}>
             <input
               autoFocus
@@ -413,11 +465,12 @@ export function ConfirmAffectingChangeModal({
 
 /* ─── Pull button — fast-forward pull of the current branch's upstream ─── */
 export function GitPullButton({
-  sessionId, onPulled, compact = true,
+  sessionId, onPulled, compact = true, iconOnly = false,
 }: {
   sessionId: string;
   onPulled?: () => void;
   compact?: boolean;
+  iconOnly?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
@@ -439,9 +492,11 @@ export function GitPullButton({
     }
   };
 
-  const btnStyle: React.CSSProperties = compact
-    ? { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "1px 6px", fontSize: 11, color: "var(--text-secondary)", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1 }
-    : { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "3px 10px", fontSize: 12, color: "var(--text-secondary)", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1 };
+  const btnStyle: React.CSSProperties = iconOnly
+    ? { display: "inline-flex", alignItems: "center", justifyContent: "center", background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "1px 4px", fontSize: 11, color: "var(--text-secondary)", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1, flexShrink: 0 }
+    : compact
+      ? { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "1px 6px", fontSize: 11, color: "var(--text-secondary)", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1, flexShrink: 0 }
+      : { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "3px 10px", fontSize: 12, color: "var(--text-secondary)", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1 };
 
   return (
     <div style={{ position: "relative", display: "inline-block" }}>
@@ -449,14 +504,16 @@ export function GitPullButton({
         onClick={handleClick}
         disabled={busy}
         style={btnStyle}
-        title="git pull --ff-only"
+        title={busy ? "Pulling…" : "git pull --ff-only"}
       >
         <svg width={10} height={10} viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0 }}>
           <path d="M7.78 12.53a.75.75 0 01-1.06 0L2.47 8.28a.75.75 0 011.06-1.06l2.72 2.72V2.75a.75.75 0 011.5 0v7.19l2.72-2.72a.75.75 0 111.06 1.06l-4.25 4.25zM2.75 14a.75.75 0 000 1.5h10.5a.75.75 0 000-1.5H2.75z" />
         </svg>
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {busy ? "Pulling…" : "Pull"}
-        </span>
+        {!iconOnly && (
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {busy ? "Pulling…" : "Pull"}
+          </span>
+        )}
       </button>
       {toast && (
         <div

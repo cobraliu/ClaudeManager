@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import hljs from "highlight.js/lib/common";
 import { marked } from "../lib/markdown";
 import {
@@ -20,6 +20,25 @@ const MAX_TRANSFER_MB = 16;
 const MAX_TRANSFER_BYTES = MAX_TRANSFER_MB * 1024 * 1024;
 
 const POLL_MS = 8000;
+
+// ── useResizeWidth: tracks the clientWidth of an element via ResizeObserver ──
+function useResizeWidth<T extends HTMLElement>() {
+  const ref = useRef<T | null>(null);
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setWidth(el.clientWidth);
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setWidth(entry.contentRect.width);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, width] as const;
+}
 
 // ── File icons (copied from FileEditorModal) ──────────────────────────────
 
@@ -829,20 +848,36 @@ export function FileSidePanel({
 
   const handleSelect = (entry: FileEntry) => onFileClick(entry.path, false);
 
+  const [sideBarRef, sideBarWidth] = useResizeWidth<HTMLDivElement>();
+  const [sideBranchName, setSideBranchName] = useState<string>("");
+  const sideNaturalWidth = useMemo(() => {
+    const filesLabel = 32;
+    const padding = 20;
+    const branchOverhead = 42;
+    const branchName = (sideBranchName || "main").length * 7.5;
+    const pullCompact = 60;
+    const gaps = 16;
+    return filesLabel + padding + branchOverhead + branchName + pullCompact + gaps;
+  }, [sideBranchName]);
+  const sideCollapse = sideBarWidth > 0 && sideBarWidth < sideNaturalWidth;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden", background: "var(--bg-base)" }}>
       {/* Files (top, fills remaining space) */}
       <div style={{ overflowY: "auto", flex: 1, paddingTop: 4 }}>
-        <div style={{ padding: "4px 10px 2px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", display: "flex", alignItems: "center", gap: 8 }}>
-          <span>Files</span>
+        <div ref={sideBarRef} style={{ padding: "4px 10px 2px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", display: "flex", alignItems: "center", gap: sideCollapse ? 4 : 8, minWidth: 0 }}>
+          <span style={{ flexShrink: 0 }}>Files</span>
           <GitBranchPicker
             sessionId={sessionId}
             refreshKey={filesRefreshKey}
             onBranchChanged={() => setFilesRefreshKey(k => k + 1)}
+            onInfoLoaded={(i) => setSideBranchName(i.current)}
+            iconOnly={sideCollapse}
           />
           <GitPullButton
             sessionId={sessionId}
             onPulled={() => setFilesRefreshKey(k => k + 1)}
+            iconOnly={sideCollapse}
           />
         </div>
         <FileTree sessionId={sessionId} selected={selectedPath} changed={changedSet} onSelect={handleSelect} revealPath={selectedPath} refreshKey={filesRefreshKey} />
@@ -1605,6 +1640,30 @@ export function CodePane({
     setCtxMenu({ entry, x: e.clientX, y: e.clientY });
   }, []);
 
+  // Two-row toolbar — Row 1: branch picker + Pull + Git panel (Pull and Git
+  // adjacent, no gap). Row 2: history search + file-management actions.
+  // Branch picker is granted `maxWidth = spare`, so it expands gradually as the
+  // column widens (RTL ellipsis shows more of the name as the picker grows).
+  const [toolbarRef, toolbarWidth] = useResizeWidth<HTMLDivElement>();
+
+  const secondRowItems = useMemo(() => [
+    { key: "historySearch", label: "Git history by path", icon: "⏱", active: toolForm === "historySearch", onClick: () => setToolForm(toolForm === "historySearch" ? null : "historySearch") },
+    { key: "search",    label: "Search files", icon: "🔍", active: toolForm === "search",    onClick: () => setToolForm(toolForm === "search" ? null : "search") },
+    { key: "newFile",   label: "New file",     icon: "+",  active: toolForm === "newFile",   onClick: () => setToolForm(toolForm === "newFile" ? null : "newFile") },
+    { key: "newFolder", label: "New folder",   icon: "📁", active: toolForm === "newFolder", onClick: () => setToolForm(toolForm === "newFolder" ? null : "newFolder") },
+    { key: "upload",    label: "Upload file",  icon: "⬆", active: toolForm === "upload",    onClick: () => setToolForm(toolForm === "upload" ? null : "upload") },
+  ], [toolForm]);
+
+  const branchMaxWidth = useMemo(() => {
+    if (toolbarWidth <= 0) return undefined;
+    const FILES_W = 32, PAD_W = 14, GAP_W = 3;
+    const PULL_FULL = 60;
+    const GIT_ICON_W = 24;
+    // Layout: Files [gap] Picker [gap] [Pull][Git] (Pull/Git adjacent, no gap).
+    const fixed = FILES_W + PAD_W + GAP_W * 2 + PULL_FULL + (onGitClick ? GIT_ICON_W : 0);
+    return Math.max(40, toolbarWidth - fixed);
+  }, [toolbarWidth, onGitClick]);
+
   return (
     <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
 
@@ -1612,32 +1671,28 @@ export function CodePane({
       {!hideLeftPanel && (
         <div style={{ flex: treeOnly ? 1 : undefined, width: treeOnly ? undefined : 220, flexShrink: 0, borderRight: treeOnly ? "none" : "1px solid var(--bg-hover)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
 
-          {/* Files header + toolbar */}
-          <div style={{ padding: "4px 6px 2px", display: "flex", alignItems: "center", gap: 4, flexShrink: 0, borderBottom: "1px solid var(--bg-hover)" }}>
+          {/* Row 1: Files label + branch picker + Pull + Git panel (Pull/Git adjacent, no gap) */}
+          <div ref={toolbarRef} style={{ padding: "4px 6px 2px", display: "flex", alignItems: "center", gap: 3, flexShrink: 0, borderBottom: "1px solid var(--bg-hover)", minWidth: 0 }}>
             <span style={{ fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", paddingLeft: 4, flexShrink: 0 }}>Files</span>
             <GitBranchPicker
               sessionId={sessionId}
               refreshKey={filesRefreshKey}
               onBranchChanged={bumpFilesRefresh}
+              maxWidth={branchMaxWidth}
             />
-            <GitPullButton
-              sessionId={sessionId}
-              onPulled={bumpFilesRefresh}
-            />
-            <span style={{ flex: 1 }} />
-            <button title="Search files" onClick={() => setToolForm(toolForm === "search" ? null : "search")}
-              style={toolbarIconBtn(toolForm === "search")}>🔍</button>
-            <button title="New file" onClick={() => setToolForm(toolForm === "newFile" ? null : "newFile")}
-              style={toolbarIconBtn(toolForm === "newFile")}>+</button>
-            <button title="New folder" onClick={() => setToolForm(toolForm === "newFolder" ? null : "newFolder")}
-              style={toolbarIconBtn(toolForm === "newFolder")}>📁</button>
-            <button title="Upload file" onClick={() => setToolForm(toolForm === "upload" ? null : "upload")}
-              style={toolbarIconBtn(toolForm === "upload")}>⬆</button>
-            <button title="Git history by path (supports deleted files)" onClick={() => setToolForm(toolForm === "historySearch" ? null : "historySearch")}
-              style={toolbarIconBtn(toolForm === "historySearch")}>⏱</button>
-            {onGitClick && (
-              <button title="Git" onClick={() => onGitClick()} style={toolbarIconBtn(false)}>⎇</button>
-            )}
+            <div style={{ display: "flex", alignItems: "center", gap: 0, marginLeft: "auto", flexShrink: 0 }}>
+              <GitPullButton sessionId={sessionId} onPulled={bumpFilesRefresh} />
+              {onGitClick && (
+                <button title="Git panel" onClick={onGitClick} style={toolbarIconBtn(false)}>⎇</button>
+              )}
+            </div>
+          </div>
+
+          {/* Row 2: history search + file management actions */}
+          <div style={{ padding: "2px 6px 4px", display: "flex", alignItems: "center", gap: 2, flexShrink: 0, borderBottom: "1px solid var(--bg-hover)", minWidth: 0 }}>
+            {secondRowItems.map(it => (
+              <button key={it.key} title={it.label} onClick={it.onClick} style={toolbarIconBtn(it.active)}>{it.icon}</button>
+            ))}
           </div>
 
           {/* Inline forms */}
