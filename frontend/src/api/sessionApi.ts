@@ -309,8 +309,9 @@ export interface TuiAuqData {
   // Hook format (raw tool_input)
   questions?: Array<{
     question: string;
-    options?: Array<string | { label?: string; value?: string }>;
+    options?: Array<string | { label?: string; value?: string; description?: string; preview?: string }>;
     multiSelect?: boolean;
+    header?: string;
   }>;
 }
 

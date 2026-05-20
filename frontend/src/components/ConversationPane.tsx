@@ -2886,7 +2886,7 @@ interface PendingAuqData {
   // Hook format (raw tool_input from Claude Code)
   questions?: Array<{
     question: string;
-    options?: Array<string | { label?: string; value?: string }>;
+    options?: Array<string | { label?: string; value?: string; description?: string; preview?: string }>;
     multiSelect?: boolean;
     header?: string;
   }>;
@@ -2899,7 +2899,13 @@ function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
       header: q.header,
       multiSelect: q.multiSelect,
       options: (q.options ?? []).map(o =>
-        typeof o === "string" ? { label: o } : { label: o.label ?? o.value ?? String(o) }
+        typeof o === "string"
+          ? { label: o }
+          : {
+              label: o.label ?? o.value ?? String(o),
+              description: o.description,
+              preview: o.preview,
+            }
       ),
     }));
   }
