@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import type { SessionMeta, ScheduledTask, SshConfig } from "../api/sessionApi";
-import { createTask, cancelTask, renameSession, makeRemoteUri } from "../api/sessionApi";
+import type { SessionMeta, ScheduledTask } from "../api/sessionApi";
+import { createTask, cancelTask, renameSession } from "../api/sessionApi";
 import scheduleIcon from "../assets/schedule.svg";
 
 function _relTime(iso: string): string {
@@ -24,7 +24,6 @@ interface Props {
   session: SessionMeta;
   isActive?: boolean;
   showOwner?: boolean;
-  sshConfig?: SshConfig;
   onAttach?: () => void;
   onViewChat?: () => void;
   onTerminate?: () => void;
@@ -299,7 +298,6 @@ export function SessionCard({
   session: s,
   isActive,
   showOwner,
-  sshConfig,
   onAttach,
   onViewChat,
   onTerminate,
@@ -443,22 +441,6 @@ export function SessionCard({
           {s.model && ` · ${s.model.replace("claude-", "").replace(/-\d{8}$/, "")}`}
         </span>
         <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end", marginLeft: "auto" }}>
-          {sshConfig?.host && (
-            <>
-              <Btn
-                color="#1e3a2a"
-                label="VS Code"
-                title={`Open in VS Code (Remote SSH: ${sshConfig.user}@${sshConfig.host})`}
-                onClick={(e) => { e.stopPropagation(); window.open(makeRemoteUri("vscode", sshConfig, s.cwd)); }}
-              />
-              <Btn
-                color="#1a2a3a"
-                label="Cursor"
-                title={`Open in Cursor (Remote SSH: ${sshConfig.user}@${sshConfig.host})`}
-                onClick={(e) => { e.stopPropagation(); window.open(makeRemoteUri("cursor", sshConfig, s.cwd)); }}
-              />
-            </>
-          )}
           {canSchedule && (
             <Btn
               color={showSchedule ? "var(--accent-blue)" : "var(--btn-icon-bg)"}

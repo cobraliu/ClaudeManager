@@ -201,18 +201,3 @@ def get_term_standby_grace_seconds() -> int:
 
 def set_term_standby_grace_seconds(value: int) -> None:
     _set("term_standby_grace_seconds", str(max(5, int(value))))
-
-
-def get_ssh_config() -> dict:
-    import getpass
-    return {
-        "host": _get("ssh_host"),
-        "port": int(_get("ssh_port") or "22"),
-        "user": _get("ssh_user") or getpass.getuser(),
-    }
-
-
-def set_ssh_config(host: str, port: int, user: str) -> None:
-    _set("ssh_host", host)
-    _set("ssh_port", str(port))
-    _set("ssh_user", user)

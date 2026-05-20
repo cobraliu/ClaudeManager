@@ -279,26 +279,6 @@ export function getAvailableTools(): Promise<{ claude: boolean; cursor: boolean 
   return request("/api/config/available-tools");
 }
 
-export interface SshConfig {
-  host: string;
-  port: number;
-  user: string;
-}
-
-export function getSshConfig(): Promise<SshConfig> {
-  return request("/api/config/ssh");
-}
-
-export function updateSshConfig(cfg: SshConfig): Promise<SshConfig> {
-  return request("/api/config/ssh", { method: "PUT", body: JSON.stringify(cfg) });
-}
-
-// Helper: generate vscode:// or cursor:// URI
-export function makeRemoteUri(scheme: "vscode" | "cursor", ssh: SshConfig, cwd: string): string {
-  const hostPart = ssh.port === 22 ? `${ssh.user}@${ssh.host}` : `${ssh.user}@${ssh.host}:${ssh.port}`;
-  return `${scheme}://vscode-remote/ssh-remote+${hostPart}${cwd}`;
-}
-
 // Filesystem
 export function listDirs(path: string): Promise<string[]> {
   return request(`/api/fs/dirs?path=${encodeURIComponent(path)}`);

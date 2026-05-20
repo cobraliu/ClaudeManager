@@ -12,7 +12,6 @@ from app.config import (
     get_cursor_bin,
     get_default_workspace,
     get_proxy,
-    get_ssh_config,
     get_term_idle_grace_seconds,
     get_term_standby_grace_seconds,
     get_terminal_font,
@@ -20,7 +19,6 @@ from app.config import (
     set_cursor_bin,
     set_default_workspace,
     set_proxy,
-    set_ssh_config,
     set_term_idle_grace_seconds,
     set_term_standby_grace_seconds,
     set_terminal_font,
@@ -57,12 +55,6 @@ class CursorBinUpdateRequest(BaseModel):
 
 class ProxyUpdateRequest(BaseModel):
     proxy: str
-
-
-class SshConfigRequest(BaseModel):
-    host: str = ""
-    port: int = 22
-    user: str = ""
 
 
 class TerminalFontRequest(BaseModel):
@@ -115,17 +107,6 @@ def update_cursor_bin(body: CursorBinUpdateRequest, _admin: AdminUser) -> Config
 def update_proxy(body: ProxyUpdateRequest, _admin: AdminUser) -> ConfigView:
     set_proxy(body.proxy.strip())
     return _full_config()
-
-
-@router.get("/ssh")
-def get_ssh(_user: CurrentUser):
-    return get_ssh_config()
-
-
-@router.put("/ssh")
-def update_ssh(body: SshConfigRequest, _admin: AdminUser):
-    set_ssh_config(body.host.strip(), body.port, body.user.strip())
-    return get_ssh_config()
 
 
 @router.get("/fonts")
