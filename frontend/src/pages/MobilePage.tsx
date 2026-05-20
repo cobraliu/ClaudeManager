@@ -1084,35 +1084,52 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
   return (
     <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
       {/* Header */}
-      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
-        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Git</span>
-        {branches.current && (
-          <button
-            onClick={() => setShowBranchSheet(true)}
-            style={{ fontSize: 11, padding: "3px 10px", background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", color: "var(--accent-blue)", borderRadius: 11, fontFamily: "monospace", maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 1 }}
-          >⎇ {branches.current}</button>
-        )}
-        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{filtered.length}</span>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          {isRepo && (
-            <>
-              <button
-                disabled={committing}
-                onClick={async () => {
-                  setCommitting(true);
-                  try {
-                    const res = await gitManualCommit(sessionId);
-                    setMsg({ text: res.committed ? res.output || "Committed" : "Nothing to commit", ok: res.committed });
-                    if (res.committed) { const info = await getGitInfo(sessionId); setLog(info.log); }
-                  } catch (e) { setMsg({ text: String(e), ok: false }); }
-                  finally { setCommitting(false); }
-                }}
-                style={{ fontSize: 11, padding: "3px 10px", background: committing ? "var(--bg-hover)" : "var(--bg-hover)", color: committing ? "var(--text-muted)" : "var(--accent-green)", border: "1px solid #2d5a2d", borderRadius: 5 }}
-              >
-                {committing ? "…" : "Commit"}
-              </button>
-              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Auto commit</span>
+      <div style={{ background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+        {/* Row 1: title + branch */}
+        <div style={{ padding: "10px 14px 6px 10px", display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+          <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Git</span>
+          {branches.current && (
+            <button
+              onClick={() => setShowBranchSheet(true)}
+              style={{ fontSize: 11, padding: "3px 10px", background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", color: "var(--accent-blue)", borderRadius: 11, fontFamily: "monospace", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 1 }}
+            >⎇ {branches.current}</button>
+          )}
+          <span style={{ fontSize: 12, color: "var(--text-muted)", marginLeft: "auto", flexShrink: 0 }}>{filtered.length} commits</span>
+        </div>
+
+        {/* Row 2: action buttons */}
+        {isRepo && (
+          <div style={{ padding: "0 12px 10px 12px", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <button
+              disabled={committing}
+              onClick={async () => {
+                setCommitting(true);
+                try {
+                  const res = await gitManualCommit(sessionId);
+                  setMsg({ text: res.committed ? res.output || "Committed" : "Nothing to commit", ok: res.committed });
+                  if (res.committed) { const info = await getGitInfo(sessionId); setLog(info.log); }
+                } catch (e) { setMsg({ text: String(e), ok: false }); }
+                finally { setCommitting(false); }
+              }}
+              style={{ fontSize: 11, padding: "4px 12px", background: "var(--bg-hover)", color: committing ? "var(--text-muted)" : "var(--accent-green)", border: "1px solid #2d5a2d", borderRadius: 5 }}
+            >
+              {committing ? "…" : "Commit"}
+            </button>
+            <button
+              onClick={() => setEditingGitignore(true)}
+              style={{ fontSize: 11, padding: "4px 10px", background: "var(--bg-hover)", color: "var(--text-secondary)", border: "1px solid #374151", borderRadius: 5 }}
+            >
+              .gitignore
+            </button>
+            <button
+              onClick={() => setShowMerge(true)}
+              style={{ fontSize: 11, padding: "4px 10px", background: "var(--bg-hover)", color: "var(--accent-amber)", border: "1px solid #5a4527", borderRadius: 5 }}
+            >
+              Merge
+            </button>
+            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+              <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Auto commit</span>
               <button
                 onClick={async () => {
                   const next = !autoCommit;
@@ -1127,21 +1144,9 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
               >
                 <span style={{ position: "absolute", top: 2, left: autoCommit ? 18 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff", transition: "left 0.15s" }} />
               </button>
-              <button
-                onClick={() => setEditingGitignore(true)}
-                style={{ fontSize: 11, padding: "3px 8px", background: "var(--bg-hover)", color: "var(--text-secondary)", border: "1px solid #374151", borderRadius: 5 }}
-              >
-                .gitignore
-              </button>
-              <button
-                onClick={() => setShowMerge(true)}
-                style={{ fontSize: 11, padding: "3px 8px", background: "var(--bg-hover)", color: "var(--accent-amber)", border: "1px solid #5a4527", borderRadius: 5 }}
-              >
-                Merge
-              </button>
-            </>
-          )}
-        </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {!isRepo && !loading && (
