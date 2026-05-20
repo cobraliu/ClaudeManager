@@ -25,7 +25,16 @@ from app.api import files as files_api
 from app.api import fs as fs_api
 from app.api import sessions as sessions_api
 from app.api import usage_api
-from app.config import get_claude_bin, get_claude_shell, get_cursor_bin, get_default_admin, get_proxy, get_session_db_path
+from app.config import (
+    get_claude_bin,
+    get_claude_shell,
+    get_cursor_bin,
+    get_default_admin,
+    get_proxy,
+    get_session_db_path,
+    get_term_idle_grace_seconds,
+    get_term_standby_grace_seconds,
+)
 from app.services.git_service import git_add_commit, git_is_dirty, is_git_repo, make_commit_message
 from app.services.claude_session_reader import find_newest_claude_session_id, get_latest_turn_info
 from app.services.cursor_session_reader import find_newest_cursor_session_id
@@ -44,7 +53,11 @@ _db_path = get_session_db_path()
 user_store = UserStore(_db_path)
 session_store = SessionStore(db_path=_db_path)
 tmux = TmuxService(proxy=get_proxy(), claude_bin=get_claude_bin(), claude_shell=get_claude_shell(), cursor_bin=get_cursor_bin())
-term_mgr = TerminalManager(tmux)
+term_mgr = TerminalManager(
+    tmux,
+    idle_grace_getter=lambda: float(get_term_idle_grace_seconds()),
+    standby_grace_getter=lambda: float(get_term_standby_grace_seconds()),
+)
 # Reap any leftover cmterm-* tmux sessions from a previous run (in-memory refcounts
 # are gone, so we can't reattach reliably).
 try:

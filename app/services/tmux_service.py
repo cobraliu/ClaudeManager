@@ -451,6 +451,19 @@ class TmuxService:
         except (TmuxError, ValueError):
             return None
 
+    def is_pane_in_mode(self, session_name: str) -> bool:
+        """True if the pane is currently in any tmux mode (copy-mode, view-mode).
+
+        Used by WS scroll handlers to detect when copy-mode was cancelled by a
+        user keypress (Enter / Escape / q) so cached in_copy_mode state can be
+        re-synced before issuing further scroll-up commands.
+        """
+        try:
+            out = self._run("display-message", "-p", "-t", session_name, "#{pane_in_mode}")
+            return out.strip() == "1"
+        except TmuxError:
+            return False
+
     def list_sessions(self) -> list[str]:
         out = self._run("list-sessions", "-F", "#{session_name}")
         return [row for row in out.splitlines() if row] if out else []

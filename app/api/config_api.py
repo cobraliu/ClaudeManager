@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import (
     get_claude_bin,
@@ -13,12 +13,16 @@ from app.config import (
     get_default_workspace,
     get_proxy,
     get_ssh_config,
+    get_term_idle_grace_seconds,
+    get_term_standby_grace_seconds,
     get_terminal_font,
     set_claude_bin,
     set_cursor_bin,
     set_default_workspace,
     set_proxy,
     set_ssh_config,
+    set_term_idle_grace_seconds,
+    set_term_standby_grace_seconds,
     set_terminal_font,
 )
 from app.security import AdminUser, CurrentUser
@@ -35,6 +39,8 @@ class ConfigView(BaseModel):
     cursor_bin: str
     proxy: str
     terminal_font: str
+    term_idle_grace_seconds: int = 600
+    term_standby_grace_seconds: int = 30
 
 
 class WorkspaceUpdateRequest(BaseModel):
@@ -63,6 +69,13 @@ class TerminalFontRequest(BaseModel):
     font: str
 
 
+class TermLifecycleRequest(BaseModel):
+    """Idle = how long an ephemeral tmux terminal sits with no holder before
+    standby; standby = grace period after standby starts before tmux kill."""
+    idle_grace_seconds: int = Field(ge=10, le=86400)
+    standby_grace_seconds: int = Field(ge=5, le=3600)
+
+
 def _full_config() -> ConfigView:
     return ConfigView(
         workspace=get_default_workspace(),
@@ -70,6 +83,8 @@ def _full_config() -> ConfigView:
         cursor_bin=get_cursor_bin(),
         proxy=get_proxy(),
         terminal_font=get_terminal_font(),
+        term_idle_grace_seconds=get_term_idle_grace_seconds(),
+        term_standby_grace_seconds=get_term_standby_grace_seconds(),
     )
 
 
@@ -160,6 +175,13 @@ def list_system_fonts(_user: CurrentUser) -> list[dict]:
 @router.put("/terminal-font")
 def update_terminal_font(body: TerminalFontRequest, _admin: AdminUser) -> ConfigView:
     set_terminal_font(body.font.strip())
+    return _full_config()
+
+
+@router.put("/term-lifecycle")
+def update_term_lifecycle(body: TermLifecycleRequest, _admin: AdminUser) -> ConfigView:
+    set_term_idle_grace_seconds(body.idle_grace_seconds)
+    set_term_standby_grace_seconds(body.standby_grace_seconds)
     return _full_config()
 
 

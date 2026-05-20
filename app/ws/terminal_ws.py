@@ -337,6 +337,20 @@ async def terminal_ws(
                     await loop.run_in_executor(None, pty_handle.write, data.encode("utf-8"))
             elif msg.type == "scroll" and msg.delta is not None:
                 delta = msg.delta  # negative = scroll up, positive = scroll down
+                # Re-sync with tmux's actual mode: copy-mode can be cancelled by
+                # user keypresses (Enter/Escape/q) without us knowing, which
+                # would leave in_copy_mode=True stale and make subsequent
+                # scroll-up commands no-ops.
+                actually_in_mode = await loop.run_in_executor(
+                    None, tmux.is_pane_in_mode, session.tmux_session_name,
+                )
+                if in_copy_mode and not actually_in_mode:
+                    in_copy_mode = False
+                    scroll_depth = 0
+                    try:
+                        await websocket.send_json({"type": "copy-mode-exited"})
+                    except Exception:
+                        pass
                 try:
                     if delta < 0:
                         n = min(abs(delta), 50)

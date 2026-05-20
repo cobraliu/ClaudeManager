@@ -531,6 +531,15 @@ export function TerminalPane({ wsUrl, sessionId, scrollMode = "pty", onDisconnec
           setTerminated(true);
         }
       },
+      onCopyModeExited: () => {
+        // Server detected a stale copy-mode (user cancelled via Enter/Escape/q).
+        // Clear the scroll-up depth so the "back to bottom" overlay disappears.
+        mouseScrollDepthRef.current = 0;
+        if (scrolledUpRef.current) {
+          scrolledUpRef.current = false;
+          setScrolledUp(false);
+        }
+      },
       onClose: (reason) => onDisconnect?.(reason),
     });
     wsRef.current = ws;
