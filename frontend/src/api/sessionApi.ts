@@ -209,6 +209,8 @@ export interface ConfigView {
   cursor_bin: string;
   proxy: string;
   terminal_font: string;
+  term_idle_grace_seconds: number;
+  term_standby_grace_seconds: number;
 }
 
 export interface FontInfo {
@@ -256,6 +258,16 @@ export function setProxy(proxy: string): Promise<ConfigView> {
   return request("/api/config/proxy", {
     method: "PUT",
     body: JSON.stringify({ proxy }),
+  });
+}
+
+export function setTermLifecycle(
+  idle_grace_seconds: number,
+  standby_grace_seconds: number,
+): Promise<ConfigView> {
+  return request("/api/config/term-lifecycle", {
+    method: "PUT",
+    body: JSON.stringify({ idle_grace_seconds, standby_grace_seconds }),
   });
 }
 
@@ -811,6 +823,14 @@ export interface TerminalInfo {
   is_named: boolean;
   attach_count: number;
   created_at: number;
+  kept?: boolean;
+}
+
+export interface TerminalHeartbeatResponse {
+  term_id: string;
+  is_named: boolean;
+  kept: boolean;
+  attach_count: number;
 }
 
 export interface CreateTerminalResponse {
@@ -825,6 +845,9 @@ export interface IssueTerminalTokenResponse {
   term_id: string;
   ws_token: string;
   ws_url: string;
+  name?: string | null;
+  is_named?: boolean;
+  kept?: boolean;
 }
 
 export function listTerminals(sessionId: string): Promise<{ items: TerminalInfo[] }> {
@@ -861,6 +884,16 @@ export function renameTerminal(
 
 export function deleteTerminal(sessionId: string, termId: string): Promise<{ ok: boolean }> {
   return request(`/api/sessions/${sessionId}/terminals/${termId}`, { method: "DELETE" });
+}
+
+/** Refresh "still alive" timestamp for a cached ephemeral terminal.
+ *  Throws if the terminal has been swept (HTTP 410) — caller should treat
+ *  that as "cached term_id is stale; spawn a fresh one." */
+export function heartbeatTerminal(
+  sessionId: string,
+  termId: string,
+): Promise<TerminalHeartbeatResponse> {
+  return request(`/api/sessions/${sessionId}/terminals/${termId}/heartbeat`, { method: "POST" });
 }
 
 // Git

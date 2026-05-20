@@ -38,6 +38,16 @@ class TerminalInfo(BaseModel):
     is_named: bool
     attach_count: int
     created_at: float
+    # True once promoted from standby — terminal is no longer subject to
+    # auto-close, so the client can stop heartbeating if it wants.
+    kept: bool = False
+
+
+class HeartbeatResponse(BaseModel):
+    term_id: str
+    is_named: bool
+    kept: bool
+    attach_count: int
 
 
 class TerminalListResponse(BaseModel):
@@ -65,6 +75,9 @@ class IssueTokenResponse(BaseModel):
     term_id: str
     ws_token: str
     ws_url: str
+    name: Optional[str] = None
+    is_named: bool = False
+    kept: bool = False
 
 
 @router.get("/{session_id}/terminals", response_model=TerminalListResponse)
@@ -117,6 +130,9 @@ def issue_token(session_id: str, term_id: str, user_info: CurrentUserInfo) -> Is
         term_id=term_id,
         ws_token=token,
         ws_url=f"/ws/terminals/{term_id}?token={token}",
+        name=rec.name,
+        is_named=rec.is_named,
+        kept=rec.kept,
     )
 
 
@@ -139,6 +155,33 @@ def rename_terminal(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return TerminalInfo(**rec.public())
+
+
+@router.post("/{session_id}/terminals/{term_id}/heartbeat", response_model=HeartbeatResponse)
+def heartbeat_terminal(session_id: str, term_id: str, user_info: CurrentUserInfo) -> HeartbeatResponse:
+    """Refresh "last holder" timestamp; revives a standby ephemeral.
+
+    Returns 410 (gone) if the terminal has already been swept. The frontend
+    treats 410 as "your cached term_id is stale; create a fresh terminal."
+    """
+    _check_session_access(session_id, user_info)
+    assert _term_mgr is not None
+    rec = _term_mgr.get(term_id)
+    if rec is None:
+        raise HTTPException(status_code=410, detail="terminal gone")
+    if rec.session_id != session_id:
+        raise HTTPException(status_code=404, detail="terminal not found")
+    if not user_info.is_admin and rec.user_id != user_info.username:
+        raise HTTPException(status_code=404, detail="terminal not found")
+    updated = _term_mgr.heartbeat(term_id)
+    if updated is None:
+        raise HTTPException(status_code=410, detail="terminal gone")
+    return HeartbeatResponse(
+        term_id=updated.term_id,
+        is_named=updated.is_named,
+        kept=updated.kept,
+        attach_count=updated.attach_count,
+    )
 
 
 @router.delete("/{session_id}/terminals/{term_id}")

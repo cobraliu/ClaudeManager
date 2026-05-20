@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import type { LayoutScheme } from "../hooks/useUserConfig";
-import { getSystemFonts, setTerminalFont, type FontInfo } from "../api/sessionApi";
+import {
+  getConfig,
+  getSystemFonts,
+  setTermLifecycle,
+  setTerminalFont,
+  type FontInfo,
+} from "../api/sessionApi";
 
 interface Props {
   open: boolean;
@@ -80,6 +86,13 @@ export function UserConfigModal({
   const [fontFilter, setFontFilter] = useState("");
   const [fontMsg, setFontMsg] = useState<string | null>(null);
 
+  // Bash terminal lifecycle (idle → standby → kill). Stored as strings so the
+  // user can clear the input while typing; we parse on save.
+  const [idleGrace, setIdleGrace] = useState<string>("");
+  const [standbyGrace, setStandbyGrace] = useState<string>("");
+  const [lifecycleMsg, setLifecycleMsg] = useState<string | null>(null);
+  const [lifecycleSaving, setLifecycleSaving] = useState(false);
+
   useEffect(() => {
     if (!open || fontList.length > 0) return;
     setFontLoading(true);
@@ -87,6 +100,35 @@ export function UserConfigModal({
       .then(f => { setFontList(f); setFontLoading(false); })
       .catch(() => setFontLoading(false));
   }, [open, fontList.length]);
+
+  useEffect(() => {
+    if (!open) return;
+    getConfig()
+      .then(c => {
+        setIdleGrace(String(c.term_idle_grace_seconds ?? 600));
+        setStandbyGrace(String(c.term_standby_grace_seconds ?? 30));
+      })
+      .catch(() => { /* keep blank — user can still type and save */ });
+  }, [open]);
+
+  const saveLifecycle = async () => {
+    const i = Number(idleGrace);
+    const s = Number(standbyGrace);
+    if (!Number.isFinite(i) || i < 10) { setLifecycleMsg("Idle grace must be ≥ 10 seconds."); return; }
+    if (!Number.isFinite(s) || s < 5) { setLifecycleMsg("Standby grace must be ≥ 5 seconds."); return; }
+    setLifecycleSaving(true);
+    setLifecycleMsg(null);
+    try {
+      const c = await setTermLifecycle(Math.floor(i), Math.floor(s));
+      setIdleGrace(String(c.term_idle_grace_seconds));
+      setStandbyGrace(String(c.term_standby_grace_seconds));
+      setLifecycleMsg("Saved. Sweeper picks up new values on the next tick.");
+    } catch (e) {
+      setLifecycleMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLifecycleSaving(false);
+    }
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -259,6 +301,63 @@ export function UserConfigModal({
             </div>
             {fontMsg && (
               <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-muted)" }}>{fontMsg}</div>
+            )}
+          </section>
+
+          {/* Bash terminal lifecycle */}
+          <section>
+            <div style={sectionTitleStyle}>Bash Terminal Lifecycle</div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 10, lineHeight: 1.5 }}>
+              Ephemeral tmux terminals stay alive after the last client disconnects so refreshing the
+              page reattaches to the same session. Once no client has held it for the idle window, it
+              enters a hidden <code>standby</code> state for the standby grace, then tmux kills it.
+              A cached client that heartbeats during standby revives the terminal and pins it.
+            </div>
+            <div style={{ display: "flex", gap: 16, alignItems: "flex-end", flexWrap: "wrap" }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Idle grace (seconds)</span>
+                <input
+                  type="number"
+                  min={10}
+                  step={10}
+                  value={idleGrace}
+                  onChange={e => { setIdleGrace(e.target.value); if (lifecycleMsg) setLifecycleMsg(null); }}
+                  style={{
+                    width: 110, padding: "6px 8px", fontSize: 12,
+                    background: "var(--bg-surface)", border: "1px solid var(--border)",
+                    borderRadius: 5, color: "var(--text-body)",
+                  }}
+                />
+                <span style={{ fontSize: 10, color: "var(--text-faint)" }}>default 600 (10 min)</span>
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Standby grace (seconds)</span>
+                <input
+                  type="number"
+                  min={5}
+                  step={5}
+                  value={standbyGrace}
+                  onChange={e => { setStandbyGrace(e.target.value); if (lifecycleMsg) setLifecycleMsg(null); }}
+                  style={{
+                    width: 110, padding: "6px 8px", fontSize: 12,
+                    background: "var(--bg-surface)", border: "1px solid var(--border)",
+                    borderRadius: 5, color: "var(--text-body)",
+                  }}
+                />
+                <span style={{ fontSize: 10, color: "var(--text-faint)" }}>default 30</span>
+              </label>
+              <button
+                onClick={saveLifecycle}
+                disabled={lifecycleSaving}
+                style={{
+                  padding: "6px 14px", fontSize: 12,
+                  background: lifecycleSaving ? "var(--text-faintest)" : "var(--accent-blue)",
+                  color: "#fff", borderRadius: 5,
+                }}
+              >{lifecycleSaving ? "Saving…" : "Save"}</button>
+            </div>
+            {lifecycleMsg && (
+              <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-muted)" }}>{lifecycleMsg}</div>
             )}
           </section>
         </div>

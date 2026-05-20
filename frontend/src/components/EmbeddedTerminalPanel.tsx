@@ -2,12 +2,24 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createTerminal,
   deleteTerminal,
+  heartbeatTerminal,
   issueTerminalToken,
   listTerminals,
   renameTerminal,
   type TerminalInfo,
 } from "../api/sessionApi";
 import { TerminalPane } from "./TerminalPane";
+
+// Per-session cache: which term_id we were attached to last. Used on panel
+// mount / page reload to reattach instead of spawning yet another ephemeral.
+// Bumping the prefix invalidates all stored ids if the schema ever changes.
+const TERM_CACHE_PREFIX = "cmTermLastTermId:v1:";
+const termCacheKey = (sid: string) => TERM_CACHE_PREFIX + sid;
+
+// Heartbeat interval. The default backend idle grace is 600s; 30s gives ~20
+// heartbeats per window, so transient network blips don't lose the terminal.
+// Stays safely below any reasonable user-configured idle grace.
+const HEARTBEAT_INTERVAL_MS = 30_000;
 
 interface Props {
   sessionId: string | null;
@@ -145,12 +157,37 @@ export function EmbeddedTerminalPanel({
     setRenaming(false);
   }, [sessionId, open]);
 
-  // Auto-open an ephemeral when the panel is visible and nothing is attached.
+  // Auto-open: when the panel becomes visible with nothing attached, first try
+  // to reattach the term_id remembered from the previous mount. Only fall back
+  // to spawning a new ephemeral if the cached id is stale (404/410) or absent.
+  // This is what makes a browser refresh feel like nothing happened, instead
+  // of leaving an orphaned ephemeral behind every reload.
   useEffect(() => {
     if (!open || !sessionId || attached) return;
     let cancelled = false;
     (async () => {
       try {
+        const cachedId = localStorage.getItem(termCacheKey(sessionId));
+        if (cachedId) {
+          try {
+            // issueTerminalToken works for standby terms too, so revival
+            // happens automatically when the WS later attaches.
+            const t = await issueTerminalToken(sessionId, cachedId);
+            if (cancelled) return;
+            setAttached({
+              termId: t.term_id,
+              wsUrl: t.ws_url,
+              name: t.name ?? null,
+              isNamed: !!t.is_named,
+            });
+            listTerminals(sessionId).then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
+            return;
+          } catch {
+            // Cached term was swept or otherwise unreachable. Drop the cache
+            // and fall through to the create-new path below.
+            localStorage.removeItem(termCacheKey(sessionId));
+          }
+        }
         const r = await listTerminals(sessionId);
         if (cancelled) return;
         setTerminals(r.items);
@@ -163,6 +200,40 @@ export function EmbeddedTerminalPanel({
       }
     })();
     return () => { cancelled = true; };
+  }, [open, sessionId, attached]);
+
+  // Persist the currently-attached term_id so the next mount can find it.
+  // We store on every attach (named or ephemeral) — the cached id is just
+  // "where the user was looking last in this tab," and reattach behavior
+  // works identically for both kinds.
+  useEffect(() => {
+    if (!sessionId) return;
+    if (attached) {
+      try { localStorage.setItem(termCacheKey(sessionId), attached.termId); }
+      catch { /* quota exceeded — not worth surfacing */ }
+    }
+  }, [sessionId, attached]);
+
+  // While a terminal is attached, periodically heartbeat. This keeps the
+  // backend's "last holder" timestamp fresh so an ephemeral with a temporarily
+  // detached WS (network blip, tab background-throttling) doesn't get swept.
+  // 410 means our cached id was already swept — drop attachment so the
+  // auto-open effect above can spawn a fresh one.
+  useEffect(() => {
+    if (!open || !sessionId || !attached) return;
+    const tick = async () => {
+      try {
+        await heartbeatTerminal(sessionId, attached.termId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/gone|404|410/i.test(msg)) {
+          try { localStorage.removeItem(termCacheKey(sessionId)); } catch { /* ignore */ }
+          setAttached(null);
+        }
+      }
+    };
+    const id = setInterval(tick, HEARTBEAT_INTERVAL_MS);
+    return () => clearInterval(id);
   }, [open, sessionId, attached]);
 
   // Periodic list refresh (mostly to update attach_count badges)
