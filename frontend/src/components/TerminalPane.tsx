@@ -366,7 +366,15 @@ export function TerminalPane({ wsUrl, sessionId, scrollMode = "pty", onDisconnec
 
     el.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
-      if (scrollMode === "tmux") forceKey = true;
+      // Only force shift/alt when xterm.js would otherwise forward the click
+      // to the application (mouse-tracking active, e.g. Claude TUI). When
+      // mouse-tracking is off (bash + `tmux mouse off`), xterm.js's selection
+      // service is enabled and reads shiftKey as "extend existing selection"
+      // via _handleIncrementalClick — forcing it here makes the first drag a
+      // no-op because there's no prior selection to extend.
+      if (scrollMode === "tmux" && term.modes.mouseTrackingMode !== "none") {
+        forceKey = true;
+      }
       pauseWrites();
       isMouseDown = true;
     }, true);
