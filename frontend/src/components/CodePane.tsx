@@ -40,35 +40,108 @@ function useResizeWidth<T extends HTMLElement>() {
   return [ref, width] as const;
 }
 
-// ── File icons (copied from FileEditorModal) ──────────────────────────────
+// ── File icons (react-icons: si for brand langs, vsc for generic) ─────────
 
-const EXT_ICONS: Record<string, string> = {
-  py: "🐍", js: "📜", ts: "📘", tsx: "⚛️", jsx: "⚛️",
-  json: "{ }", yaml: "📋", yml: "📋", toml: "📋",
-  md: "📝", txt: "📄", csv: "📊", sql: "🗄️",
-  css: "🎨", scss: "🎨", html: "🌐", htm: "🌐",
-  sh: "⚙️", bash: "⚙️", zsh: "⚙️",
-  go: "🔵", rs: "🦀", java: "☕", kt: "🟣",
-  c: "🔷", cpp: "🔷", h: "🔷",
-  rb: "💎", php: "🐘", swift: "🍎",
-  tf: "🏗️", dockerfile: "🐳", env: "🔑",
-  log: "📋", lock: "🔒",
-  db: "🗄️", sqlite: "🗄️", sqlite3: "🗄️",
-  pdf: "📕",
-  zip: "🗜️", tar: "🗜️", gz: "🗜️", bz2: "🗜️", xz: "🗜️",
-  tgz: "🗜️", tbz2: "🗜️", txz: "🗜️",
-  png: "🖼️", jpg: "🖼️", jpeg: "🖼️", gif: "🖼️", webp: "🖼️",
-  bmp: "🖼️", ico: "🖼️", avif: "🖼️", tiff: "🖼️", tif: "🖼️", svg: "🖼️",
+import {
+  SiPython, SiJavascript, SiTypescript, SiReact, SiNpm, SiYaml, SiMarkdown,
+  SiCss, SiSass, SiHtml5, SiGnubash, SiGo, SiRust, SiKotlin,
+  SiC, SiCplusplus, SiRuby, SiPhp, SiSwift, SiTerraform, SiDocker,
+  SiSqlite, SiGit,
+} from "react-icons/si";
+import {
+  VscJson, VscFile, VscFolder, VscFolderOpened, VscFilePdf, VscFileZip, VscFileMedia,
+  VscDatabase, VscLock, VscOutput, VscSettingsGear, VscKey, VscMarkdown,
+  VscFileCode,
+} from "react-icons/vsc";
+import type { IconType } from "react-icons";
+
+interface IconSpec { Icon: IconType; color: string; }
+
+const FILE_SPECIAL: Record<string, IconSpec> = {
+  "Makefile":        { Icon: VscSettingsGear, color: "var(--text-secondary)" },
+  "Dockerfile":      { Icon: SiDocker,        color: "#2496ED" },
+  ".gitignore":      { Icon: SiGit,           color: "#F05032" },
+  ".env":            { Icon: VscKey,          color: "var(--accent-amber)" },
+  "package.json":    { Icon: SiNpm,           color: "#CB3837" },
+  "go.mod":          { Icon: SiGo,            color: "#00ADD8" },
+  "Cargo.toml":      { Icon: SiRust,          color: "#DEA584" },
+  "pyproject.toml":  { Icon: SiPython,        color: "#3776AB" },
 };
-const SPECIAL_ICONS: Record<string, string> = {
-  Makefile: "⚙️", Dockerfile: "🐳", ".gitignore": "🔍",
-  ".env": "🔑", "package.json": "📦", "go.mod": "🔵",
-  "Cargo.toml": "🦀", "pyproject.toml": "🐍",
+
+const FILE_EXT: Record<string, IconSpec> = {
+  py:    { Icon: SiPython,      color: "#3776AB" },
+  js:    { Icon: SiJavascript,  color: "#F7DF1E" },
+  ts:    { Icon: SiTypescript,  color: "#3178C6" },
+  tsx:   { Icon: SiReact,       color: "#61DAFB" },
+  jsx:   { Icon: SiReact,       color: "#61DAFB" },
+  json:  { Icon: VscJson,       color: "var(--accent-amber)" },
+  yaml:  { Icon: SiYaml,        color: "#CB171E" },
+  yml:   { Icon: SiYaml,        color: "#CB171E" },
+  toml:  { Icon: VscSettingsGear, color: "var(--text-secondary)" },
+  md:    { Icon: VscMarkdown,   color: "var(--text-secondary)" },
+  txt:   { Icon: VscFile,       color: "var(--text-secondary)" },
+  csv:   { Icon: VscFileCode,   color: "#16A34A" },
+  sql:   { Icon: VscDatabase,   color: "#0EA5E9" },
+  css:   { Icon: SiCss,         color: "#1572B6" },
+  scss:  { Icon: SiSass,        color: "#CC6699" },
+  html:  { Icon: SiHtml5,       color: "#E34F26" },
+  htm:   { Icon: SiHtml5,       color: "#E34F26" },
+  sh:    { Icon: SiGnubash,     color: "#4EAA25" },
+  bash:  { Icon: SiGnubash,     color: "#4EAA25" },
+  zsh:   { Icon: SiGnubash,     color: "#4EAA25" },
+  go:    { Icon: SiGo,          color: "#00ADD8" },
+  rs:    { Icon: SiRust,        color: "#DEA584" },
+  java:  { Icon: VscFileCode,   color: "#E76F00" },
+  kt:    { Icon: SiKotlin,      color: "#7F52FF" },
+  c:     { Icon: SiC,           color: "#A8B9CC" },
+  cpp:   { Icon: SiCplusplus,   color: "#00599C" },
+  h:     { Icon: SiC,           color: "#A8B9CC" },
+  rb:    { Icon: SiRuby,        color: "#CC342D" },
+  php:   { Icon: SiPhp,         color: "#777BB4" },
+  swift: { Icon: SiSwift,       color: "#FA7343" },
+  tf:    { Icon: SiTerraform,   color: "#7B42BC" },
+  dockerfile: { Icon: SiDocker, color: "#2496ED" },
+  env:   { Icon: VscKey,        color: "var(--accent-amber)" },
+  log:   { Icon: VscOutput,     color: "var(--text-secondary)" },
+  lock:  { Icon: VscLock,       color: "var(--text-secondary)" },
+  db:    { Icon: VscDatabase,   color: "#0EA5E9" },
+  sqlite:  { Icon: SiSqlite,    color: "#88B7E0" },
+  sqlite3: { Icon: SiSqlite,    color: "#88B7E0" },
+  pdf:   { Icon: VscFilePdf,    color: "#DC2626" },
+  zip:   { Icon: VscFileZip,    color: "var(--text-secondary)" },
+  tar:   { Icon: VscFileZip,    color: "var(--text-secondary)" },
+  gz:    { Icon: VscFileZip,    color: "var(--text-secondary)" },
+  bz2:   { Icon: VscFileZip,    color: "var(--text-secondary)" },
+  xz:    { Icon: VscFileZip,    color: "var(--text-secondary)" },
+  tgz:   { Icon: VscFileZip,    color: "var(--text-secondary)" },
+  tbz2:  { Icon: VscFileZip,    color: "var(--text-secondary)" },
+  txz:   { Icon: VscFileZip,    color: "var(--text-secondary)" },
+  png:   { Icon: VscFileMedia,  color: "#A78BFA" },
+  jpg:   { Icon: VscFileMedia,  color: "#A78BFA" },
+  jpeg:  { Icon: VscFileMedia,  color: "#A78BFA" },
+  gif:   { Icon: VscFileMedia,  color: "#A78BFA" },
+  webp:  { Icon: VscFileMedia,  color: "#A78BFA" },
+  bmp:   { Icon: VscFileMedia,  color: "#A78BFA" },
+  ico:   { Icon: VscFileMedia,  color: "#A78BFA" },
+  avif:  { Icon: VscFileMedia,  color: "#A78BFA" },
+  tiff:  { Icon: VscFileMedia,  color: "#A78BFA" },
+  tif:   { Icon: VscFileMedia,  color: "#A78BFA" },
+  svg:   { Icon: VscFileMedia,  color: "#A78BFA" },
 };
-function fileIcon(name: string): string {
-  if (SPECIAL_ICONS[name]) return SPECIAL_ICONS[name];
-  const ext = name.split(".").pop()?.toLowerCase() || "";
-  return EXT_ICONS[ext] || "📄";
+
+const FILE_DEFAULT: IconSpec = { Icon: VscFile, color: "var(--text-secondary)" };
+const FOLDER_SPEC: IconSpec   = { Icon: VscFolder, color: "var(--accent-blue)" };
+
+function FileIcon({ name, isDir = false, isOpen = false, size = 14 }: { name?: string; isDir?: boolean; isOpen?: boolean; size?: number }) {
+  let spec: IconSpec;
+  if (isDir) {
+    spec = isOpen ? { Icon: VscFolderOpened, color: "var(--accent-blue)" } : FOLDER_SPEC;
+  } else {
+    const ext = (name ?? "").split(".").pop()?.toLowerCase() ?? "";
+    spec = (name ? FILE_SPECIAL[name] : undefined) ?? FILE_EXT[ext] ?? FILE_DEFAULT;
+  }
+  const Icon = spec.Icon;
+  return <Icon size={size} color={spec.color} style={{ flexShrink: 0, display: "inline-block", verticalAlign: "middle" }} />;
 }
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "tiff", "tif", "ico", "svg"]);
@@ -231,7 +304,7 @@ function FileTreeDir({
         <span style={{ fontSize: 9, color: "var(--text-muted)", minWidth: 8, textAlign: "center", flexShrink: 0 }}>
           {state.loading ? "…" : state.open ? "▾" : "▸"}
         </span>
-        <span style={{ fontSize: 13, flexShrink: 0 }}>{state.open ? "📂" : "📁"}</span>
+        <FileIcon isDir isOpen={state.open} />
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {entry.name}
         </span>
@@ -291,7 +364,7 @@ function FileTreeFile({
       onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}
     >
       <span style={{ minWidth: 8, flexShrink: 0 }} />
-      <span style={{ fontSize: 13, flexShrink: 0 }}>{fileIcon(entry.name)}</span>
+      <FileIcon name={entry.name} isDir={entry.type === "dir"} />
       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
         {entry.name}
       </span>
@@ -680,7 +753,7 @@ function ChangesNodeRow({
           onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
         >
           <span style={{ fontSize: 9, color: "var(--text-faint)" }}>{open ? "▾" : "▸"}</span>
-          <span style={{ fontSize: 12 }}>📁</span>
+          <FileIcon isDir isOpen={open} />
           <span>{node.name}</span>
           <span style={{ fontSize: 10, color: "var(--text-faint)", marginLeft: 2 }}>({fileCount})</span>
         </div>
@@ -708,7 +781,7 @@ function ChangesNodeRow({
       <span style={{ fontSize: 9, color: STATUS_COLORS[f.status] ?? "var(--text-secondary)", minWidth: 10, fontWeight: 700, flexShrink: 0 }}>
         {f.status[0].toUpperCase()}
       </span>
-      <span style={{ fontSize: 13, flexShrink: 0 }}>{fileIcon(node.name)}</span>
+      <FileIcon name={node.name} />
       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{node.name}</span>
       {(f.added != null || f.removed != null) && (
         <span style={{ display: "flex", gap: 3, flexShrink: 0, fontSize: 9, fontFamily: "monospace" }}>
@@ -941,7 +1014,7 @@ function ViewerHeader({
       padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0,
       display: "flex", alignItems: "center", gap: 8, background: "var(--bg-base)", fontSize: 12, minHeight: 28,
     }}>
-      <span style={{ fontSize: 13, flexShrink: 0 }}>{fileIcon(name)}</span>
+      <FileIcon name={name} />
       <span style={{ color: "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {path}
       </span>
@@ -1107,7 +1180,7 @@ function ViewerContent({
     return (
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faintest)", fontSize: 13 }}>
         <div style={{ textAlign: "center" }}>
-          <div style={{ fontSize: 32, marginBottom: 8 }}>📂</div>
+          <div style={{ marginBottom: 8, lineHeight: 0 }}><VscFolderOpened size={36} color="var(--text-faint)" /></div>
           <div>Select a file from the tree</div>
           <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 4 }}>Changed files are highlighted in yellow</div>
         </div>
@@ -1786,7 +1859,7 @@ export function CodePane({
                     style={{ padding: "3px 10px", fontSize: 12, cursor: "pointer", color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: 5, borderBottom: "1px solid var(--bg-deep)" }}
                     onMouseEnter={(el) => { el.currentTarget.style.background = "var(--bg-surface)"; }}
                     onMouseLeave={(el) => { el.currentTarget.style.background = "transparent"; }}>
-                    <span style={{ fontSize: 13, flexShrink: 0 }}>{e.type === "dir" ? "📁" : fileIcon(e.name)}</span>
+                    <FileIcon name={e.name} isDir={e.type === "dir"} />
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, fontFamily: "monospace" }}>{e.path}</span>
                   </div>
                 ))
