@@ -11,7 +11,6 @@ import {
   terminateSession,
   deleteSession,
   getConfig,
-  getSshConfig,
   getConversation,
   getGitInfo,
   gitRollback,
@@ -45,7 +44,6 @@ import {
   listAvailableClaudeSessions,
   setClaudeSessionId,
   fetchRawFileBlob,
-  makeRemoteUri,
   browseExternalSessions,
   listModels,
   setSessionModel,
@@ -68,7 +66,6 @@ import {
   type SqliteInfo,
   type AttachResponse,
   type AvailableClaudeSession,
-  type SshConfig,
   type UsageInfo,
   type TuiAuqData,
   type TuiApproveData,
@@ -3282,8 +3279,8 @@ function SessionDrawer({
   );
 }
 
-function DetailView({ session: initialSession, sshConfig, onBack, username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: {
-  session: SessionMeta; sshConfig: SshConfig; onBack: () => void; username: string;
+function DetailView({ session: initialSession, onBack, username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: {
+  session: SessionMeta; onBack: () => void; username: string;
   onLogout: () => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void;
 }) {
   const [session, setSession] = useState(initialSession);
@@ -3767,9 +3764,6 @@ function parseSessionHash(): string | null {
 /* ─── Top-level Mobile Page ─── */
 export function MobilePage({ username, onLogout, onSwitchToAdmin, theme, onToggleTheme }: { username: string; onLogout: () => void; onSwitchToAdmin?: () => void; theme?: "dark" | "light"; onToggleTheme?: () => void }) {
   const [openSession, setOpenSession] = useState<SessionMeta | null>(null);
-  const [sshConfig, setSshConfig] = useState<SshConfig>({ host: "", port: 22, user: "" });
-
-  useEffect(() => { getSshConfig().then(setSshConfig).catch(() => {}); }, []);
 
   // On mount: if URL already has #/s/{id}, load that session directly
   useEffect(() => {
@@ -3801,7 +3795,7 @@ export function MobilePage({ username, onLogout, onSwitchToAdmin, theme, onToggl
     setOpenSession(null);
   };
 
-  if (openSession) return <DetailView session={openSession} sshConfig={sshConfig} onBack={closeDetail} username={username} onLogout={onLogout} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
+  if (openSession) return <DetailView session={openSession} onBack={closeDetail} username={username} onLogout={onLogout} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
   return <ListView username={username} onLogout={onLogout} onOpen={openDetail} onSwitchToAdmin={onSwitchToAdmin} theme={theme} onToggleTheme={onToggleTheme} />;
 }
 

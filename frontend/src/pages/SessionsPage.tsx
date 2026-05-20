@@ -12,7 +12,6 @@ import {
   deleteSession,
   resumeSession,
   getConfig,
-  getSshConfig,
   restartServer,
   extractToDir,
   getDirInfo,
@@ -27,7 +26,6 @@ import {
   listSessionTodos,
   type SessionMeta,
   type AttachResponse,
-  type SshConfig,
   type ExternalSession,
   type ExternalSessionGroup,
   type ExternalPreview,
@@ -721,7 +719,6 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       setModelList([]);
     }
   }, [activeSessionMeta?.tool]);
-  const [sshConfig, setSshConfig] = useState<SshConfig>({ host: "", port: 22, user: "" });
 
   // Download-cwd exclusion modal state
   const DOWNLOAD_MAX_MB = 100;
@@ -836,10 +833,9 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     }
   }, []);
 
-  // Fetch workspace config and SSH config once on mount
+  // Fetch workspace config once on mount
   useEffect(() => {
     getConfig().then((c) => { setWorkspaceBase(c.workspace); setTerminalFont(c.terminal_font || undefined); }).catch(() => {});
-    getSshConfig().then(setSshConfig).catch(() => {});
   }, []);
 
   // ── Hash-based session routing ──────────────────────────────────────────────
@@ -1294,7 +1290,6 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               key={s.id}
               session={s}
               isActive={activeSessionId === s.id}
-              sshConfig={sshConfig}
               onAttach={() => handleAttach(s.id)}
               onViewChat={() => handleViewChat(s.id)}
               onTerminate={() => handleTerminate(s.id)}
