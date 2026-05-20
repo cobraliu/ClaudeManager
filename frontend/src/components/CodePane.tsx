@@ -13,7 +13,7 @@ import {
 } from "../api/sessionApi";
 import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker, EditorWithLineNumbers } from "./FileEditorModal";
 import { GitPanel, CommitDetailModal } from "./GitPanel";
-import { GitBranchPicker } from "./GitBranchPicker";
+import { GitBranchPicker, GitPullButton } from "./GitBranchPicker";
 import downloadIcon from "../assets/download.svg";
 
 const MAX_TRANSFER_MB = 16;
@@ -840,6 +840,10 @@ export function FileSidePanel({
             refreshKey={filesRefreshKey}
             onBranchChanged={() => setFilesRefreshKey(k => k + 1)}
           />
+          <GitPullButton
+            sessionId={sessionId}
+            onPulled={() => setFilesRefreshKey(k => k + 1)}
+          />
         </div>
         <FileTree sessionId={sessionId} selected={selectedPath} changed={changedSet} onSelect={handleSelect} revealPath={selectedPath} refreshKey={filesRefreshKey} />
       </div>
@@ -1615,6 +1619,10 @@ export function CodePane({
               sessionId={sessionId}
               refreshKey={filesRefreshKey}
               onBranchChanged={bumpFilesRefresh}
+            />
+            <GitPullButton
+              sessionId={sessionId}
+              onPulled={bumpFilesRefresh}
             />
             <span style={{ flex: 1 }} />
             <button title="Search files" onClick={() => setToolForm(toolForm === "search" ? null : "search")}

@@ -957,6 +957,10 @@ export function gitPush(sessionId: string): Promise<{ ok: boolean; output: strin
   return request(`/api/sessions/${sessionId}/git/push`, { method: "POST" });
 }
 
+export function gitPull(sessionId: string): Promise<{ ok: boolean; output: string }> {
+  return request(`/api/sessions/${sessionId}/git/pull`, { method: "POST" });
+}
+
 export interface CommitDetail {
   message: string;
   files: GitDiffFile[];
@@ -1015,13 +1019,13 @@ export class GitCheckoutConflictError extends Error {
 export async function gitCheckoutBranch(
   sessionId: string,
   branch: string,
-  force_discard = false,
-): Promise<{ ok: boolean; branch: string; output: string }> {
+  opts: { stash?: boolean } = {},
+): Promise<{ ok: boolean; branch: string; output: string; stashed?: boolean }> {
   const token = getToken();
   const resp = await fetch(`/api/sessions/${sessionId}/git/checkout`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ branch, force_discard }),
+    body: JSON.stringify({ branch, stash: opts.stash ?? false }),
   });
   if (resp.status === 409) {
     const body = await resp.json().catch(() => ({}));

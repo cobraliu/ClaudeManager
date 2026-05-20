@@ -38,7 +38,7 @@ from app.services.cursor_session_reader import (
 from app.services.git_service import (
     git_add_commit, git_checkout_branch, git_clone, git_file_diff, git_file_log, git_file_show,
     git_get_remote, git_graph_log, git_init, git_is_dirty, git_list_branches, git_log,
-    git_push, git_search_commits, git_set_remote, git_show_commit, is_git_repo,
+    git_pull, git_push, git_search_commits, git_set_remote, git_show_commit, is_git_repo,
     make_commit_message, make_commit_summary,
 )
 from app.services.session_store import SessionStore
@@ -1392,7 +1392,7 @@ def list_active_cwd_sessions(session_id: str, user_id: CurrentUser) -> dict:
 
 class GitCheckoutRequest(BaseModel):
     branch: str = Field(min_length=1, max_length=200)
-    force_discard: bool = False
+    stash: bool = False
 
 
 @router.post("/{session_id}/git/checkout")
@@ -1405,22 +1405,24 @@ def checkout_git_branch(
         raise HTTPException(status_code=404, detail="session not found")
     if not is_git_repo(session.cwd):
         raise HTTPException(status_code=400, detail="not a git repo")
-    # Try plain checkout first. Git itself decides whether uncommitted edits
-    # conflict with the target branch; we only force-discard when explicitly
-    # requested by the caller after they've been shown the conflict.
-    result = git_checkout_branch(session.cwd, body.branch, force_discard=body.force_discard)
+    result = git_checkout_branch(session.cwd, body.branch, stash=body.stash)
     if not result["ok"]:
         if result.get("conflict"):
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "conflict",
-                    "message": "local changes would be overwritten; pass force_discard=true to discard them",
+                    "message": "local changes would be overwritten by checkout; commit or stash them first",
                     "conflicting_files": result.get("conflicting_files", []),
                 },
             )
         raise HTTPException(status_code=400, detail=result["output"])
-    return {"ok": True, "branch": body.branch, "output": result["output"]}
+    return {
+        "ok": True,
+        "branch": body.branch,
+        "output": result["output"],
+        "stashed": result.get("stashed", False),
+    }
 
 
 @router.post("/{session_id}/git/init")
@@ -1482,6 +1484,20 @@ def push_to_remote(session_id: str, user_id: CurrentUser) -> dict:
     result = git_push(session.cwd)
     if not result["ok"]:
         raise HTTPException(status_code=500, detail=result["output"])
+    return {"ok": True, "output": result["output"]}
+
+
+@router.post("/{session_id}/git/pull")
+def pull_from_remote(session_id: str, user_id: CurrentUser) -> dict:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not is_git_repo(session.cwd):
+        raise HTTPException(status_code=400, detail="not a git repo")
+    result = git_pull(session.cwd)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["output"])
     return {"ok": True, "output": result["output"]}
 
 

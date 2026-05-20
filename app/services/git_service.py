@@ -547,6 +547,20 @@ def git_push(cwd: str) -> dict:
     return {"ok": result.returncode == 0, "output": out}
 
 
+def git_pull(cwd: str) -> dict:
+    """Pull current branch from its upstream. Returns {ok, output}."""
+    result = subprocess.run(
+        ["git", "pull", "--ff-only"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    out = (result.stdout + result.stderr).strip()
+    return {"ok": result.returncode == 0, "output": out}
+
+
 def git_current_branch(cwd: str) -> str:
     """Return current branch name, or '' if detached / failure."""
     result = subprocess.run(
@@ -572,28 +586,31 @@ def git_list_branches(cwd: str) -> dict:
     return {"current": current, "local": local}
 
 
-def git_checkout_branch(cwd: str, branch: str, force_discard: bool = False) -> dict:
+def git_checkout_branch(cwd: str, branch: str, stash: bool = False) -> dict:
     """Checkout an existing local branch.
 
-    Strategy:
-      - Try plain `git checkout <branch>` first. Git carries over uncommitted
-        edits when they don't conflict with the target.
-      - If git refuses because local changes would be overwritten, return
-        {ok: False, conflict: True, conflicting_files: [...]} so the caller
-        can decide whether to discard and retry.
-      - If force_discard=True, reset --hard + clean -fd first, then checkout.
+    Tries plain `git checkout <branch>`. Git itself carries over uncommitted
+    edits when they don't conflict with the target. If it refuses because local
+    changes would be overwritten, returns conflict info so the caller can
+    surface the conflicting files.
+
+    If stash=True, runs `git stash push -u -m <auto msg>` first so the working
+    tree is preserved (recoverable via `git stash pop`), then checks out.
     """
-    if force_discard:
-        reset = subprocess.run(
-            ["git", "reset", "--hard", "HEAD"],
+    stashed = False
+    if stash:
+        current = git_current_branch(cwd) or "detached"
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"claudemanager: WIP on {current} (switching to {branch}) @ {ts}"
+        stash_res = subprocess.run(
+            ["git", "stash", "push", "-u", "-m", msg],
             cwd=cwd, capture_output=True, text=True, encoding="utf-8",
         )
-        if reset.returncode != 0:
-            return {"ok": False, "output": reset.stderr.strip(), "conflict": False}
-        subprocess.run(
-            ["git", "clean", "-fd"],
-            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-        )
+        if stash_res.returncode != 0:
+            return {"ok": False, "output": stash_res.stderr.strip(), "conflict": False}
+        # "No local changes to save" comes back with rc=0; only count an actual stash.
+        stashed = "No local changes" not in (stash_res.stdout + stash_res.stderr)
 
     result = subprocess.run(
         ["git", "checkout", branch],
@@ -601,7 +618,7 @@ def git_checkout_branch(cwd: str, branch: str, force_discard: bool = False) -> d
     )
     out = (result.stdout + result.stderr).strip()
     if result.returncode == 0:
-        return {"ok": True, "output": out, "conflict": False}
+        return {"ok": True, "output": out, "conflict": False, "stashed": stashed}
 
     # Parse conflicting file list from git's error output.
     if "would be overwritten by checkout" in out or "would be overwritten by merge" in out:

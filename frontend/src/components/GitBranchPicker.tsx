@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import {
   getGitBranches,
   gitCheckoutBranch,
+  gitPull,
   getActiveCwdSessions,
   GitCheckoutConflictError,
   type ActiveCwdSession,
@@ -137,8 +138,8 @@ function BranchCheckoutConfirm({
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // Set after the first attempt comes back with a conflict; switches the UI
-  // to a discard-prompt mode and the action button to "Discard & Checkout".
+  // Set when the attempt comes back with a conflict; checkout is then blocked
+  // until the user commits or stashes those files manually.
   const [conflict, setConflict] = useState<{ files: string[] } | null>(null);
 
   useEffect(() => {
@@ -147,13 +148,13 @@ function BranchCheckoutConfirm({
 
   const hasActive = (active?.length ?? 0) > 0;
   const requireAck = hasActive;
-  const canProceed = !requireAck || ack;
+  const ackOk = !requireAck || ack;
 
-  const handleConfirm = async () => {
+  const doCheckout = async (stash: boolean) => {
     setBusy(true);
     setErr(null);
     try {
-      await gitCheckoutBranch(sessionId, branch, /* force_discard */ conflict !== null);
+      await gitCheckoutBranch(sessionId, branch, { stash });
       onDone();
     } catch (e) {
       if (e instanceof GitCheckoutConflictError) {
@@ -190,14 +191,14 @@ function BranchCheckoutConfirm({
 
           {conflict && (
             <div style={{ background: "rgba(248, 81, 73, 0.12)", border: "1px solid var(--accent-red)", borderRadius: 4, padding: "8px 10px", color: "var(--text-body)", fontSize: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-              <div style={{ color: "var(--accent-red)", fontWeight: 600 }}>⚠ Local changes would be overwritten by checkout</div>
+              <div style={{ color: "var(--accent-red)", fontWeight: 600 }}>⚠ Checkout blocked — local changes would be overwritten</div>
               {conflict.files.length > 0 && (
                 <div style={{ maxHeight: 140, overflowY: "auto", fontFamily: "monospace", fontSize: 11, color: "var(--text-secondary)" }}>
                   {conflict.files.map(f => <div key={f}>{f}</div>)}
                 </div>
               )}
               <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                Commit or stash these first to keep them. Continuing will <b>discard them</b> (git reset --hard + clean -fd).
+                Stash & Checkout preserves these edits (recover later with <span style={{ fontFamily: "monospace" }}>git stash pop</span>), or commit them via terminal first.
               </div>
             </div>
           )}
@@ -236,18 +237,35 @@ function BranchCheckoutConfirm({
           {err && <div style={{ fontSize: 12, color: "var(--accent-red)" }}>{err}</div>}
         </div>
         <div style={{ padding: "10px 14px", borderTop: "1px solid var(--bg-hover)", display: "flex", justifyContent: "flex-end", gap: 6 }}>
-          <button onClick={onCancel} disabled={busy} style={{ background: "var(--text-faintest)", color: "var(--text-secondary)", fontSize: 12, padding: "5px 12px" }}>Cancel</button>
-          <button
-            disabled={!canProceed || busy}
-            onClick={handleConfirm}
-            style={{
-              background: !canProceed ? "var(--bg-hover)" : conflict ? "var(--accent-red)" : "var(--accent-blue)",
-              color: !canProceed ? "var(--text-faint)" : "#fff",
-              fontSize: 12, padding: "5px 14px",
-            }}
-          >
-            {busy ? "Checking out…" : conflict ? "Discard & Checkout" : "Checkout"}
+          <button onClick={onCancel} disabled={busy} style={{ background: "var(--text-faintest)", color: "var(--text-secondary)", fontSize: 12, padding: "5px 12px" }}>
+            Cancel
           </button>
+          {conflict ? (
+            <button
+              disabled={!ackOk || busy}
+              onClick={() => doCheckout(true)}
+              style={{
+                background: !ackOk ? "var(--bg-hover)" : "var(--accent-amber)",
+                color: !ackOk ? "var(--text-faint)" : "#000",
+                fontSize: 12, padding: "5px 14px",
+              }}
+              title="Run git stash push -u, then checkout. Recover later with git stash pop."
+            >
+              {busy ? "Stashing & checking out…" : "Stash & Checkout"}
+            </button>
+          ) : (
+            <button
+              disabled={!ackOk || busy}
+              onClick={() => doCheckout(false)}
+              style={{
+                background: !ackOk ? "var(--bg-hover)" : "var(--accent-blue)",
+                color: !ackOk ? "var(--text-faint)" : "#fff",
+                fontSize: 12, padding: "5px 14px",
+              }}
+            >
+              {busy ? "Checking out…" : "Checkout"}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -353,6 +371,70 @@ export function ConfirmAffectingChangeModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ─── Pull button — fast-forward pull of the current branch's upstream ─── */
+export function GitPullButton({
+  sessionId, onPulled, compact = true,
+}: {
+  sessionId: string;
+  onPulled?: () => void;
+  compact?: boolean;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  const handleClick = async () => {
+    if (busy) return;
+    setBusy(true);
+    setToast(null);
+    try {
+      const r = await gitPull(sessionId);
+      const msg = r.output?.split("\n")[0] || "Up to date";
+      setToast({ kind: "ok", text: msg });
+      onPulled?.();
+    } catch (e) {
+      setToast({ kind: "err", text: String(e).replace(/^Error:\s*/, "") });
+    } finally {
+      setBusy(false);
+      setTimeout(() => setToast(null), 4000);
+    }
+  };
+
+  const btnStyle: React.CSSProperties = compact
+    ? { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "1px 6px", fontSize: 11, color: "var(--text-secondary)", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1 }
+    : { display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg-hover)", border: "1px solid var(--text-faintest)", borderRadius: 4, padding: "3px 10px", fontSize: 12, color: "var(--text-secondary)", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1 };
+
+  return (
+    <div style={{ position: "relative", display: "inline-block" }}>
+      <button
+        onClick={handleClick}
+        disabled={busy}
+        style={btnStyle}
+        title="git pull --ff-only"
+      >
+        <svg width={10} height={10} viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0 }}>
+          <path d="M7.78 12.53a.75.75 0 01-1.06 0L2.47 8.28a.75.75 0 011.06-1.06l2.72 2.72V2.75a.75.75 0 011.5 0v7.19l2.72-2.72a.75.75 0 111.06 1.06l-4.25 4.25zM2.75 14a.75.75 0 000 1.5h10.5a.75.75 0 000-1.5H2.75z" />
+        </svg>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {busy ? "Pulling…" : "Pull"}
+        </span>
+      </button>
+      {toast && (
+        <div
+          style={{
+            position: "absolute", top: "calc(100% + 4px)", left: 0, zIndex: 200,
+            background: toast.kind === "ok" ? "rgba(46,160,67,0.95)" : "rgba(248,81,73,0.95)",
+            color: "#fff", fontSize: 11, padding: "4px 8px", borderRadius: 4,
+            maxWidth: 320, whiteSpace: "pre-wrap", wordBreak: "break-word",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
+          }}
+        >
+          {toast.text}
+        </div>
+      )}
     </div>
   );
 }
