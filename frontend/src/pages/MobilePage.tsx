@@ -17,6 +17,7 @@ import {
   getGitGraph,
   gitCheckoutBranch,
   GitCheckoutConflictError,
+  gitPull,
   gitRollback,
   gitManualCommit,
   getCommitDetail,
@@ -948,6 +949,63 @@ function MobileFileDiff({ file, onClose }: { file: GitDiffFile; onClose: () => v
 /* ─── Mobile Git Panel ─── */
 const GIT_PAGE_SIZE = 15;
 
+function MobileGitPullButton({ sessionId, onPulled }: { sessionId: string; onPulled?: () => void | Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  const handleClick = async () => {
+    if (busy) return;
+    setBusy(true);
+    setToast(null);
+    try {
+      const r = await gitPull(sessionId);
+      const msg = r.output?.split("\n")[0] || "Up to date";
+      setToast({ kind: "ok", text: msg });
+      await onPulled?.();
+    } catch (e) {
+      setToast({ kind: "err", text: String(e).replace(/^Error:\s*/, "") });
+    } finally {
+      setBusy(false);
+      setTimeout(() => setToast(null), 4000);
+    }
+  };
+
+  return (
+    <div style={{ position: "relative", display: "inline-block", flexShrink: 0 }}>
+      <button
+        onClick={handleClick}
+        disabled={busy}
+        title={busy ? "Pulling…" : "git pull --ff-only"}
+        style={{
+          display: "inline-flex", alignItems: "center", gap: 4,
+          fontSize: 11, padding: "3px 10px",
+          background: "var(--bg-hover)", border: "1px solid var(--text-faintest)",
+          color: "var(--text-secondary)", borderRadius: 11,
+          cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1,
+        }}
+      >
+        <svg width={10} height={10} viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0 }}>
+          <path d="M7.78 12.53a.75.75 0 01-1.06 0L2.47 8.28a.75.75 0 011.06-1.06l2.72 2.72V2.75a.75.75 0 011.5 0v7.19l2.72-2.72a.75.75 0 111.06 1.06l-4.25 4.25zM2.75 14a.75.75 0 000 1.5h10.5a.75.75 0 000-1.5H2.75z" />
+        </svg>
+        <span>{busy ? "Pulling…" : "Pull"}</span>
+      </button>
+      {toast && (
+        <div
+          style={{
+            position: "absolute", top: "calc(100% + 4px)", left: 0, zIndex: 200,
+            background: toast.kind === "ok" ? "rgba(46,160,67,0.95)" : "rgba(248,81,73,0.95)",
+            color: "#fff", fontSize: 11, padding: "4px 8px", borderRadius: 4,
+            maxWidth: 280, whiteSpace: "pre-wrap", wordBreak: "break-word",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
+          }}
+        >
+          {toast.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sessionId: string; session: SessionMeta; onSessionChange: (s: SessionMeta) => void; onClose: () => void }) {
   const [log, setLog] = useState<GitLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1103,6 +1161,19 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
               onClick={() => setShowBranchSheet(true)}
               style={{ fontSize: 11, padding: "3px 10px", background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", color: "var(--accent-blue)", borderRadius: 11, fontFamily: "monospace", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 1 }}
             >⎇ {branches.current}</button>
+          )}
+          {isRepo && (
+            <MobileGitPullButton
+              sessionId={sessionId}
+              onPulled={async () => {
+                const [info, br] = await Promise.all([
+                  getGitInfo(sessionId).catch(() => null),
+                  getGitBranches(sessionId).catch(() => branches),
+                ]);
+                if (info) setLog(info.log);
+                setBranches(br);
+              }}
+            />
           )}
           <span style={{ fontSize: 12, color: "var(--text-muted)", marginLeft: "auto", flexShrink: 0 }}>{filtered.length} commits</span>
         </div>
