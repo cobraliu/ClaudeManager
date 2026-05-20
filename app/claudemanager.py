@@ -32,16 +32,25 @@ from app.services.cursor_session_reader import find_newest_cursor_session_id
 from app.models.user import UserRole
 from app.models.session import SessionStatus
 from app.observability import configure_logging
+from app.services.bash_term_service import TerminalManager
 from app.services.session_store import SessionStore
 from app.services.tmux_service import TmuxService
 from app.services.user_store import UserStore
-from app.ws import terminal_ws, shell_ws
+from app.ws import terminal_ws, shell_ws, term_ws
+from app.api import terminals as terminals_api
 
 # Init stores (both share the same database file)
 _db_path = get_session_db_path()
 user_store = UserStore(_db_path)
 session_store = SessionStore(db_path=_db_path)
 tmux = TmuxService(proxy=get_proxy(), claude_bin=get_claude_bin(), claude_shell=get_claude_shell(), cursor_bin=get_cursor_bin())
+term_mgr = TerminalManager(tmux)
+# Reap any leftover cmterm-* tmux sessions from a previous run (in-memory refcounts
+# are gone, so we can't reattach reliably).
+try:
+    term_mgr.reap_orphan_tmux_sessions()
+except Exception:
+    pass
 
 # Create default admin if no users exist
 if user_store.is_empty():
@@ -74,6 +83,8 @@ files_api.configure(session_store)
 code_api.configure(session_store)
 terminal_ws.configure(session_store, tmux)
 shell_ws.configure(tmux, sessions_api._shell_tokens)
+term_ws.configure(tmux, term_mgr)
+terminals_api.configure(session_store, term_mgr)
 
 configure_logging()
 
@@ -439,6 +450,21 @@ def _fire_due_tasks() -> None:
             tmux.send_keys(session.tmux_session_name, task.command)
             session_store.update_task_status(task.id, "sent")
             logger.info("task %s sent to session %s: %r", task.id, task.session_id, task.command)
+            # Repeating task: spawn the next iteration as a fresh pending row.
+            # Anchored on now, not task.run_at, so a missed-tick won't pile up.
+            if task.loop_seconds:
+                from datetime import datetime as _dt, timezone as _tz, timedelta
+                from app.models.session import ScheduledTask as _ScheduledTask
+                next_task = _ScheduledTask(
+                    session_id=task.session_id,
+                    owner_id=task.owner_id,
+                    command=task.command,
+                    run_at=_dt.now(_tz.utc) + timedelta(seconds=task.loop_seconds),
+                    loop_seconds=task.loop_seconds,
+                )
+                session_store.create_task(next_task)
+                logger.info("task %s scheduled next loop iteration %s at +%ds",
+                            task.id, next_task.id, task.loop_seconds)
         except Exception as exc:
             session_store.update_task_status(task.id, "failed", str(exc))
             logger.exception("task %s failed to send: %s", task.id, exc)
@@ -583,6 +609,8 @@ app.include_router(code_api.router)
 app.include_router(usage_api.router)
 app.include_router(terminal_ws.router)
 app.include_router(shell_ws.router)
+app.include_router(term_ws.router)
+app.include_router(terminals_api.router)
 
 
 @app.get("/health")

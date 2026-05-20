@@ -4,6 +4,7 @@ export interface ScheduledTask {
   run_at: string;
   status: string;
   created_at: string;
+  loop_seconds?: number | null;
 }
 
 export interface SessionMeta {
@@ -84,7 +85,13 @@ async function request<T>(
   }
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`${resp.status}: ${text}`);
+    let msg = text;
+    try {
+      const j = JSON.parse(text);
+      if (typeof j?.detail === "string") msg = j.detail;
+      else if (Array.isArray(j?.detail)) msg = j.detail.map((d: { msg?: string }) => d?.msg).filter(Boolean).join("; ") || text;
+    } catch { /* not JSON, use raw text */ }
+    throw new Error(msg || `HTTP ${resp.status}`);
   }
   if (resp.status === 204) return undefined as unknown as T;
   return resp.json();
@@ -643,6 +650,17 @@ export function moveEntry(
   });
 }
 
+export function deleteEntry(
+  sessionId: string,
+  path: string,
+  recursive = false,
+): Promise<void> {
+  return request(`/api/sessions/${sessionId}/fs/delete`, {
+    method: "POST",
+    body: JSON.stringify({ path, recursive }),
+  });
+}
+
 export interface ArchiveListResult {
   entries: string[];
   total: number;
@@ -702,11 +720,12 @@ export function writeFile(
 export function createTask(
   sessionId: string,
   command: string,
-  delay_seconds: number
+  delay_seconds: number,
+  loop_seconds?: number | null,
 ): Promise<ScheduledTask> {
   return request(`/api/sessions/${sessionId}/tasks`, {
     method: "POST",
-    body: JSON.stringify({ command, delay_seconds }),
+    body: JSON.stringify({ command, delay_seconds, loop_seconds: loop_seconds ?? null }),
   });
 }
 
@@ -757,6 +776,7 @@ export function listSessionAuqs(sessionId: string): Promise<AuqEntry[]> {
 export interface TodoItem {
   id?: string;
   content: string;
+  description?: string;
   activeForm?: string;
   status: "pending" | "in_progress" | "completed";
   priority?: "high" | "medium" | "low";
@@ -779,6 +799,68 @@ export function listSessionTodos(sessionId: string): Promise<TodoPlansResponse> 
 
 export function openShell(sessionId: string): Promise<AttachResponse> {
   return request(`/api/sessions/${sessionId}/shell`, { method: "POST", body: JSON.stringify({}) });
+}
+
+// ── Bash terminals (tmux-backed) ────────────────────────────────────────────
+
+export interface TerminalInfo {
+  term_id: string;
+  session_id: string;
+  name: string | null;
+  cwd: string;
+  is_named: boolean;
+  attach_count: number;
+  created_at: number;
+}
+
+export interface CreateTerminalResponse {
+  term_id: string;
+  name: string | null;
+  is_named: boolean;
+  ws_token: string;
+  ws_url: string;
+}
+
+export interface IssueTerminalTokenResponse {
+  term_id: string;
+  ws_token: string;
+  ws_url: string;
+}
+
+export function listTerminals(sessionId: string): Promise<{ items: TerminalInfo[] }> {
+  return request(`/api/sessions/${sessionId}/terminals`);
+}
+
+export function createTerminal(
+  sessionId: string,
+  opts: { name?: string | null; cwd?: string } = {},
+): Promise<CreateTerminalResponse> {
+  return request(`/api/sessions/${sessionId}/terminals`, {
+    method: "POST",
+    body: JSON.stringify({ name: opts.name ?? null, cwd: opts.cwd ?? null }),
+  });
+}
+
+export function issueTerminalToken(
+  sessionId: string,
+  termId: string,
+): Promise<IssueTerminalTokenResponse> {
+  return request(`/api/sessions/${sessionId}/terminals/${termId}/token`, { method: "POST" });
+}
+
+export function renameTerminal(
+  sessionId: string,
+  termId: string,
+  name: string | null,
+): Promise<TerminalInfo> {
+  return request(`/api/sessions/${sessionId}/terminals/${termId}/rename`, {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function deleteTerminal(sessionId: string, termId: string): Promise<{ ok: boolean }> {
+  return request(`/api/sessions/${sessionId}/terminals/${termId}`, { method: "DELETE" });
 }
 
 // Git
@@ -1029,6 +1111,10 @@ export interface RawContentBlock {
 
 export function getRawMessages(sessionId: string, tail = 500): Promise<{ messages: RawMessage[]; total: number }> {
   return request<{ messages: RawMessage[]; total: number }>(`/api/sessions/${sessionId}/raw-messages?tail=${tail}`);
+}
+
+export function getAllRawMessages(sessionId: string): Promise<{ messages: RawMessage[]; total: number }> {
+  return request<{ messages: RawMessage[]; total: number }>(`/api/sessions/${sessionId}/raw-messages/all`);
 }
 
 export interface SubAgentMeta {

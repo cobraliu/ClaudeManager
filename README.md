@@ -38,13 +38,15 @@ If you juggle several Claude Code sessions across different projects, the usual 
 
 - **Multi-session dashboard** — create, resume, attach, and terminate Claude Code sessions
 - **Embedded terminal** — full xterm.js terminal with direct tmux passthrough
+- **Persistent bash terminals** — open one or more bash terminals per session, named (survives disconnect) or ephemeral (auto-killed on detach). All are tmux-backed, multi-attach (same terminal from multiple browser tabs), and use tmux copy-mode for smooth server-side scrollback. Rename / delete from the in-page terminal header
 - **Chat view** — conversation bubbles parsed from the Claude JSONL in real time
 - **Code panel** — git diff of changed files with side-by-side diff viewer; full file tree
 - **JSONL viewer** — inspect the raw Claude conversation log for any session
 - **Load existing sessions** — import sessions from `~/.claude/projects/` by browsing the JSONL history
-- **Scheduled tasks** — send commands to a session at a future time, with a live floating panel showing pending / sent / failed tasks and per-task countdowns
+- **Scheduled tasks** — schedule commands to a session via a centered modal, with optional loop mode (repeats at a fixed interval after each fire); a live floating panel shows pending / sent / failed tasks and per-task countdowns
 - **Goals (`/goal`)** — track active and historical session goals parsed from the JSONL; click any goal to refill the input
 - **AUQs panel** — browse every `AskUserQuestion` interaction (question, options, and the answer — including free-text answers tagged distinctly), with ascending / descending sort
+- **Tasks panel** — Claude's TodoWrite / TaskCreate items surface with their `description` field rendered as a faint second line; completed items use a ✓ checkmark only (no strikethrough)
 - **Right-side dock** — Tasks / Goals / AUQs render as collapsible sections beside the conversation; toolbar buttons pulse green / blue when something is currently executing
 - **Slash-command badges** — `/goal`, `/compact`, etc. surface as styled badges in the conversation and session list, distinct from regular user input
 - **Compaction banner** — Chat shows a TUI-style `Compacting … XX%` banner with a live progress bar while `/compact` is running, driven by a `PreToolUse` hook plus strict TUI tail-screen detection (no false positives from chat history mentioning "compacting")
@@ -52,11 +54,14 @@ If you juggle several Claude Code sessions across different projects, the usual 
 - **Export Chat to HTML** — download a self-contained HTML file of the full conversation (inline CSS, light + dark theme, no external resources)
 - **File copy** — one-click "Copy to clipboard" button in both the file viewer modal and the inline file pane (rejects files >500 KB)
 - **Resizable chat input** — drag the textarea corner to enlarge for editing longer prompts
+- **Prompt draft persistence** — unsent prompt text is cached per-session in `localStorage` (4 KB cap, 10-minute TTL with heartbeat refresh) and restored after page refresh, tab close, or browser restart
+- **Layout schemes** — switch between **Classic** (three-column) and **Chat-Centric** (chat-maximized) layouts from the user settings modal; theme toggle and terminal font picker live in the same place
 - **Mobile-friendly** — swipe-to-scroll TUI history, floating ▲/▼ pagination buttons on touch devices, touch-to-select-and-copy in the TUI / shell pane, and Tasks / Goals / AUQs panels available on mobile
 - **Shell access** — sandboxed shell (firejail on Linux) in the session's working directory
 - **Git panel** — view git log and diffs per session
 - **User accounts** — JWT-based auth with admin and regular user roles; Google OAuth optional
 - **PreToolUse hook auto-injection** — server startup idempotently injects the per-session tool-call hook into `~/.claude/settings.json` (used for inline tool approval, AskUserQuestion prompts, and compaction detection)
+- **Workspace-trust auto-accept** — Claude's first-run "Trust this workspace?" dialog is dismissed automatically during session startup
 - **Standalone binary** — single-file distribution via PyInstaller (no Python install required)
 
 ---
@@ -144,8 +149,9 @@ Claude Code starts in a tmux pane and the session appears in the list within sec
 
 | View | Description |
 |---|---|
-| **Terminal** | Full xterm.js terminal forwarded directly to the tmux pane |
-| **Chat** | Read-only conversation bubbles parsed from the Claude JSONL, with mermaid rendering, resizable input, and a right-side dock for Tasks / Goals / AUQs |
+| **Terminal** | Full xterm.js terminal forwarded directly to the Claude tmux pane |
+| **Bash Terminal** | One or more named or ephemeral bash terminals per session, attached to dedicated tmux sessions. Switcher dropdown lets you open new, attach existing, rename, or delete. Multi-attach: open the same terminal from several tabs |
+| **Chat** | Read-only conversation bubbles parsed from the Claude JSONL, with mermaid rendering, resizable input, draft persistence across refresh, and a right-side dock for Tasks / Goals / AUQs |
 | **Code** | Changed files (git diff) and full file tree with diff viewer; one-click copy file contents to clipboard |
 
 ### Session actions

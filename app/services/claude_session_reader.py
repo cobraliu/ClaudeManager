@@ -430,13 +430,20 @@ def get_todo_plans(claude_session_id: str, cwd: str) -> dict:
                             # Append the new task onto the prior snapshot. Emit a combined
                             # id-and-content key set so anonymous TaskCreates (no id yet) can
                             # still chain into the next task_reminder snapshot that assigns ids.
-                            subject = inp.get("subject") or inp.get("description") or ""
+                            subject = inp.get("subject") or ""
+                            description = inp.get("description")
+                            if not subject:
+                                # Legacy: some callers only pass `description` — promote it
+                                # to subject so the task isn't dropped.
+                                subject = description or ""
+                                description = None
                             if not subject:
                                 continue
                             tid = inp.get("taskId") or inp.get("id")
                             new_task = {
                                 "id": tid,
                                 "content": subject,
+                                "description": description,
                                 "activeForm": inp.get("activeForm"),
                                 "status": "pending",
                                 "priority": inp.get("priority"),
@@ -475,6 +482,8 @@ def get_todo_plans(claude_session_id: str, cwd: str) -> dict:
                                         nx["status"] = inp.get("status")
                                     if inp.get("subject"):
                                         nx["content"] = inp.get("subject")
+                                    if "description" in inp:
+                                        nx["description"] = inp.get("description")
                                     if inp.get("activeForm"):
                                         nx["activeForm"] = inp.get("activeForm")
                                     updated.append(nx)
@@ -502,6 +511,7 @@ def get_todo_plans(claude_session_id: str, cwd: str) -> dict:
                         norm.append({
                             "id": it.get("id"),
                             "content": subject,
+                            "description": it.get("description"),
                             "activeForm": it.get("activeForm"),
                             "status": it.get("status", "pending"),
                             "priority": it.get("priority"),
@@ -630,10 +640,16 @@ def list_all_claude_sessions_global(excluded_ids: set[str]) -> list[dict]:
             if stem in excluded_ids:
                 continue
 
-            cwd = _read_session_cwd(jsonl_file)
-            if not cwd:
-                # Fallback: decode dir name ("-home-sgf-Projs-foo" → "/home/sgf/Projs/foo")
-                cwd = "/" + project_dir.name[1:].replace("-", "/")
+            # Decoded directory name is the authoritative "where this file lives now"
+            # (works for manually-moved files where internal cwd points to the old location).
+            decoded_dir = "/" + project_dir.name[1:].replace("-", "/")
+            internal_cwd = _read_session_cwd(jsonl_file)
+            # Trust the internal cwd only when it re-encodes to the same dir name —
+            # this preserves disambiguation when "_" → "-" collapsing makes decode lossy.
+            if internal_cwd and internal_cwd.replace("/", "-").replace("_", "-") == project_dir.name:
+                cwd = internal_cwd
+            else:
+                cwd = decoded_dir
 
             mtime = jsonl_file.stat().st_mtime
             data = enrich_session(stem, cwd)

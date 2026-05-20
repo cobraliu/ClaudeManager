@@ -13,17 +13,14 @@ import {
   restartServer,
   getSshConfig,
   updateSshConfig,
-  openShell,
   getSystemFonts,
   setTerminalFont,
   type UserInfo,
   type SessionMeta,
   type SshConfig,
-  type AttachResponse,
   type FontInfo,
 } from "../api/sessionApi";
 import { SessionCard } from "../components/SessionCard";
-import { TerminalPane } from "../components/TerminalPane";
 
 const PAGE_SIZE = 30;
 
@@ -37,7 +34,6 @@ interface Props {
 export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
   const [users, setUsers] = useState<UserInfo[]>([]);
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
-  const [shellTerminal, setShellTerminal] = useState<{ res: AttachResponse; cwd: string } | null>(null);
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newRole, setNewRole] = useState<"admin" | "user">("user");
@@ -126,15 +122,6 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
     document.addEventListener("visibilitychange", onVis);
     return () => { stop(); document.removeEventListener("visibilitychange", onVis); };
   }, [refreshUsers, refreshSessions]);
-
-  const handleShell = async (s: SessionMeta) => {
-    try {
-      const res = await openShell(s.id);
-      setShellTerminal({ res, cwd: s.cwd });
-    } catch (e) {
-      alert(String(e));
-    }
-  };
 
   // Debounced search
   useEffect(() => {
@@ -298,7 +285,7 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
             />
             <div style={{ columns: "minmax(260px, 1fr)", columnGap: 10 }}>
               {pageItems.map((s) => (
-                <SessionCard key={s.id} session={s} showOwner onShell={() => handleShell(s)} />
+                <SessionCard key={s.id} session={s} showOwner />
               ))}
             </div>
             {sessions.length === 0 && (
@@ -615,34 +602,6 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
         )}
       </div>
 
-      {/* ── Shell Terminal Modal ── */}
-      {shellTerminal && (
-        <div
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 3000 }}
-          onClick={() => setShellTerminal(null)}
-        >
-          <div
-            style={{ width: "90vw", height: "85vh", background: "var(--bg-base)", borderRadius: 10, border: "1px solid var(--border-strong)", display: "flex", flexDirection: "column", overflow: "hidden" }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ padding: "8px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--bg-hover)", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
-              <span style={{ fontSize: 13, color: "var(--text-secondary)", fontFamily: "monospace" }}>
-                &gt;_ {shellTerminal.cwd}
-              </span>
-              <button onClick={() => setShellTerminal(null)} style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 12, padding: "4px 10px" }}>✕</button>
-            </div>
-            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-              <TerminalPane
-                key={shellTerminal.res.session_id + shellTerminal.res.ws_token}
-                sessionId={shellTerminal.res.session_id}
-                wsUrl={shellTerminal.res.ws_url}
-                onDisconnect={() => setShellTerminal(null)}
-                defaultFit
-              />
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

@@ -487,13 +487,23 @@ function ActiveTodoList({
             <span style={{ fontSize: 11, color: statusColor(t.status), flexShrink: 0, marginTop: 1, fontFamily: "monospace" }}>
               {statusIcon(t.status)}
             </span>
-            <span style={{
-              fontSize: 12, lineHeight: 1.45, flex: 1,
-              color: t.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
-              textDecoration: t.status === "completed" ? "line-through" : "none",
-              wordBreak: "break-word",
-            }}>
-              {t.content}
+            <span style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+              <span style={{
+                fontSize: 12, lineHeight: 1.45,
+                color: t.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
+                wordBreak: "break-word",
+              }}>
+                {t.content}
+              </span>
+              {t.description && (
+                <span style={{
+                  fontSize: 11, lineHeight: 1.4, color: "var(--text-faint)",
+                  wordBreak: "break-word",
+                  opacity: t.status === "completed" ? 0.7 : 1,
+                }}>
+                  {t.description}
+                </span>
+              )}
             </span>
             {t.priority && (
               <span style={{ fontSize: 9, flexShrink: 0, padding: "1px 5px", borderRadius: 3, fontFamily: "monospace", fontWeight: 700, letterSpacing: "0.3px",
@@ -541,8 +551,15 @@ function TodoHistoryRow({ plan }: { plan: TodoPlan }) {
           {plan.todos.map((t, i) => (
             <div key={t.id ?? i} style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
               <span style={{ color: "var(--accent-green)", fontSize: 11, flexShrink: 0, marginTop: 1, fontFamily: "monospace" }}>✓</span>
-              <span style={{ fontSize: 11.5, lineHeight: 1.4, flex: 1, color: "var(--text-faint)", textDecoration: "line-through", wordBreak: "break-word" }}>
-                {t.content}
+              <span style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                <span style={{ fontSize: 11.5, lineHeight: 1.4, color: "var(--text-faint)", wordBreak: "break-word" }}>
+                  {t.content}
+                </span>
+                {t.description && (
+                  <span style={{ fontSize: 10.5, lineHeight: 1.4, color: "var(--text-faint)", opacity: 0.75, wordBreak: "break-word" }}>
+                    {t.description}
+                  </span>
+                )}
               </span>
             </div>
           ))}

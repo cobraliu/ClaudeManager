@@ -135,7 +135,12 @@ def get_changed_files(session_id: str, _user: CurrentUser) -> list[dict]:
         raise HTTPException(status_code=404)
 
     cwd = session.cwd
-    out = _git(cwd, "status", "--porcelain")
+    # -uall: list every untracked file individually instead of collapsing
+    # whole untracked directories into a single "dir/" entry (default
+    # -unormal behavior).  Without this, the changes tree shows a folder
+    # with an unnamed file row underneath, and the user can't see which
+    # files inside the directory are new.
+    out = _git(cwd, "status", "--porcelain", "-uall")
     if not out:
         return []
 
