@@ -353,6 +353,8 @@ export function SessionCard({
           : "1px solid var(--bg-hover)",
         cursor: (canAttach && onAttach) || (canResume && onViewChat) ? "pointer" : "default",
         breakInside: "avoid",
+        minWidth: 0,
+        overflow: "hidden",
       }}
       onClick={() => {
         if (canAttach && onAttach) { onAttach(); }
@@ -360,8 +362,8 @@ export function SessionCard({
       }}
     >
       {/* row 1: owner? + project + status */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, flex: "1 1 auto" }}>
           {showOwner && (
             <span style={{ fontSize: 10, background: "var(--text-faintest)", padding: "1px 5px", borderRadius: 3, color: "var(--text-secondary)" }}>
               {s.owner_id}
@@ -379,7 +381,7 @@ export function SessionCard({
               autoFocus
             />
           ) : (
-            <strong style={{ fontSize: 13, cursor: "text" }} title="Click to rename" onClick={startEdit}>{s.project}</strong>
+            <strong style={{ fontSize: 13, cursor: "text", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }} title="Click to rename" onClick={startEdit}>{s.project}</strong>
           )}
           {s.is_streaming && <span className="streaming-dot" title="Terminal is outputting" />}
           {!s.is_streaming && s.has_new_output && <span className="new-output-dot" title="New output since last view" />}
@@ -393,7 +395,7 @@ export function SessionCard({
             </span>
           )}
         </div>
-        <span style={{ fontSize: 10, color: STATUS_COLORS[s.status] || "var(--text-muted)", fontWeight: 600, textTransform: "uppercase" }}>
+        <span style={{ fontSize: 10, color: STATUS_COLORS[s.status] || "var(--text-muted)", fontWeight: 600, textTransform: "uppercase", flexShrink: 0, whiteSpace: "nowrap" }}>
           {s.status}
         </span>
       </div>
