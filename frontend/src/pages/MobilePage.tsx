@@ -49,6 +49,9 @@ import {
   setClaudeSessionId,
   fetchRawFileBlob,
   browseExternalSessions,
+  browseCursorSessions,
+  getExternalPreview,
+  type ExternalPreview,
   listModels,
   setSessionModel,
   getSystemFonts,
@@ -260,18 +263,99 @@ function relativeTime(mtime: number): string {
   return new Date(mtime * 1000).toLocaleDateString();
 }
 
+function MobileSessionPreviewModal({
+  session, tool, onClose,
+}: { session: ExternalSession; tool: "claude" | "cursor"; onClose: () => void }) {
+  const [preview, setPreview] = useState<ExternalPreview | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    getExternalPreview(session.claude_session_id, session.cwd, tool)
+      .then(setPreview)
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [session.claude_session_id, session.cwd, tool]);
+
+  const turns = preview?.turns ?? [];
+  const splitAt = preview && preview.truncated_before > 0 ? 100 : turns.length;
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 500, display: "flex", flexDirection: "column" }}>
+      <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1, flexShrink: 0 }}>‹</button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {session.title || "No title"}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {session.cwd}
+          </div>
+        </div>
+        {preview && (
+          <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{preview.total} turns</span>
+        )}
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+        {loading && <div style={{ color: "var(--text-faint)", fontSize: 13, textAlign: "center", marginTop: 32 }}>Loading…</div>}
+        {!loading && !preview && <div style={{ color: "var(--text-faint)", fontSize: 13, textAlign: "center", marginTop: 32 }}>Failed to load preview.</div>}
+        {preview && (
+          <>
+            {turns.slice(0, splitAt).map((t, i) => (
+              <PreviewTurnBubble key={`head-${i}`} turn={t} />
+            ))}
+            {preview.truncated_before > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 0" }}>
+                <div style={{ flex: 1, height: 1, background: "var(--border)" }} />
+                <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0, padding: "2px 10px", background: "var(--bg-surface)", borderRadius: 12, border: "1px solid var(--border)" }}>
+                  … {preview.truncated_before} messages omitted …
+                </span>
+                <div style={{ flex: 1, height: 1, background: "var(--border)" }} />
+              </div>
+            )}
+            {preview.truncated_before > 0 && turns.slice(100).map((t, i) => (
+              <PreviewTurnBubble key={`tail-${i}`} turn={t} />
+            ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PreviewTurnBubble({ turn }: { turn: { role: string; text: string; ts: number } }) {
+  const isUser = turn.role === "user";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}>
+      <div style={{
+        maxWidth: "90%", padding: "8px 12px", borderRadius: 10, fontSize: 13, lineHeight: 1.5,
+        background: isUser ? "var(--accent-blue)" : "var(--bg-surface)",
+        color: isUser ? "#fff" : "var(--text-body)",
+        border: isUser ? "none" : "1px solid var(--border)",
+        whiteSpace: "pre-wrap", wordBreak: "break-word",
+      }}>
+        {turn.text.length > 600 ? turn.text.slice(0, 600) + "…" : turn.text}
+      </div>
+    </div>
+  );
+}
+
 function MobileBrowseExternalPanel({
   onClose, onLoad,
-}: { onClose: () => void; onLoad: (ext: ExternalSession) => Promise<void> }) {
+}: { onClose: () => void; onLoad: (ext: ExternalSession, tool: "claude" | "cursor") => Promise<void> }) {
+  const [tool, setTool] = useState<"claude" | "cursor">("claude");
   const [groups, setGroups] = useState<ExternalSessionGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [previewSession, setPreviewSession] = useState<ExternalSession | null>(null);
 
   useEffect(() => {
-    browseExternalSessions().then((data) => setGroups(data)).catch(() => {}).finally(() => setLoading(false));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    setLoading(true);
+    setGroups([]);
+    const fetcher = tool === "cursor" ? browseCursorSessions : browseExternalSessions;
+    fetcher().then((data) => setGroups(data)).catch(() => {}).finally(() => setLoading(false));
+  }, [tool]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const q = search.toLowerCase();
 
@@ -303,7 +387,18 @@ function MobileBrowseExternalPanel({
       {/* Header */}
       <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
         <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1, flexShrink: 0 }}>‹</button>
-        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Browse External Sessions</span>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Browse External Sessions</span>
+        <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden", flexShrink: 0 }}>
+          {(["claude", "cursor"] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setTool(t)}
+              style={{ padding: "4px 10px", fontSize: 12, background: tool === t ? "var(--bg-hover)" : "transparent", color: tool === t ? "var(--text-body)" : "var(--text-muted)", border: "none", cursor: "pointer", textTransform: "capitalize" }}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
       </div>
       {/* Search */}
       <div style={{ flexShrink: 0, padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
@@ -374,25 +469,37 @@ function MobileBrowseExternalPanel({
                         </span>
                       </div>
                     </div>
-                    <button
-                      disabled={!canLoad || isLoadingThis}
-                      onPointerDown={(e) => e.preventDefault()}
-                      onClick={async () => {
-                        if (!canLoad) return;
-                        setLoadingId(s.claude_session_id);
-                        try { await onLoad(s); } finally { setLoadingId(null); }
-                      }}
-                      style={{
-                        background: canLoad ? "var(--accent-blue)" : "var(--bg-hover)",
-                        color: canLoad ? "#fff" : "var(--text-faint)",
-                        border: "none", borderRadius: 6,
-                        padding: "6px 14px", fontSize: 13,
-                        cursor: canLoad ? "pointer" : "not-allowed",
-                        flexShrink: 0, opacity: isLoadingThis ? 0.6 : 1,
-                      }}
-                    >
-                      {isLoadingThis ? "…" : "Load"}
-                    </button>
+                    <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                      <button
+                        onClick={() => setPreviewSession(s)}
+                        style={{
+                          background: "var(--bg-hover)", color: "var(--text-secondary)",
+                          border: "1px solid var(--border)", borderRadius: 6,
+                          padding: "6px 10px", fontSize: 12, cursor: "pointer",
+                        }}
+                      >
+                        View
+                      </button>
+                      <button
+                        disabled={!canLoad || isLoadingThis}
+                        onPointerDown={(e) => e.preventDefault()}
+                        onClick={async () => {
+                          if (!canLoad) return;
+                          setLoadingId(s.claude_session_id);
+                          try { await onLoad(s, tool); } finally { setLoadingId(null); }
+                        }}
+                        style={{
+                          background: canLoad ? "var(--accent-blue)" : "var(--bg-hover)",
+                          color: canLoad ? "#fff" : "var(--text-faint)",
+                          border: "none", borderRadius: 6,
+                          padding: "6px 14px", fontSize: 13,
+                          cursor: canLoad ? "pointer" : "not-allowed",
+                          opacity: isLoadingThis ? 0.6 : 1,
+                        }}
+                      >
+                        {isLoadingThis ? "…" : "Load"}
+                      </button>
+                    </div>
                   </div>
                 );
               })}
@@ -400,6 +507,13 @@ function MobileBrowseExternalPanel({
           );
         })}
       </div>
+      {previewSession && (
+        <MobileSessionPreviewModal
+          session={previewSession}
+          tool={tool}
+          onClose={() => setPreviewSession(null)}
+        />
+      )}
     </div>
   );
 }
@@ -657,9 +771,9 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
       {showImport && (
         <MobileBrowseExternalPanel
           onClose={() => setShowImport(false)}
-          onLoad={async (ext) => {
+          onLoad={async (ext, tool) => {
             const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
-            const newSession = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id });
+            const newSession = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id, tool });
             setShowImport(false);
             onOpen(newSession);
           }}
@@ -4014,9 +4128,9 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       {showImport && (
         <MobileBrowseExternalPanel
           onClose={() => setShowImport(false)}
-          onLoad={async (ext) => {
+          onLoad={async (ext, tool) => {
             const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
-            const s = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id });
+            const s = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id, tool });
             setShowImport(false); setSession(s);
           }}
         />
