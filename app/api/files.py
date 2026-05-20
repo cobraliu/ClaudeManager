@@ -717,6 +717,66 @@ def rename_entry(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+class DeleteRequest(BaseModel):
+    path: str               # relative path of the file or directory to delete
+    recursive: bool = False  # if true, allow rmtree on non-empty directories
+
+
+@router.post("/{session_id}/fs/delete", status_code=status.HTTP_204_NO_CONTENT)
+def delete_entry(
+    session_id: str,
+    body: DeleteRequest,
+    user_id: CurrentUser = None,  # type: ignore[assignment]
+) -> None:
+    """Delete a file or directory inside the session workspace.
+
+    Safety checks:
+      - path must resolve inside cwd (no traversal)
+      - cannot delete the cwd root
+      - non-empty directory requires recursive=true
+    """
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not body.path:
+        raise HTTPException(status_code=400, detail="path required")
+
+    base = Path(session.cwd).resolve()
+    target = _resolve(session.cwd, body.path)
+    if not target.exists() and not target.is_symlink():
+        raise HTTPException(status_code=404, detail="path not found")
+
+    # Refuse to delete the workspace root itself.
+    if target.resolve() == base:
+        raise HTTPException(status_code=403, detail="cannot delete workspace root")
+
+    if target.is_symlink() or target.is_file():
+        try:
+            target.unlink()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return
+
+    if target.is_dir():
+        try:
+            has_entries = any(target.iterdir())
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if has_entries and not body.recursive:
+            raise HTTPException(status_code=409, detail="directory not empty")
+        try:
+            if has_entries:
+                shutil.rmtree(target)
+            else:
+                target.rmdir()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return
+
+    raise HTTPException(status_code=400, detail="unsupported entry type")
+
+
 class ArchiveListResponse(BaseModel):
     entries: list[str]
     total: int

@@ -25,6 +25,19 @@ import {
   saveGitignore,
   gitSetRemote,
   listFiles,
+  searchFiles,
+  createDir,
+  uploadFile,
+  renameEntry,
+  moveEntry,
+  deleteEntry,
+  listDirs,
+  writeFile,
+  getFileGitLog,
+  getFileGitShow,
+  getFileGitDiff,
+  getDirInfo,
+  downloadDirZip,
   readFile,
   sqliteQuery,
   sqliteExec,
@@ -338,7 +351,17 @@ function MobileBrowseExternalPanel({
                           <PromptText text={s.prompts[s.prompts.length - 1]} />
                         </div>
                       )}
-                      <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>{relativeTime(s.mtime)}</div>
+                      <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2, display: "flex", gap: 8, alignItems: "center" }}>
+                        <span>{relativeTime(s.mtime)}</span>
+                        <span
+                          title={s.claude_session_id}
+                          style={{ fontFamily: "var(--font-mono, monospace)", color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                        >
+                          {s.claude_session_id.length > 18
+                            ? `${s.claude_session_id.slice(0, 8)}…${s.claude_session_id.slice(-5)}`
+                            : s.claude_session_id}
+                        </span>
+                      </div>
                     </div>
                     <button
                       disabled={!canLoad || isLoadingThis}
@@ -1189,9 +1212,15 @@ function MobileSchedulePanel({
               const secondsLeft = Math.max(0, Math.round((runAt.getTime() - Date.now()) / 1000));
               const minsLeft = Math.floor(secondsLeft / 60);
               const secsLeft = secondsLeft % 60;
+              const isLoop = !!t.loop_seconds;
+              const loopSec = t.loop_seconds ?? 0;
+              const loopLabel = loopSec < 60 ? `${loopSec}s` : loopSec < 3600 ? `${Math.floor(loopSec / 60)}m` : `${Math.floor(loopSec / 3600)}h`;
               return (
-                <div key={t.id} style={{ background: "var(--bg-surface)", border: "1px solid var(--border-subtle)", borderRadius: 8, padding: "10px 12px", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <div key={t.id} style={{ background: isLoop ? "rgba(124,58,237,0.15)" : "var(--bg-surface)", border: isLoop ? "1px solid #7c3aed" : "1px solid var(--border-subtle)", borderRadius: 8, padding: "10px 12px", display: "flex", gap: 10, alignItems: "flex-start" }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                      {isLoop && <span style={{ color: "#a78bfa", fontSize: 12, fontWeight: 700 }}>↻ every {loopLabel}</span>}
+                    </div>
                     <div style={{ fontSize: 13, color: "var(--text-primary)", marginBottom: 4, wordBreak: "break-word" }}>{t.command}</div>
                     <div style={{ fontSize: 11, color: "var(--text-faint)" }}>
                       Runs at {runAt.toLocaleTimeString()} · in {minsLeft > 0 ? `${minsLeft}m ` : ""}{secsLeft}s
@@ -1278,12 +1307,20 @@ function MobileTasksPanel({
                   border: "1px solid " + (t.status === "in_progress" ? "rgba(245,158,11,0.3)" : "transparent"),
                 }}>
                   <span style={{ fontSize: 12, color: statusColor(t.status), flexShrink: 0, marginTop: 2, fontFamily: "monospace" }}>{statusIcon(t.status)}</span>
-                  <span style={{
-                    fontSize: 13, lineHeight: 1.45, flex: 1,
-                    color: t.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
-                    textDecoration: t.status === "completed" ? "line-through" : "none",
-                    wordBreak: "break-word",
-                  }}>{t.content}</span>
+                  <span style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                    <span style={{
+                      fontSize: 13, lineHeight: 1.45,
+                      color: t.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
+                      wordBreak: "break-word",
+                    }}>{t.content}</span>
+                    {t.description && (
+                      <span style={{
+                        fontSize: 12, lineHeight: 1.4, color: "var(--text-faint)",
+                        wordBreak: "break-word",
+                        opacity: t.status === "completed" ? 0.7 : 1,
+                      }}>{t.description}</span>
+                    )}
+                  </span>
                 </div>
               ))}
             </div>
@@ -1325,7 +1362,12 @@ function MobileTodoHistoryRow({ plan }: { plan: TodoPlan }) {
           {plan.todos.map((t, i) => (
             <div key={t.id ?? i} style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
               <span style={{ color: "var(--accent-green)", fontSize: 11, flexShrink: 0, marginTop: 2, fontFamily: "monospace" }}>✓</span>
-              <span style={{ fontSize: 12, lineHeight: 1.4, flex: 1, color: "var(--text-faint)", textDecoration: "line-through", wordBreak: "break-word" }}>{t.content}</span>
+              <span style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                <span style={{ fontSize: 12, lineHeight: 1.4, color: "var(--text-faint)", wordBreak: "break-word" }}>{t.content}</span>
+                {t.description && (
+                  <span style={{ fontSize: 11, lineHeight: 1.4, color: "var(--text-faint)", opacity: 0.75, wordBreak: "break-word" }}>{t.description}</span>
+                )}
+              </span>
             </div>
           ))}
         </div>
@@ -2116,6 +2158,19 @@ function MobileSqliteViewer({ sessionId, path }: { sessionId: string; path: stri
 
 interface DirNodeState { entries: FileEntry[]; loaded: boolean; expanded: boolean; loading: boolean; }
 
+type FileSheetKind =
+  | null
+  | "search"
+  | "newFile"
+  | "newFolder"
+  | "upload"
+  | "action"      // long-press action menu
+  | "rename"
+  | "move"
+  | "deleteConfirm"
+  | "gitHistory"
+  | "gitCommit";  // viewing a single commit
+
 function MobileFileBrowserPanel({
   sessionId, sessionCwd, onClose, onSetBackHandler,
 }: {
@@ -2133,6 +2188,49 @@ function MobileFileBrowserPanel({
   const [fileError, setFileError] = useState("");
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
 
+  // ── Toolbar / action-sheet state ─────────────────────────────────────────
+  const [sheet, setSheet] = useState<FileSheetKind>(null);
+  const [sheetTarget, setSheetTarget] = useState<FileEntry | null>(null);
+  const [sheetBusy, setSheetBusy] = useState(false);
+  const [sheetError, setSheetError] = useState("");
+
+  // Search
+  const [searchQ, setSearchQ] = useState("");
+  const [searchResults, setSearchResults] = useState<FileEntry[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+
+  // New file / new folder
+  const [newName, setNewName] = useState("");
+  const [newParentDir, setNewParentDir] = useState("");
+  const [newDirChoices, setNewDirChoices] = useState<string[]>([]);
+
+  // Upload
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const [uploadDir, setUploadDir] = useState("");
+  const [uploadFileObj, setUploadFileObj] = useState<File | null>(null);
+
+  // Rename
+  const [renameValue, setRenameValue] = useState("");
+
+  // Move
+  const [moveDest, setMoveDest] = useState("");
+  const [moveDirChoices, setMoveDirChoices] = useState<string[]>([]);
+
+  // Delete
+  const [deleteRecursive, setDeleteRecursive] = useState(false);
+
+  // Git history
+  const [gitLog, setGitLog] = useState<Array<{ hash: string; short_hash: string; subject: string; author: string; date: string }>>([]);
+  const [gitLoading, setGitLoading] = useState(false);
+  const [gitCommit, setGitCommit] = useState<{ hash: string; short_hash: string; subject: string } | null>(null);
+  const [gitMode, setGitMode] = useState<"diff" | "full">("diff");
+  const [gitDiff, setGitDiff] = useState("");
+  const [gitFull, setGitFull] = useState("");
+  const [gitDetailLoading, setGitDetailLoading] = useState(false);
+
+  // Download zip
+  const [zipBusy, setZipBusy] = useState(false);
+
   const loadDir = useCallback(async (path: string, hidden = false) => {
     setTree(t => ({ ...t, [path]: { ...t[path], loading: true } }));
     try {
@@ -2143,16 +2241,213 @@ function MobileFileBrowserPanel({
     }
   }, [sessionId]);
 
+  const reloadRoot = useCallback(async () => {
+    setRootLoading(true);
+    try {
+      const res = await listFiles(sessionId, undefined, showHidden);
+      setRootEntries(res.entries);
+    } catch { setRootEntries([]); } finally { setRootLoading(false); }
+  }, [sessionId, showHidden]);
+
+  /** Reload the directory containing `path`, plus its parents up to root, so
+   *  the tree reflects the change after a rename/move/delete/create. */
+  const reloadAffected = useCallback(async (path: string) => {
+    const parent = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
+    if (parent === "") {
+      await reloadRoot();
+    } else {
+      // Reload the parent dir node
+      try {
+        const res = await listFiles(sessionId, parent, showHidden);
+        setTree(t => ({ ...t, [parent]: { entries: res.entries, loaded: true, expanded: true, loading: false } }));
+      } catch { /* ignore */ }
+    }
+  }, [sessionId, showHidden, reloadRoot]);
+
   useEffect(() => {
     (async () => {
       setRootLoading(true);
       try {
-        // Pass undefined (no path) → backend uses session.cwd as root
         const res = await listFiles(sessionId, undefined, showHidden);
         setRootEntries(res.entries);
       } catch { setRootEntries([]); } finally { setRootLoading(false); }
     })();
   }, [sessionId, sessionCwd, showHidden]);
+
+  // Reset sheet state when sheet changes
+  useEffect(() => {
+    setSheetError("");
+    if (sheet === null) {
+      setSheetTarget(null);
+      setSheetBusy(false);
+      setSearchQ(""); setSearchResults([]);
+      setNewName(""); setNewParentDir(""); setNewDirChoices([]);
+      setUploadDir(""); setUploadFileObj(null);
+      setRenameValue("");
+      setMoveDest(""); setMoveDirChoices([]);
+      setDeleteRecursive(false);
+      setGitLog([]); setGitCommit(null);
+      setGitDiff(""); setGitFull("");
+    }
+  }, [sheet]);
+
+  // Load dir choices for sheets that need a destination picker
+  useEffect(() => {
+    if (sheet === "newFile" || sheet === "newFolder" || sheet === "upload" || sheet === "move") {
+      listDirs(sessionCwd).then(dirs => {
+        const choices = ["", ...dirs.map(d => d.startsWith(sessionCwd + "/") ? d.substring(sessionCwd.length + 1) : "")].filter((v, i, a) => a.indexOf(v) === i);
+        if (sheet === "move") setMoveDirChoices(choices); else setNewDirChoices(choices);
+      }).catch(() => { /* ignore */ });
+    }
+  }, [sheet, sessionCwd]);
+
+  // Sheet back handler — back closes the active sheet first
+  useEffect(() => {
+    if (sheet) {
+      history.pushState({ mobileFilesSheet: sheet }, "");
+      onSetBackHandler(() => setSheet(null));
+    } else if (!previewEntry) {
+      onSetBackHandler(null);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sheet]);
+
+  // ── Actions ──────────────────────────────────────────────────────────────
+
+  const doSearch = useCallback(async () => {
+    if (!searchQ.trim()) { setSearchResults([]); return; }
+    setSearchLoading(true);
+    try {
+      const res = await searchFiles(sessionId, searchQ.trim(), showHidden);
+      setSearchResults(res.entries);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setSearchLoading(false); }
+  }, [sessionId, searchQ, showHidden]);
+
+  const doCreateFile = useCallback(async () => {
+    if (!newName.trim()) { setSheetError("file name required"); return; }
+    if (/[/\\]/.test(newName)) { setSheetError("name cannot contain / or \\"); return; }
+    setSheetBusy(true); setSheetError("");
+    try {
+      const fullPath = newParentDir ? `${newParentDir}/${newName.trim()}` : newName.trim();
+      await writeFile(sessionId, fullPath, "");
+      await reloadAffected(fullPath);
+      setSheet(null);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setSheetBusy(false); }
+  }, [sessionId, newName, newParentDir, reloadAffected]);
+
+  const doCreateFolder = useCallback(async () => {
+    if (!newName.trim()) { setSheetError("folder name required"); return; }
+    if (/[/\\]/.test(newName)) { setSheetError("name cannot contain / or \\"); return; }
+    setSheetBusy(true); setSheetError("");
+    try {
+      const fullPath = newParentDir ? `${newParentDir}/${newName.trim()}` : newName.trim();
+      await createDir(sessionId, fullPath);
+      await reloadAffected(fullPath);
+      setSheet(null);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setSheetBusy(false); }
+  }, [sessionId, newName, newParentDir, reloadAffected]);
+
+  const doUpload = useCallback(async () => {
+    if (!uploadFileObj) { setSheetError("pick a file first"); return; }
+    setSheetBusy(true); setSheetError("");
+    try {
+      await uploadFile(sessionId, uploadDir, uploadFileObj);
+      const dest = uploadDir ? `${uploadDir}/${uploadFileObj.name}` : uploadFileObj.name;
+      await reloadAffected(dest);
+      setSheet(null);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setSheetBusy(false); }
+  }, [sessionId, uploadDir, uploadFileObj, reloadAffected]);
+
+  const doRename = useCallback(async () => {
+    if (!sheetTarget) return;
+    const v = renameValue.trim();
+    if (!v) { setSheetError("new name required"); return; }
+    if (/[/\\]/.test(v)) { setSheetError("name cannot contain / or \\"); return; }
+    if (v === sheetTarget.name) { setSheet(null); return; }
+    setSheetBusy(true); setSheetError("");
+    try {
+      await renameEntry(sessionId, sheetTarget.path, v);
+      await reloadAffected(sheetTarget.path);
+      setSheet(null);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setSheetBusy(false); }
+  }, [sessionId, sheetTarget, renameValue, reloadAffected]);
+
+  const doMove = useCallback(async () => {
+    if (!sheetTarget) return;
+    if (moveDest === undefined) { setSheetError("destination required"); return; }
+    setSheetBusy(true); setSheetError("");
+    try {
+      await moveEntry(sessionId, sheetTarget.path, moveDest);
+      await reloadAffected(sheetTarget.path);
+      // Also reload destination dir
+      if (moveDest !== "") await reloadAffected(`${moveDest}/x`);
+      else await reloadRoot();
+      setSheet(null);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setSheetBusy(false); }
+  }, [sessionId, sheetTarget, moveDest, reloadAffected, reloadRoot]);
+
+  const doDelete = useCallback(async () => {
+    if (!sheetTarget) return;
+    setSheetBusy(true); setSheetError("");
+    try {
+      await deleteEntry(sessionId, sheetTarget.path, deleteRecursive);
+      await reloadAffected(sheetTarget.path);
+      setSheet(null);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setSheetBusy(false); }
+  }, [sessionId, sheetTarget, deleteRecursive, reloadAffected]);
+
+  const openGitHistory = useCallback(async (entry: FileEntry) => {
+    setSheetTarget(entry); setSheet("gitHistory");
+    setGitLoading(true); setGitLog([]);
+    try {
+      const log = await getFileGitLog(sessionId, entry.path, 50);
+      setGitLog(log);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setGitLoading(false); }
+  }, [sessionId]);
+
+  const openGitCommit = useCallback(async (commit: { hash: string; short_hash: string; subject: string }) => {
+    if (!sheetTarget) return;
+    setGitCommit(commit); setSheet("gitCommit");
+    setGitMode("diff"); setGitDiff(""); setGitFull(""); setGitDetailLoading(true);
+    try {
+      const res = await getFileGitDiff(sessionId, sheetTarget.path, commit.hash);
+      setGitDiff(res.diff);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setGitDetailLoading(false); }
+  }, [sessionId, sheetTarget]);
+
+  const loadGitFullAtCommit = useCallback(async () => {
+    if (!sheetTarget || !gitCommit) return;
+    setGitDetailLoading(true);
+    try {
+      const res = await getFileGitShow(sessionId, sheetTarget.path, gitCommit.hash);
+      setGitFull(res.content);
+    } catch (e) { setSheetError(String(e)); }
+    finally { setGitDetailLoading(false); }
+  }, [sessionId, sheetTarget, gitCommit]);
+
+  const handleDownloadZip = useCallback(async () => {
+    setZipBusy(true);
+    try {
+      const info = await getDirInfo(sessionId, "");
+      const compress = info.total_size > 16 * 1024 * 1024;
+      if (info.total_size > 100 * 1024 * 1024) {
+        if (!window.confirm(`Workspace is ${(info.total_size / 1024 / 1024).toFixed(1)}MB. Download anyway?`)) {
+          setZipBusy(false); return;
+        }
+      }
+      await downloadDirZip(sessionId, "", [], compress);
+    } catch (e) { alert(String(e)); }
+    finally { setZipBusy(false); }
+  }, [sessionId]);
 
   const openFile = useCallback(async (entry: FileEntry) => {
     setPreviewEntry(entry);
@@ -2199,6 +2494,42 @@ function MobileFileBrowserPanel({
     setTree(t => ({ ...t, [path]: { ...t[path], expanded: !t[path].expanded } }));
   }, [tree, loadDir, showHidden]);
 
+  // Long-press detection — fires after ~500ms hold without movement.
+  const longPressTimer = useRef<number | null>(null);
+  const longPressFired = useRef(false);
+  const longPressStart = useRef<{ x: number; y: number } | null>(null);
+
+  const onEntryTouchStart = useCallback((e: React.TouchEvent, entry: FileEntry) => {
+    const t = e.touches[0];
+    longPressFired.current = false;
+    longPressStart.current = { x: t.clientX, y: t.clientY };
+    if (longPressTimer.current) window.clearTimeout(longPressTimer.current);
+    longPressTimer.current = window.setTimeout(() => {
+      longPressFired.current = true;
+      setSheetTarget(entry);
+      setSheet("action");
+      // Haptic feedback if supported
+      try { (navigator as Navigator & { vibrate?: (p: number) => void }).vibrate?.(20); } catch { /* ignore */ }
+    }, 500);
+  }, []);
+
+  const onEntryTouchMove = useCallback((e: React.TouchEvent) => {
+    if (!longPressStart.current) return;
+    const t = e.touches[0];
+    const dx = t.clientX - longPressStart.current.x;
+    const dy = t.clientY - longPressStart.current.y;
+    if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+      if (longPressTimer.current) window.clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  }, []);
+
+  const onEntryTouchEnd = useCallback(() => {
+    if (longPressTimer.current) window.clearTimeout(longPressTimer.current);
+    longPressTimer.current = null;
+    longPressStart.current = null;
+  }, []);
+
   function renderEntries(entries: FileEntry[], depth = 0): React.ReactNode {
     return entries.map(entry => {
       const indent = 12 + depth * 18;
@@ -2208,8 +2539,13 @@ function MobileFileBrowserPanel({
         const loading = node?.loading ?? false;
         return (
           <div key={entry.path}>
-            <div onClick={() => !entry.is_skipped && toggleDir(entry.path)}
-              style={{ padding: `10px 12px 10px ${indent}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: entry.is_skipped ? "default" : "pointer", userSelect: "none" }}>
+            <div
+              onClick={() => { if (longPressFired.current) return; if (!entry.is_skipped) toggleDir(entry.path); }}
+              onTouchStart={(e) => onEntryTouchStart(e, entry)}
+              onTouchMove={onEntryTouchMove}
+              onTouchEnd={onEntryTouchEnd}
+              onTouchCancel={onEntryTouchEnd}
+              style={{ padding: `10px 12px 10px ${indent}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: entry.is_skipped ? "default" : "pointer", userSelect: "none", WebkitTouchCallout: "none" }}>
               <span style={{ fontSize: 10, color: "var(--text-faint)", width: 10, flexShrink: 0 }}>{entry.is_skipped ? "" : expanded ? "▼" : "▶"}</span>
               <span style={{ fontSize: 16 }}>📁</span>
               <span style={{ fontSize: 14, color: entry.is_skipped ? "var(--text-faint)" : "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -2223,8 +2559,13 @@ function MobileFileBrowserPanel({
       }
       const clickable = entry.is_text || entry.is_sqlite || getMobileFileKind(entry) === "pdf" || getMobileFileKind(entry) === "image";
       return (
-        <div key={entry.path} onClick={() => clickable && openFile(entry)}
-          style={{ padding: `10px 12px 10px ${indent + 18}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: clickable ? "pointer" : "default" }}>
+        <div key={entry.path}
+          onClick={() => { if (longPressFired.current) return; if (clickable) openFile(entry); }}
+          onTouchStart={(e) => onEntryTouchStart(e, entry)}
+          onTouchMove={onEntryTouchMove}
+          onTouchEnd={onEntryTouchEnd}
+          onTouchCancel={onEntryTouchEnd}
+          style={{ padding: `10px 12px 10px ${indent + 18}px`, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid var(--border-subtle)", cursor: clickable ? "pointer" : "default", userSelect: "none", WebkitTouchCallout: "none" }}>
           <span style={{ fontSize: 15 }}>{mobileFileIcon(entry.name)}</span>
           <span style={{ fontSize: 14, color: clickable ? "var(--text-primary)" : "var(--text-faint)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
           {entry.size != null && <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{mobileFormatSize(entry.size)}</span>}
@@ -2281,14 +2622,31 @@ function MobileFileBrowserPanel({
   }
 
   // ── Tree view ─────────────────────────────────────────────────────────────
+  const toolbarBtnStyle: React.CSSProperties = {
+    fontSize: 16, width: 32, height: 32, padding: 0, background: "transparent",
+    border: "1px solid transparent", borderRadius: 6, color: "var(--text-secondary)",
+    cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+    flexShrink: 0,
+  };
   return (
     <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+      {/* Top row: back / title / cwd */}
+      <div style={{ padding: "10px 12px 6px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
         <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
         <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>Files</span>
         <span style={{ fontSize: 11, color: "var(--text-faint)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{sessionCwd}</span>
+      </div>
+      {/* Toolbar row: actions */}
+      <div style={{ padding: "4px 8px 6px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 4, flexShrink: 0, overflowX: "auto" }}>
+        <button title="Search" onClick={() => setSheet("search")} style={toolbarBtnStyle}>🔍</button>
+        <button title="New file" onClick={() => setSheet("newFile")} style={toolbarBtnStyle}>✚</button>
+        <button title="New folder" onClick={() => setSheet("newFolder")} style={toolbarBtnStyle}>📁</button>
+        <button title="Upload" onClick={() => setSheet("upload")} style={toolbarBtnStyle}>⬆</button>
+        <button title="Download workspace .zip" disabled={zipBusy} onClick={handleDownloadZip}
+          style={{ ...toolbarBtnStyle, opacity: zipBusy ? 0.4 : 1 }}>{zipBusy ? "…" : "💾"}</button>
+        <span style={{ flex: 1 }} />
         <button onClick={() => setShowHidden(h => !h)}
-          style={{ fontSize: 11, padding: "3px 8px", background: showHidden ? "color-mix(in srgb, var(--accent-blue) 20%, var(--bg-base))" : "var(--bg-hover)", color: showHidden ? "var(--accent-blue)" : "var(--text-muted)", border: "1px solid " + (showHidden ? "var(--accent-blue)" : "var(--border)"), borderRadius: 5 }}>
+          style={{ fontSize: 11, padding: "4px 10px", background: showHidden ? "color-mix(in srgb, var(--accent-blue) 20%, var(--bg-base))" : "var(--bg-hover)", color: showHidden ? "var(--accent-blue)" : "var(--text-muted)", border: "1px solid " + (showHidden ? "var(--accent-blue)" : "var(--border)"), borderRadius: 5, flexShrink: 0 }}>
           {showHidden ? "hidden ✓" : "hidden"}
         </button>
       </div>
@@ -2299,6 +2657,345 @@ function MobileFileBrowserPanel({
             ? <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Empty directory</div>
             : renderEntries(rootEntries)
         }
+      </div>
+      {sheet !== null && (
+        <MobileFileSheet
+          kind={sheet}
+          target={sheetTarget}
+          busy={sheetBusy}
+          error={sheetError}
+          onClose={() => setSheet(null)}
+          // search
+          searchQ={searchQ} setSearchQ={setSearchQ}
+          searchResults={searchResults} searchLoading={searchLoading}
+          onSearch={doSearch} onPickSearchResult={(entry) => { setSheet(null); openFile(entry); }}
+          // new file / folder
+          newName={newName} setNewName={setNewName}
+          newParentDir={newParentDir} setNewParentDir={setNewParentDir}
+          newDirChoices={newDirChoices}
+          onCreateFile={doCreateFile} onCreateFolder={doCreateFolder}
+          // upload
+          uploadDir={uploadDir} setUploadDir={setUploadDir}
+          uploadFileObj={uploadFileObj} uploadInputRef={uploadInputRef}
+          onPickUploadFile={(f) => setUploadFileObj(f)}
+          onUpload={doUpload}
+          // rename
+          renameValue={renameValue} setRenameValue={setRenameValue} onRename={doRename}
+          // move
+          moveDest={moveDest} setMoveDest={setMoveDest}
+          moveDirChoices={moveDirChoices} onMove={doMove}
+          // delete
+          deleteRecursive={deleteRecursive} setDeleteRecursive={setDeleteRecursive} onDelete={doDelete}
+          // action menu navigation
+          onOpenAction={(action) => {
+            if (action === "view" && sheetTarget) { setSheet(null); openFile(sheetTarget); return; }
+            if (action === "rename" && sheetTarget) { setRenameValue(sheetTarget.name); setSheet("rename"); return; }
+            if (action === "move") { setMoveDest(""); setSheet("move"); return; }
+            if (action === "delete") { setDeleteRecursive(sheetTarget?.type === "dir"); setSheet("deleteConfirm"); return; }
+            if (action === "gitHistory" && sheetTarget) { openGitHistory(sheetTarget); return; }
+          }}
+          // git history
+          gitLog={gitLog} gitLoading={gitLoading}
+          gitCommit={gitCommit}
+          gitMode={gitMode} setGitMode={(m) => { setGitMode(m); if (m === "full" && !gitFull) loadGitFullAtCommit(); }}
+          gitDiff={gitDiff} gitFull={gitFull} gitDetailLoading={gitDetailLoading}
+          onPickGitCommit={openGitCommit}
+          onBackToGitHistory={() => setSheet("gitHistory")}
+        />
+      )}
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// MobileFileSheet — bottom-sheet renderer for all file-browser actions
+// ────────────────────────────────────────────────────────────────────────────
+interface MobileFileSheetProps {
+  kind: Exclude<FileSheetKind, null>;
+  target: FileEntry | null;
+  busy: boolean;
+  error: string;
+  onClose: () => void;
+  // search
+  searchQ: string; setSearchQ: (v: string) => void;
+  searchResults: FileEntry[]; searchLoading: boolean;
+  onSearch: () => void;
+  onPickSearchResult: (entry: FileEntry) => void;
+  // new file / folder
+  newName: string; setNewName: (v: string) => void;
+  newParentDir: string; setNewParentDir: (v: string) => void;
+  newDirChoices: string[];
+  onCreateFile: () => void; onCreateFolder: () => void;
+  // upload
+  uploadDir: string; setUploadDir: (v: string) => void;
+  uploadFileObj: File | null;
+  uploadInputRef: React.MutableRefObject<HTMLInputElement | null>;
+  onPickUploadFile: (f: File) => void;
+  onUpload: () => void;
+  // rename
+  renameValue: string; setRenameValue: (v: string) => void;
+  onRename: () => void;
+  // move
+  moveDest: string; setMoveDest: (v: string) => void;
+  moveDirChoices: string[]; onMove: () => void;
+  // delete
+  deleteRecursive: boolean; setDeleteRecursive: (v: boolean) => void;
+  onDelete: () => void;
+  // action menu
+  onOpenAction: (a: "view" | "rename" | "move" | "delete" | "gitHistory") => void;
+  // git
+  gitLog: Array<{ hash: string; short_hash: string; subject: string; author: string; date: string }>;
+  gitLoading: boolean;
+  gitCommit: { hash: string; short_hash: string; subject: string } | null;
+  gitMode: "diff" | "full"; setGitMode: (m: "diff" | "full") => void;
+  gitDiff: string; gitFull: string; gitDetailLoading: boolean;
+  onPickGitCommit: (commit: { hash: string; short_hash: string; subject: string }) => void;
+  onBackToGitHistory: () => void;
+}
+
+function MobileFileSheet(props: MobileFileSheetProps) {
+  const { kind, target, busy, error, onClose } = props;
+
+  const titleByKind: Record<Exclude<FileSheetKind, null>, string> = {
+    search: "Search files",
+    newFile: "New file",
+    newFolder: "New folder",
+    upload: "Upload file",
+    action: target?.name || "Actions",
+    rename: `Rename ${target?.name ?? ""}`,
+    move: `Move ${target?.name ?? ""}`,
+    deleteConfirm: `Delete ${target?.name ?? ""}`,
+    gitHistory: `Git history — ${target?.name ?? ""}`,
+    gitCommit: props.gitCommit?.short_hash ?? "Commit",
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: "100%", boxSizing: "border-box", padding: "10px 12px",
+    fontSize: 14, color: "var(--text-primary)",
+    background: "var(--bg-base)", border: "1px solid var(--border)",
+    borderRadius: 6, outline: "none",
+  };
+  const primaryBtn: React.CSSProperties = {
+    flex: 1, padding: "10px", fontSize: 14, fontWeight: 600,
+    background: "var(--accent-blue)", color: "#fff",
+    border: "none", borderRadius: 6, cursor: "pointer",
+  };
+  const secondaryBtn: React.CSSProperties = {
+    flex: 1, padding: "10px", fontSize: 14,
+    background: "var(--bg-hover)", color: "var(--text-secondary)",
+    border: "1px solid var(--border)", borderRadius: 6, cursor: "pointer",
+  };
+  const dangerBtn: React.CSSProperties = {
+    ...primaryBtn, background: "var(--accent-red)",
+  };
+  const labelStyle: React.CSSProperties = {
+    fontSize: 11, color: "var(--text-muted)", textTransform: "uppercase",
+    letterSpacing: 0.5, marginBottom: 4, display: "block",
+  };
+
+  return (
+    <div onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 300, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{ background: "var(--bg-surface)", borderTopLeftRadius: 12, borderTopRightRadius: 12,
+                 maxHeight: "85vh", display: "flex", flexDirection: "column" }}>
+        <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10 }}>
+          {kind === "gitCommit" && (
+            <button onClick={props.onBackToGitHistory}
+              style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 18, padding: 0, cursor: "pointer" }}>‹</button>
+          )}
+          <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{titleByKind[kind]}</span>
+          <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-muted)", fontSize: 18, padding: 0, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
+          {error && <div style={{ marginBottom: 10, padding: "8px 10px", background: "rgba(248,81,73,0.15)", color: "var(--accent-red)", fontSize: 12, borderRadius: 4 }}>{error}</div>}
+
+          {/* ── Search ─────────────────────────────────────────── */}
+          {kind === "search" && (
+            <>
+              <div style={{ display: "flex", gap: 6 }}>
+                <input autoFocus value={props.searchQ}
+                  onChange={(e) => props.setSearchQ(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && props.onSearch()}
+                  placeholder="filename / fragment" style={inputStyle} />
+                <button onClick={props.onSearch} disabled={props.searchLoading} style={{ ...primaryBtn, flex: "none", padding: "0 14px" }}>{props.searchLoading ? "…" : "Go"}</button>
+              </div>
+              <div style={{ marginTop: 10 }}>
+                {props.searchResults.length === 0 && !props.searchLoading && (
+                  <div style={{ color: "var(--text-faint)", fontSize: 13, padding: "16px 0", textAlign: "center" }}>{props.searchQ ? "No matches" : "Enter a filename or fragment"}</div>
+                )}
+                {props.searchResults.map((entry) => (
+                  <div key={entry.path}
+                    onClick={() => props.onPickSearchResult(entry)}
+                    style={{ padding: "8px 4px", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 14 }}>{entry.type === "dir" ? "📁" : mobileFileIcon(entry.name)}</span>
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</div>
+                      <div style={{ fontSize: 10, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.path}</div>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {/* ── New file / New folder ───────────────────────────── */}
+          {(kind === "newFile" || kind === "newFolder") && (
+            <>
+              <label style={labelStyle}>Parent directory</label>
+              <select value={props.newParentDir} onChange={(e) => props.setNewParentDir(e.target.value)} style={inputStyle}>
+                <option value="">(root)</option>
+                {props.newDirChoices.filter(d => d !== "").map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+              <label style={{ ...labelStyle, marginTop: 12 }}>{kind === "newFile" ? "File name" : "Folder name"}</label>
+              <input autoFocus value={props.newName} onChange={(e) => props.setNewName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && (kind === "newFile" ? props.onCreateFile() : props.onCreateFolder())}
+                placeholder={kind === "newFile" ? "untitled.txt" : "new-folder"} style={inputStyle} />
+              <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+                <button onClick={onClose} style={secondaryBtn}>Cancel</button>
+                <button disabled={busy} onClick={kind === "newFile" ? props.onCreateFile : props.onCreateFolder} style={primaryBtn}>{busy ? "…" : "Create"}</button>
+              </div>
+            </>
+          )}
+
+          {/* ── Upload ──────────────────────────────────────────── */}
+          {kind === "upload" && (
+            <>
+              <label style={labelStyle}>Target directory</label>
+              <select value={props.uploadDir} onChange={(e) => props.setUploadDir(e.target.value)} style={inputStyle}>
+                <option value="">(root)</option>
+                {props.newDirChoices.filter(d => d !== "").map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+              <label style={{ ...labelStyle, marginTop: 12 }}>File</label>
+              <input ref={props.uploadInputRef} type="file"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) props.onPickUploadFile(f); }}
+                style={{ ...inputStyle, padding: "8px 10px" }} />
+              {props.uploadFileObj && <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 6 }}>{props.uploadFileObj.name} · {mobileFormatSize(props.uploadFileObj.size)}</div>}
+              <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+                <button onClick={onClose} style={secondaryBtn}>Cancel</button>
+                <button disabled={busy || !props.uploadFileObj} onClick={props.onUpload} style={{ ...primaryBtn, opacity: !props.uploadFileObj ? 0.5 : 1 }}>{busy ? "…" : "Upload"}</button>
+              </div>
+            </>
+          )}
+
+          {/* ── Action menu ─────────────────────────────────────── */}
+          {kind === "action" && target && (
+            <div style={{ display: "flex", flexDirection: "column" }}>
+              <div style={{ padding: "6px 0 14px", fontSize: 11, color: "var(--text-faint)", wordBreak: "break-all" }}>{target.path}</div>
+              {target.type === "file" && (
+                <button onClick={() => props.onOpenAction("view")} style={{ ...secondaryBtn, marginBottom: 6, justifyContent: "flex-start", display: "flex", alignItems: "center", gap: 10 }}>
+                  <span>👁</span><span>View</span>
+                </button>
+              )}
+              <button onClick={() => props.onOpenAction("rename")} style={{ ...secondaryBtn, marginBottom: 6, justifyContent: "flex-start", display: "flex", alignItems: "center", gap: 10 }}>
+                <span>✎</span><span>Rename</span>
+              </button>
+              <button onClick={() => props.onOpenAction("move")} style={{ ...secondaryBtn, marginBottom: 6, justifyContent: "flex-start", display: "flex", alignItems: "center", gap: 10 }}>
+                <span>↗</span><span>Move</span>
+              </button>
+              {target.type === "file" && (
+                <button onClick={() => props.onOpenAction("gitHistory")} style={{ ...secondaryBtn, marginBottom: 6, justifyContent: "flex-start", display: "flex", alignItems: "center", gap: 10 }}>
+                  <span>🕒</span><span>Git history</span>
+                </button>
+              )}
+              <button onClick={() => props.onOpenAction("delete")} style={{ ...secondaryBtn, marginBottom: 6, justifyContent: "flex-start", display: "flex", alignItems: "center", gap: 10, color: "var(--accent-red)", borderColor: "var(--accent-red)" }}>
+                <span>🗑</span><span>Delete</span>
+              </button>
+            </div>
+          )}
+
+          {/* ── Rename ──────────────────────────────────────────── */}
+          {kind === "rename" && target && (
+            <>
+              <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 8, wordBreak: "break-all" }}>{target.path}</div>
+              <label style={labelStyle}>New name</label>
+              <input autoFocus value={props.renameValue} onChange={(e) => props.setRenameValue(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && props.onRename()} style={inputStyle} />
+              <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+                <button onClick={onClose} style={secondaryBtn}>Cancel</button>
+                <button disabled={busy} onClick={props.onRename} style={primaryBtn}>{busy ? "…" : "Rename"}</button>
+              </div>
+            </>
+          )}
+
+          {/* ── Move ────────────────────────────────────────────── */}
+          {kind === "move" && target && (
+            <>
+              <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 8, wordBreak: "break-all" }}>{target.path}</div>
+              <label style={labelStyle}>Move to directory</label>
+              <select value={props.moveDest} onChange={(e) => props.setMoveDest(e.target.value)} style={inputStyle}>
+                <option value="">(root)</option>
+                {props.moveDirChoices.filter(d => d !== "").map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+              <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+                <button onClick={onClose} style={secondaryBtn}>Cancel</button>
+                <button disabled={busy} onClick={props.onMove} style={primaryBtn}>{busy ? "…" : "Move"}</button>
+              </div>
+            </>
+          )}
+
+          {/* ── Delete confirm ──────────────────────────────────── */}
+          {kind === "deleteConfirm" && target && (
+            <>
+              <div style={{ fontSize: 14, color: "var(--text-primary)", marginBottom: 10 }}>
+                Delete <strong>{target.name}</strong>?
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 14, wordBreak: "break-all" }}>{target.path}</div>
+              {target.type === "dir" && (
+                <label style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", border: "1px solid var(--accent-red)", borderRadius: 6, background: "rgba(248,81,73,0.08)", marginBottom: 12, cursor: "pointer", fontSize: 13, color: "var(--text-primary)" }}>
+                  <input type="checkbox" checked={props.deleteRecursive} onChange={(e) => props.setDeleteRecursive(e.target.checked)} />
+                  <span>Recursive — delete folder and all contents</span>
+                </label>
+              )}
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={onClose} style={secondaryBtn}>Cancel</button>
+                <button disabled={busy} onClick={props.onDelete} style={dangerBtn}>{busy ? "…" : "Delete"}</button>
+              </div>
+            </>
+          )}
+
+          {/* ── Git history list ────────────────────────────────── */}
+          {kind === "gitHistory" && target && (
+            <>
+              <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 10, wordBreak: "break-all" }}>{target.path}</div>
+              {props.gitLoading && <div style={{ padding: 16, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>}
+              {!props.gitLoading && props.gitLog.length === 0 && (
+                <div style={{ padding: 16, textAlign: "center", color: "var(--text-faint)", fontSize: 13 }}>No git history</div>
+              )}
+              {props.gitLog.map((c) => (
+                <div key={c.hash} onClick={() => props.onPickGitCommit(c)}
+                  style={{ padding: "10px 0", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer" }}>
+                  <div style={{ fontSize: 13, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 2 }}>{c.subject}</div>
+                  <div style={{ fontSize: 11, color: "var(--text-faint)", display: "flex", gap: 8 }}>
+                    <span style={{ fontFamily: "monospace" }}>{c.short_hash}</span>
+                    <span>·</span>
+                    <span>{c.author}</span>
+                    <span>·</span>
+                    <span>{c.date}</span>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+
+          {/* ── Git single commit (diff/full) ──────────────────── */}
+          {kind === "gitCommit" && target && props.gitCommit && (
+            <>
+              <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{props.gitCommit.subject}</div>
+              <div style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "monospace", marginBottom: 10 }}>{props.gitCommit.short_hash}</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                <button onClick={() => props.setGitMode("diff")}
+                  style={{ flex: 1, padding: "6px", fontSize: 12, background: props.gitMode === "diff" ? "var(--accent-blue)" : "var(--bg-hover)", color: props.gitMode === "diff" ? "#fff" : "var(--text-muted)", border: "none", borderRadius: 4, cursor: "pointer" }}>Diff</button>
+                <button onClick={() => props.setGitMode("full")}
+                  style={{ flex: 1, padding: "6px", fontSize: 12, background: props.gitMode === "full" ? "var(--accent-blue)" : "var(--bg-hover)", color: props.gitMode === "full" ? "#fff" : "var(--text-muted)", border: "none", borderRadius: 4, cursor: "pointer" }}>Full file</button>
+              </div>
+              {props.gitDetailLoading
+                ? <div style={{ padding: 16, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>
+                : <pre style={{ margin: 0, padding: 8, background: "var(--bg-base)", border: "1px solid var(--border-subtle)", borderRadius: 4, fontSize: 11, color: "var(--text-primary)", overflow: "auto", maxHeight: "50vh", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "monospace" }}>{props.gitMode === "diff" ? (props.gitDiff || "(empty diff)") : (props.gitFull || "(no content)")}</pre>
+              }
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2978,35 +3675,13 @@ function DetailView({ session: initialSession, sshConfig, onBack, username, onLo
         "--conv-font-xs":  `calc(${fontSize}px - 2.5px)`,
         "--conv-font-xxs": `calc(${fontSize}px - 3.5px)`,
       } as React.CSSProperties}>
-        {isCompacting && (() => {
-          const pctNum = compactingProgress ? parseInt(compactingProgress, 10) : NaN;
-          const hasPct = Number.isFinite(pctNum) && pctNum >= 0 && pctNum <= 100;
-          const filled = hasPct ? Math.max(0, Math.min(10, Math.round(pctNum / 10))) : 0;
-          const bar = "▰".repeat(filled) + "▱".repeat(10 - filled);
-          return (
-            <div style={{
-              flexShrink: 0,
-              padding: "6px 12px",
-              background: "color-mix(in srgb, var(--accent-orange, #d59f00) 14%, var(--bg-base))",
-              borderBottom: "1px solid color-mix(in srgb, var(--accent-orange, #d59f00) 35%, transparent)",
-              color: "var(--accent-orange, #d59f00)",
-              fontSize: 12,
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-            }}>
-              <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--accent-orange, #d59f00)", animation: "cursor-blink 1s step-end infinite" }} />
-              <span>Compacting conversation…</span>
-              <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", letterSpacing: 1, opacity: hasPct ? 1 : 0.55 }}>{bar}</span>
-              <span style={{ fontVariantNumeric: "tabular-nums", minWidth: 32, textAlign: "right" }}>{hasPct ? `${pctNum}%` : "…"}</span>
-            </div>
-          );
-        })()}
         <ConversationPane
           key={session.id}
           sessionId={session.id}
           tool={session.tool as "claude" | "cursor" | undefined}
           isStreaming={session.is_streaming}
+          isCompacting={isCompacting}
+          compactingProgress={compactingProgress}
           isWaitingForAuq={!!tuiHint?.includes("asking a question")}
           pendingAuqData={tuiAuqData}
           pendingApproveData={tuiApproveData}

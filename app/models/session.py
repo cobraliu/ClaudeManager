@@ -66,11 +66,18 @@ class ScheduledTask(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     sent_at: datetime | None = None
     error: str | None = None
+    # When set, the task re-schedules itself: after a successful send a new
+    # pending row is inserted with run_at = now + loop_seconds. None means
+    # the task fires once.
+    loop_seconds: int | None = None
 
 
 class TaskCreateRequest(BaseModel):
     command: str = Field(min_length=1, max_length=2000)
     delay_seconds: int = Field(ge=1, le=604800)  # max 7 days
+    # Optional: when set, the task repeats every loop_seconds after the
+    # initial fire (capped at 7 days, same as delay_seconds).
+    loop_seconds: int | None = Field(default=None, ge=1, le=604800)
 
 
 class TaskView(BaseModel):
@@ -79,6 +86,7 @@ class TaskView(BaseModel):
     run_at: str   # ISO string
     status: str
     created_at: str
+    loop_seconds: int | None = None
 
 
 class SessionView(SessionMetadata):

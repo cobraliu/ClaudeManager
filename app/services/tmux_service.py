@@ -75,7 +75,13 @@ class PtyHandle:
             pass
 
     def close(self) -> None:
-        """Close the PTY and clean up the child process."""
+        """Close the PTY and reap the child process.
+
+        Non-blocking waitpid after SIGHUP doesn't actually reap — the child
+        hasn't exited yet, so the call returns 0 and the process becomes
+        a zombie ([bash] <defunct>). We poll for ~300ms, then escalate to
+        SIGKILL + blocking waitpid to guarantee reaping.
+        """
         try:
             os.close(self.master_fd)
         except OSError:
@@ -83,9 +89,25 @@ class PtyHandle:
         try:
             os.kill(self.child_pid, signal.SIGHUP)
         except OSError:
+            return  # child already gone
+        # Poll up to ~300ms for the child to exit on its own.
+        for _ in range(30):
+            try:
+                pid, _ = os.waitpid(self.child_pid, os.WNOHANG)
+                if pid != 0:
+                    return
+            except ChildProcessError:
+                return  # already reaped
+            except OSError:
+                return
+            time.sleep(0.01)
+        # Still alive — force-kill and reap (blocking).
+        try:
+            os.kill(self.child_pid, signal.SIGKILL)
+        except OSError:
             pass
         try:
-            os.waitpid(self.child_pid, os.WNOHANG)
+            os.waitpid(self.child_pid, 0)
         except (OSError, ChildProcessError):
             pass
 

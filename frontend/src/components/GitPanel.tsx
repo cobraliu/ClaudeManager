@@ -17,6 +17,8 @@ import {
 interface Props {
   sessionId: string;
   onClose: () => void;
+  /** When true, render as an inline panel (no fixed-position backdrop). */
+  inline?: boolean;
 }
 
 const CONTEXT_LINES = 3; // lines of context around each hunk
@@ -272,7 +274,7 @@ function DiffViewer({ files, title, hashes, onClose, zIndex = 5000 }: { files: G
 }
 
 /* ─── Commit detail modal ─── */
-function CommitDetailModal({
+export function CommitDetailModal({
   sessionId, entry, onClose,
 }: { sessionId: string; entry: GitLogEntry; onClose: () => void }) {
   const [fullMessage, setFullMessage] = useState<string | null>(null);
@@ -418,7 +420,7 @@ function lcsEdits(oldL: string[], newL: string[]): Edit[] {
 const PAGE_SIZE = 20;
 
 /* ─── Git Panel ─── */
-export function GitPanel({ sessionId, onClose }: Props) {
+export function GitPanel({ sessionId, onClose, inline = false }: Props) {
   const [autoCommit, setAutoCommit] = useState(false);
   // allLog holds the complete history fetched once on open
   const [allLog, setAllLog] = useState<GitLogEntry[]>([]);
@@ -586,13 +588,20 @@ export function GitPanel({ sessionId, onClose }: Props) {
     } catch (e) { setMsg(String(e)); } finally { setBusyId(null); }
   };
 
+  const outerStyle: React.CSSProperties = inline
+    ? { width: "100%", height: "100%", display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg-base)" }
+    : { position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 4000 };
+  const innerStyle: React.CSSProperties = inline
+    ? { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }
+    : { width: 960, maxWidth: "97vw", maxHeight: "90vh", background: "var(--bg-base)", borderRadius: 10, border: "1px solid var(--border-strong)", display: "flex", flexDirection: "column", overflow: "hidden" };
+
   return (
     <div
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 4000 }}
-      onClick={onClose}
+      style={outerStyle}
+      onClick={inline ? undefined : onClose}
     >
       <div
-        style={{ width: 960, maxWidth: "97vw", maxHeight: "90vh", background: "var(--bg-base)", borderRadius: 10, border: "1px solid var(--border-strong)", display: "flex", flexDirection: "column", overflow: "hidden" }}
+        style={innerStyle}
         onClick={(e) => e.stopPropagation()}
       >
         {/* header */}

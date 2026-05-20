@@ -99,6 +99,12 @@ class SessionStore:
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # Auto-migrate scheduled_tasks (loop_seconds added later for repeating tasks)
+        try:
+            self._conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN loop_seconds INTEGER")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
         self._conn.commit()
 
     def _row_to_session(self, row: sqlite3.Row) -> SessionMetadata:
@@ -505,6 +511,7 @@ class SessionStore:
     # ── Scheduled Tasks ───────────────────────────────────────────────────────
 
     def _row_to_task(self, row: sqlite3.Row) -> ScheduledTask:
+        loop_seconds = row["loop_seconds"] if "loop_seconds" in row.keys() else None
         return ScheduledTask(
             id=row["id"],
             session_id=row["session_id"],
@@ -515,17 +522,18 @@ class SessionStore:
             created_at=datetime.fromisoformat(row["created_at"]),
             sent_at=datetime.fromisoformat(row["sent_at"]) if row["sent_at"] else None,
             error=row["error"],
+            loop_seconds=int(loop_seconds) if loop_seconds is not None else None,
         )
 
     def create_task(self, task: ScheduledTask) -> ScheduledTask:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO scheduled_tasks
-                   (id, session_id, owner_id, command, run_at, status, created_at, sent_at, error)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                   (id, session_id, owner_id, command, run_at, status, created_at, sent_at, error, loop_seconds)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (task.id, task.session_id, task.owner_id, task.command,
                  task.run_at.isoformat(), task.status,
-                 task.created_at.isoformat(), None, None),
+                 task.created_at.isoformat(), None, None, task.loop_seconds),
             )
             self._conn.commit()
         return task

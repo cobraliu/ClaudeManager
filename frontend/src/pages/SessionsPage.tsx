@@ -11,7 +11,6 @@ import {
   terminateSession,
   deleteSession,
   resumeSession,
-  openShell,
   getConfig,
   getSshConfig,
   restartServer,
@@ -40,7 +39,6 @@ import {
   type TodoPlan,
 } from "../api/sessionApi";
 // SessionMeta used for fileEditorSession state
-import { TerminalPane } from "../components/TerminalPane";
 import { TuiPane } from "../components/TuiPane";
 import { BubblePane } from "../components/BubblePane";
 import { ConversationPane } from "../components/ConversationPane";
@@ -52,6 +50,9 @@ import { GitPanel } from "../components/GitPanel";
 import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
 import { downloadConversationHtml } from "../lib/exportChat";
 import { SessionSideDock } from "../components/SessionSideDock";
+import { UserConfigModal } from "../components/UserConfigModal";
+import { EmbeddedTerminalPanel } from "../components/EmbeddedTerminalPanel";
+import { useUserConfig, type LayoutScheme } from "../hooks/useUserConfig";
 
 const PAGE_SIZE = 30;
 
@@ -603,7 +604,17 @@ function BrowseExternalPanel({
                             <PromptText text={s.prompts[s.prompts.length - 1]} />
                           </div>
                         )}
-                        <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 2 }}>{relativeTime(s.mtime)}</div>
+                        <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 2, display: "flex", gap: 8, alignItems: "center" }}>
+                          <span>{relativeTime(s.mtime)}</span>
+                          <span
+                            title={s.claude_session_id}
+                            style={{ fontFamily: "var(--font-mono, monospace)", color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                          >
+                            {s.claude_session_id.length > 18
+                              ? `${s.claude_session_id.slice(0, 8)}…${s.claude_session_id.slice(-5)}`
+                              : s.claude_session_id}
+                          </span>
+                        </div>
                       </div>
                       <button
                         title="Preview conversation"
@@ -665,14 +676,17 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [workspaceBase, setWorkspaceBase] = useState("");
   const [terminalFont, setTerminalFont] = useState<string | undefined>(undefined);
   const [fileEditorSession, setFileEditorSession] = useState<SessionMeta | null>(null);
-  const [shellTerminal, setShellTerminal] = useState<{ res: AttachResponse; cwd: string } | null>(null);
-  const [gitSession, setGitSession] = useState<SessionMeta | null>(null);
-  const [jsonlSession, setJsonlSession] = useState<SessionMeta | null>(null);
+  // Inline overlay in the conversation column (sits above bottom toolbar, replaces TUI/Chat content)
+  const [inlineView, setInlineView] = useState<"git" | "jsonl" | null>(null);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
   const [restarting, setRestarting] = useState(false);
   const [showBrowse, setShowBrowse] = useState(false);
+  const [showConfig, setShowConfig] = useState(false);
+  const { config: userConfig, patch: patchUserConfig } = useUserConfig();
+  const layout = userConfig.layout;
+  const isChatCentric = layout === "chat-centric";
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [rightMode, setRightMode] = useState<"terminal" | "bubble">("bubble");
   const [codeOpen, setCodeOpen] = useState(() => localStorage.getItem("codeOpen") === "1");
@@ -992,8 +1006,15 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!codeDragging.current) return;
-      const leftEdge = leftWidth + 5;
-      const w = Math.max(200, Math.min(e.clientX - leftEdge, window.innerWidth * 0.5));
+      let w: number;
+      if (isChatCentric) {
+        // Chat-centric: file panel is on the RIGHT — width grows as mouse moves left
+        w = Math.max(200, Math.min(window.innerWidth - e.clientX, window.innerWidth * 0.5));
+      } else {
+        // Classic: file panel left edge = sidebar (0 or leftWidth) + toggle-strip (16) + resize-bar (0 or 5, only when sidebar is open)
+        const leftEdge = sidebarCollapsed ? 16 : leftWidth + 21;
+        w = Math.max(200, Math.min(e.clientX - leftEdge, window.innerWidth * 0.5));
+      }
       setCodeWidth(w);
     };
     const onUp = () => {
@@ -1010,7 +1031,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [leftWidth, codeWidth]);
+  }, [leftWidth, codeWidth, sidebarCollapsed, isChatCentric]);
 
   useEffect(() => {
     if (!showModelPicker) return;
@@ -1097,15 +1118,6 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     }
   };
 
-  const handleShell = async (s: SessionMeta) => {
-    try {
-      const res = await openShell(s.id);
-      setShellTerminal({ res, cwd: s.cwd });
-    } catch (e) {
-      alert(String(e));
-    }
-  };
-
   const handleResume = async (s: SessionMeta) => {
     setLoading(true);
     try {
@@ -1186,6 +1198,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
           overflow: "hidden",
           minHeight: 0,
           transition: "width 0.18s ease",
+          order: 0,
         }}
       >
         {/* header — New / Load / Admin only */}
@@ -1225,6 +1238,13 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   {compact ? "⚙" : "Admin"}
                 </button>
               )}
+              <button
+                onClick={() => setShowConfig(true)}
+                title="User Config (layout, theme, terminal font)"
+                style={{ background: "var(--bg-hover)", color: "var(--text-secondary)", fontSize: compact ? 14 : 11, padding: compact ? "3px 7px" : "4px 8px", border: "1px solid var(--border)", borderRadius: 4, lineHeight: 1 }}
+              >
+                {compact ? "⚙" : "⚙ Config"}
+              </button>
             </div>
           );
         })()}
@@ -1260,7 +1280,11 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
             minHeight: 0,
             padding: "6px 10px",
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+            // min(100%, 260px) caps the column at the container's own width,
+            // so when the side-panel is narrower than 260px the card scales
+            // down with it instead of overflowing and getting clipped by
+            // overflowX: hidden (which was hiding the right-side action buttons).
+            gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 260px), 1fr))",
             gap: 8,
             alignContent: "start",
           }}
@@ -1277,13 +1301,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               onResume={() => handleResume(s)}
               onDelete={() => handleDelete(s.id)}
               onTaskChange={() => refresh(searchRef2.current)}
-              onFiles={() => setFileEditorSession(s)}
-              onShell={() => handleShell(s)}
-              onGit={() => setGitSession(s)}
-              onJsonl={() => setJsonlSession(s)}
               onRename={() => refresh(searchRef2.current)}
-              onDownloadCwd={() => handleDownloadCwd(s)}
-              onDownloadChat={() => handleDownloadChat(s)}
               loading={loading}
             />
           ))}
@@ -1383,7 +1401,6 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         })()}
       </div>
 
-      {/* ── Drag handle ── */}
       {/* ── Sidebar collapse toggle strip ── */}
       <div
         onClick={() => {
@@ -1428,18 +1445,36 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       {/* ── Middle: Code panel — tree only ── */}
       {active && activeSessionMeta && codeOpen && (
         <>
-          <div style={{ width: codeWidth, flexShrink: 0, minWidth: 180, display: "flex", flexDirection: "column", overflow: "hidden", borderRight: "1px solid var(--border)" }}>
+          <div style={{
+            width: codeWidth, flexShrink: 0, minWidth: 180,
+            display: "flex", flexDirection: "column", overflow: "hidden",
+            borderRight: "1px solid var(--border)",
+            order: isChatCentric ? 5 : 0,
+          }}>
             <CodePane
               key={active.session_id}
               sessionId={active.session_id}
-              onFileSelect={(path, vm) => setCodeFileView({ path, v: Date.now(), viewMode: vm, noDiff: vm === "full" })}
+              onFileSelect={(path, vm) => {
+                setCodeFileView({ path, v: Date.now(), viewMode: vm, noDiff: vm === "full" });
+                setInlineView(null);
+              }}
               selectedPathExternal={codeFileView?.path ?? null}
+              onGitClick={() => {
+                if (inlineView === "git") {
+                  setInlineView(null);
+                } else {
+                  setInlineView("git");
+                  setCodeFileView(null);
+                }
+              }}
             />
           </div>
-          {/* Code panel drag handle */}
           <div
             onMouseDown={startCodeDrag}
-            style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
+            style={{
+              width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0,
+              order: isChatCentric ? 4 : 0,
+            }}
             onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
             onMouseLeave={(e) => { if (!codeDragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
           />
@@ -1466,6 +1501,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
             color: "var(--text-faint)", borderLeft: codeOpen ? "none" : "1px solid var(--border)",
             borderRight: "1px solid var(--border)",
             userSelect: "none",
+            order: isChatCentric ? 3 : 0,
           }}
           onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-surface)"; }}
           onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
@@ -1475,25 +1511,17 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       )}
 
       {/* ── Right: File viewer (when file selected) ── */}
-      {active && codeFileView && (
-        <div style={{ flex: "1 1 0%", minWidth: 0, minHeight: 0, overflow: "hidden", background: "var(--bg-base)", display: "flex", flexDirection: "column" }}>
-          <FileViewerPane
-            key={codeFileView.path + codeFileView.v}
-            sessionId={active.session_id}
-            path={codeFileView.path}
-            viewMode={codeFileView.viewMode}
-            noDiff={codeFileView.noDiff}
-          />
-        </div>
-      )}
-
       {/* ── Right: Conversation / TUI ── */}
-      <div style={{ flex: "1 1 0%", minWidth: 0, minHeight: 0, overflow: "hidden", background: "var(--bg-base)", display: codeFileView ? "none" : "flex", flexDirection: "column" }}>
+      <div style={{
+        flex: "1 1 0%", minWidth: 0, minHeight: 0, overflow: "hidden", background: "var(--bg-base)",
+        display: "flex", flexDirection: "column",
+        order: isChatCentric ? 2 : 0,
+      }}>
         {active ? (
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "row", overflow: "hidden" }}>
             <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
             {!chatOnlyMode && (
-              <div style={{ flex: 1, minHeight: 0, display: rightMode === "terminal" ? "flex" : "none", flexDirection: "column" }}>
+              <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "terminal" ? "flex" : "none", flexDirection: "column" }}>
                 <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
                   <TuiPane
                     key={active.session_id + active.ws_token + (terminalFont || "")}
@@ -1505,36 +1533,44 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 </div>
               </div>
             )}
-            <div style={{ flex: 1, minHeight: 0, display: rightMode === "bubble" ? "flex" : "none", flexDirection: "column" }}>
-              {isCompacting && (() => {
-                const pctNum = compactingProgress ? parseInt(compactingProgress, 10) : NaN;
-                const hasPct = Number.isFinite(pctNum) && pctNum >= 0 && pctNum <= 100;
-                const filled = hasPct ? Math.max(0, Math.min(10, Math.round(pctNum / 10))) : 0;
-                const bar = "▰".repeat(filled) + "▱".repeat(10 - filled);
-                return (
-                  <div style={{
-                    flexShrink: 0,
-                    padding: "5px 12px",
-                    background: "color-mix(in srgb, var(--accent-orange, #d59f00) 14%, var(--bg-base))",
-                    borderBottom: "1px solid color-mix(in srgb, var(--accent-orange, #d59f00) 35%, transparent)",
-                    color: "var(--accent-orange, #d59f00)",
-                    fontSize: 12,
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                  }}>
-                    <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--accent-orange, #d59f00)", animation: "cursor-blink 1s step-end infinite" }} />
-                    <span>Compacting conversation…</span>
-                    <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", letterSpacing: 1, opacity: hasPct ? 1 : 0.55 }}>{bar}</span>
-                    <span style={{ fontVariantNumeric: "tabular-nums", minWidth: 32, textAlign: "right" }}>{hasPct ? `${pctNum}%` : "…"}</span>
-                  </div>
-                );
-              })()}
-              <ConversationPane key={active.session_id + active.ws_token} sessionId={active.session_id} tool={activeSessionMeta?.tool} isStreaming={activeSessionMeta?.is_streaming} chatOnly={chatOnlyMode} isWaitingForAuq={!!tuiHint?.includes("asking a question")} pendingAuqData={tuiAuqData} pendingApproveData={tuiApproveData} refreshRef={convRefreshRef} />
+            <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "bubble" ? "flex" : "none", flexDirection: "column" }}>
+              <ConversationPane key={active.session_id + active.ws_token} sessionId={active.session_id} tool={activeSessionMeta?.tool} isStreaming={activeSessionMeta?.is_streaming} isCompacting={isCompacting} compactingProgress={compactingProgress} chatOnly={chatOnlyMode} isWaitingForAuq={!!tuiHint?.includes("asking a question")} pendingAuqData={tuiAuqData} pendingApproveData={tuiApproveData} refreshRef={convRefreshRef} />
             </div>
-            {/* Bottom toolbar */}
+            {codeFileView && (
+              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+                <FileViewerPane
+                  key={codeFileView.path + codeFileView.v}
+                  sessionId={active.session_id}
+                  path={codeFileView.path}
+                  viewMode={codeFileView.viewMode}
+                  noDiff={codeFileView.noDiff}
+                />
+              </div>
+            )}
+            {inlineView === "git" && (
+              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+                <GitPanel
+                  inline
+                  sessionId={active.session_id}
+                  onClose={() => setInlineView(null)}
+                />
+              </div>
+            )}
+            {inlineView === "jsonl" && activeSessionMeta && (
+              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+                <JsonlPreviewModal
+                  inline
+                  sessionId={active.session_id}
+                  sessionTitle={activeSessionMeta.name || activeSessionMeta.project}
+                  onClose={() => setInlineView(null)}
+                />
+              </div>
+            )}
+            {/* Bottom toolbar — three groups: Functional | Views | Term */}
             <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, padding: "3px 8px", background: "var(--bg-base)", borderTop: "1px solid var(--bg-page)" }}>
               {!isCursorSession && <UsageBar />}
+              {/* Group 1: Functional — Auqs / Tasks / Goals / Model */}
+              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               {activeSessionMeta && activeSessionMeta.tool !== "cursor" && (
                 <button
                   onClick={() => setDockSection("auqs", !dockOpen.auqs)}
@@ -1643,32 +1679,92 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   })()}
                 </div>
               )}
-              {!chatOnlyMode && rightMode === "terminal" && (
-                <>
-                  <button
-                    onClick={() => { tuiScrollToBottomRef.current?.(); }}
-                    title="Scroll to bottom"
-                    style={{ fontSize: 11, padding: "2px 8px", background: "var(--bg-hover)", color: "var(--text-faint)", border: "1px solid transparent", borderRadius: 4 }}
-                  >
-                    ↓
-                  </button>
-                </>
-              )}
-              {!chatOnlyMode && (
+              </div>
+              {/* Divider */}
+              <div style={{ width: 1, height: 16, background: "var(--bg-hover)", margin: "0 4px" }} />
+              {/* Group 2: Views — HTML / JSONL / Chat / TUI */}
+              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              {activeSessionMeta && (
                 <button
-                  onClick={() => setRightMode("terminal")}
-                  style={{ fontSize: 11, padding: "2px 10px", background: rightMode === "terminal" ? "var(--bg-hover)" : "transparent", color: rightMode === "terminal" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (rightMode === "terminal" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                  onClick={() => handleDownloadChat(activeSessionMeta)}
+                  title="Export chat as HTML"
+                  style={{ fontSize: 11, padding: "2px 10px", background: "transparent", color: "var(--text-faint)", border: "1px solid transparent", borderRadius: 4 }}
                 >
-                  TUI
+                  📥 HTML
                 </button>
               )}
-              <button
-                onClick={() => setRightMode("bubble")}
-                style={{ fontSize: 11, padding: "2px 10px", background: rightMode === "bubble" ? "var(--bg-hover)" : "transparent", color: rightMode === "bubble" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (rightMode === "bubble" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
-              >
-                💬 Chat
-              </button>
+              {activeSessionMeta && activeSessionMeta.claude_session_id && (
+                <button
+                  onClick={() => {
+                    if (inlineView === "jsonl") {
+                      setInlineView(null);
+                    } else {
+                      setInlineView("jsonl");
+                      setCodeFileView(null);
+                    }
+                  }}
+                  title="Preview conversation JSONL"
+                  style={{ fontSize: 11, padding: "2px 10px", background: inlineView === "jsonl" ? "var(--bg-hover)" : "transparent", color: inlineView === "jsonl" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (inlineView === "jsonl" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                >
+                  📄 JSONL
+                </button>
+              )}
+              {(() => {
+                const isActive = rightMode === "bubble" && !inlineView && !codeFileView;
+                return (
+                  <button
+                    onClick={() => { setRightMode("bubble"); setInlineView(null); setCodeFileView(null); }}
+                    style={{ fontSize: 11, padding: "2px 10px", background: isActive ? "var(--bg-hover)" : "transparent", color: isActive ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (isActive ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                  >
+                    💬 Chat
+                  </button>
+                );
+              })()}
+              {!chatOnlyMode && rightMode === "terminal" && (
+                <button
+                  onClick={() => { tuiScrollToBottomRef.current?.(); }}
+                  title="Scroll to bottom"
+                  style={{ fontSize: 11, padding: "2px 8px", background: "var(--bg-hover)", color: "var(--text-faint)", border: "1px solid transparent", borderRadius: 4 }}
+                >
+                  ↓
+                </button>
+              )}
+              {!chatOnlyMode && (() => {
+                const isActive = rightMode === "terminal" && !inlineView && !codeFileView;
+                return (
+                  <button
+                    onClick={() => { setRightMode("terminal"); setInlineView(null); setCodeFileView(null); }}
+                    style={{ fontSize: 11, padding: "2px 10px", background: isActive ? "var(--bg-hover)" : "transparent", color: isActive ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (isActive ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                  >
+                    TUI
+                  </button>
+                );
+              })()}
+              </div>
+              {/* Divider */}
+              <div style={{ width: 1, height: 16, background: "var(--bg-hover)", margin: "0 4px" }} />
+              {/* Group 3: Terminal (and future tmux management) */}
+              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <button
+                  onClick={() => patchUserConfig({ terminalOpen: !userConfig.terminalOpen })}
+                  title={userConfig.terminalOpen ? "Hide terminal" : "Show terminal"}
+                  style={{ fontSize: 11, padding: "2px 10px", background: userConfig.terminalOpen ? "var(--bg-hover)" : "transparent", color: userConfig.terminalOpen ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (userConfig.terminalOpen ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                >
+                  &gt;_ Term
+                </button>
+              </div>
             </div>
+            <EmbeddedTerminalPanel
+              sessionId={active?.session_id ?? null}
+              cwd={activeSessionMeta?.cwd}
+              theme={theme}
+              fontFamily={terminalFont}
+              open={userConfig.terminalOpen}
+              onOpenChange={(o) => patchUserConfig({ terminalOpen: o })}
+              height={userConfig.terminalHeight}
+              onHeightChange={(h) => patchUserConfig({ terminalHeight: h })}
+              resizeFrom="top"
+            />
             </div>
             {activeSessionMeta && (
               <SessionSideDock
@@ -1709,69 +1805,6 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         />
       )}
 
-      {/* ── Git Panel ── */}
-      {gitSession && (
-        <GitPanel
-          sessionId={gitSession.id}
-          onClose={() => setGitSession(null)}
-        />
-      )}
-      {jsonlSession && (
-        <JsonlPreviewModal
-          sessionId={jsonlSession.id}
-          sessionTitle={jsonlSession.project}
-          onClose={() => setJsonlSession(null)}
-        />
-      )}
-
-      {/* ── Shell Terminal Modal ── */}
-      {shellTerminal && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.7)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 3000,
-          }}
-          onClick={() => setShellTerminal(null)}
-        >
-          <div
-            style={{
-              width: "90vw",
-              height: "85vh",
-              background: "var(--bg-base)",
-              borderRadius: 10,
-              border: "1px solid var(--border-strong)",
-              display: "flex",
-              flexDirection: "column",
-              overflow: "hidden",
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ padding: "8px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--bg-hover)", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
-              <span style={{ fontSize: 13, color: "var(--text-secondary)", fontFamily: "monospace" }}>
-                &gt;_ {shellTerminal.cwd}
-              </span>
-              <button onClick={() => setShellTerminal(null)} style={{ background: "var(--bg-hover)", color: "var(--text-secondary)", fontSize: 12, padding: "4px 10px" }}>✕</button>
-            </div>
-            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-              <TerminalPane
-                key={shellTerminal.res.session_id + shellTerminal.res.ws_token + (terminalFont || "")}
-                sessionId={shellTerminal.res.session_id}
-                wsUrl={shellTerminal.res.ws_url}
-                theme={theme}
-                onDisconnect={() => setShellTerminal(null)}
-                defaultFit
-                fontFamily={terminalFont}
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Browse external sessions panel */}
       {showBrowse && (
         <BrowseExternalPanel
@@ -1789,6 +1822,18 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
           onClose={() => setDlModal(null)}
         />
       )}
+
+      {/* User Config modal */}
+      <UserConfigModal
+        open={showConfig}
+        onClose={() => setShowConfig(false)}
+        layout={userConfig.layout}
+        onLayoutChange={(s: LayoutScheme) => patchUserConfig({ layout: s })}
+        theme={theme}
+        onToggleTheme={onToggleTheme}
+        terminalFont={terminalFont}
+        onTerminalFontApplied={(f) => setTerminalFont(f)}
+      />
 
     </div>
   );

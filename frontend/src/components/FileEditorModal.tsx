@@ -176,7 +176,7 @@ function formatSize(bytes: number): string {
 }
 
 // ── Directory Picker ─────────────────────────────────────────────────────────
-function DirPicker({
+export function DirPicker({
   sessionId,
   value,
   onChange,
@@ -1608,7 +1608,7 @@ export function ArchiveViewer({ sessionId, path }: { sessionId: string; path: st
 }
 
 // ── Editor with line numbers ─────────────────────────────────────────────────
-function EditorWithLineNumbers({
+export function EditorWithLineNumbers({
   textareaRef,
   content,
   onChange,

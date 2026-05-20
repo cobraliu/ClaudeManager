@@ -1022,6 +1022,9 @@ function AskUserQuestionDisplay({ questions, answer }: {
           const chosenWithPreview = q.options.filter(
             o => answeredLabels[qi]?.has(o.label) && o.preview,
           );
+          const chosenWithDescription = q.options.filter(
+            o => answeredLabels[qi]?.has(o.label) && o.description,
+          );
           return (
             <div key={qi}>
               {questions.length > 1 && q.header && (
@@ -1068,6 +1071,25 @@ function AskUserQuestionDisplay({ questions, answer }: {
                   );
                 })()}
               </div>
+              {/* Description of the chosen option(s) — surfaces the rationale text
+                  that the inline chip layout couldn't fit. */}
+              {chosenWithDescription.map(opt => (
+                <div
+                  key={opt.label}
+                  style={{
+                    marginTop: 4,
+                    fontSize: 11,
+                    color: "var(--text-muted)",
+                    lineHeight: 1.5,
+                    paddingLeft: 4,
+                    borderLeft: "2px solid var(--accent-blue)",
+                    marginLeft: 2,
+                  }}
+                >
+                  <span style={{ color: "var(--accent-blue)", fontWeight: 600, marginRight: 4 }}>{opt.label}:</span>
+                  {opt.description}
+                </div>
+              ))}
               {/* Preview of the chosen option(s), so the historical decision keeps its context */}
               {chosenWithPreview.map(opt => (
                 <pre
@@ -1110,10 +1132,28 @@ function _auqPersist(set: Set<string>) {
   try { sessionStorage.setItem(_AUQ_SS_KEY, JSON.stringify([...set])); } catch {}
 }
 const _dismissedAUQ = _auqLoadDismissed();
+// Tracks question text of recently dismissed AUQs so the JSONL widget and the
+// hook-based pendingAuqData widget cross-suppress each other while the two
+// signals settle. Cleared after a short window to avoid suppressing a future
+// re-ask of the same question.
+const _recentlyDismissedAuqQ = new Map<string, number>(); // question → timestamp
+const _AUQ_SUPPRESS_MS = 15000;
+function _markAuqDismissed(question: string) {
+  _recentlyDismissedAuqQ.set(question, Date.now());
+}
+function _isAuqRecentlyDismissed(question: string): boolean {
+  const t = _recentlyDismissedAuqQ.get(question);
+  if (!t) return false;
+  if (Date.now() - t > _AUQ_SUPPRESS_MS) {
+    _recentlyDismissedAuqQ.delete(question);
+    return false;
+  }
+  return true;
+}
 
 // ── TodoWrite / TodoRead ──────────────────────────────────────────────────────
 
-interface TodoItem { id?: string; content: string; status: "pending" | "in_progress" | "completed"; priority?: "high" | "medium" | "low" }
+interface TodoItem { id?: string; content: string; description?: string; status: "pending" | "in_progress" | "completed"; priority?: "high" | "medium" | "low" }
 
 function TodoListBlock({ block, result }: {
   block: RawContentBlock;
@@ -1185,7 +1225,6 @@ function TodoListBlock({ block, result }: {
               <span style={{
                 fontSize: "var(--conv-font, 12.5px)", lineHeight: 1.5, flex: 1,
                 color: todo.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
-                textDecoration: todo.status === "completed" ? "line-through" : "none",
               }}>
                 {todo.content}
               </span>
@@ -1390,13 +1429,12 @@ function TaskGroupBlock({ blocks }: { blocks: RawContentBlock[] }) {
                 <div style={{
                   fontSize: "var(--conv-font, 12.5px)", lineHeight: 1.5,
                   color: task.status === "completed" ? "var(--text-faint)" : "var(--text-secondary)",
-                  textDecoration: task.status === "completed" ? "line-through" : "none",
                   wordBreak: "break-word",
                 }}>
                   {task.subject}
                 </div>
-                {task.description && task.status !== "completed" && (
-                  <div style={{ fontSize: "var(--conv-font-sm, 11px)", color: "var(--text-faint)", lineHeight: 1.4, marginTop: 1, wordBreak: "break-word" }}>
+                {task.description && (
+                  <div style={{ fontSize: "var(--conv-font-sm, 11px)", color: "var(--text-faint)", lineHeight: 1.4, marginTop: 1, wordBreak: "break-word", opacity: task.status === "completed" ? 0.75 : 1 }}>
                     {task.description}
                   </div>
                 )}
@@ -1682,7 +1720,12 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
 
   const questionHtml = useMemo(() => renderMarkdown(q.question), [q.question]);
 
-  if (dismissed || _dismissedAUQ.has(blockId)) return null;
+  // Cross-suppress between JSONL widget and hook-based pending widget (different
+  // blockIds, same question). Without this a race surfaces an "unsubmitted" flash:
+  // tool_result arrives in JSONL refresh (so hasUnansweredAuq flips false) before
+  // the 3s tui status poll clears pendingAuqData → pending widget renders fresh.
+  const _qText = questions[0]?.question ?? "";
+  if (dismissed || _dismissedAUQ.has(blockId) || _isAuqRecentlyDismissed(_qText)) return null;
 
   const toggleOption = (label: string) => {
     setSelections(prev => {
@@ -1698,6 +1741,10 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
 
   const setCustom = (val: string) => {
     setCustoms(prev => { const n = [...prev]; n[step] = val; return n; });
+    // For single-select: typing in Other clears the previously selected option
+    if (!effectiveMulti && val.trim()) {
+      setSelections(prev => { const n = prev.map(s => new Set(s)); n[step] = new Set(); return n; });
+    }
   };
 
   // Build answer for ONE question:
@@ -1720,6 +1767,7 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
   const _dismiss = () => {
     _dismissedAUQ.add(blockId);
     _auqPersist(_dismissedAUQ);
+    _markAuqDismissed(_qText);
     setDismissed(true);
   };
 
@@ -1833,10 +1881,12 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
         />
 
         {(() => {
-          // When any option has a preview, force the vertical-card layout even for
-          // single-select — inline chips can't show preview/description meaningfully.
+          // When any option has a preview or a description, force the vertical-card
+          // layout even for single-select — inline chips have no room for either
+          // and would silently drop them (TUI shows the description, so Chat must too).
           const hasPreview = q.options.some(o => o.preview);
-          const useCards = effectiveMulti || hasPreview;
+          const hasDescription = q.options.some(o => o.description);
+          const useCards = effectiveMulti || hasPreview || hasDescription;
           if (!useCards) return null;
           const isCheckbox = effectiveMulti;
           return (
@@ -1920,7 +1970,7 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
             </>
           );
         })()}
-        {!effectiveMulti && !q.options.some(o => o.preview) && (
+        {!effectiveMulti && !q.options.some(o => o.preview) && !q.options.some(o => o.description) && (
           /* Single-select: inline chips + custom input at end separated by | */
           <div style={{ display: "flex", flexWrap: "wrap", gap: 5, alignItems: "center", marginBottom: 10 }}>
             {q.options.map((opt) => {
@@ -2865,6 +2915,10 @@ interface Props {
   sessionId: string;
   tool?: "claude" | "cursor";
   isStreaming?: boolean;
+  /** True while claude is running its compaction pass — drives the bottom banner's compacting variant. */
+  isCompacting?: boolean;
+  /** Numeric percentage string ("0".."100") parsed from the TUI status line; null when unknown. */
+  compactingProgress?: string | null;
   chatOnly?: boolean;
   /** Screen-parsed AUQ data from status poll — shown when JSONL hasn't been written yet. */
   pendingAuqData?: PendingAuqData | null;
@@ -2886,16 +2940,85 @@ interface OptimisticMsg {
 
 type WsStatus = "connecting" | "connected" | "disconnected" | "error";
 
-// Per-session input draft cache — survives mode switches and session switches,
-// cleared on page refresh. Keyed by sessionId.
+// Per-session input draft cache. The in-memory Map handles fast session
+// switches within a tab; localStorage mirrors it so drafts also survive page
+// refresh and tab close, for up to DRAFT_TTL_MS of staleness.
 const _inputDrafts = new Map<string, string>();
 
-export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+const DRAFT_PREFIX = "convInputDraft:v1:";
+const DRAFT_TTL_MS = 10 * 60 * 1000;        // 10 minutes
+const DRAFT_MAX_BYTES = 4096;               // 4 KB; oversize → skip persist
+const DRAFT_HEARTBEAT_MS = 60 * 1000;       // refresh updatedAt every 1 min
+const DRAFT_CLEANUP_MS = 60 * 1000;         // sweep expired keys every 1 min
+
+function _draftKey(sessionId: string): string { return DRAFT_PREFIX + sessionId; }
+
+function _loadDraft(sessionId: string): string {
+  try {
+    const raw = localStorage.getItem(_draftKey(sessionId));
+    if (!raw) return "";
+    const obj = JSON.parse(raw);
+    if (typeof obj?.text !== "string" || typeof obj?.updatedAt !== "number") return "";
+    if (Date.now() - obj.updatedAt > DRAFT_TTL_MS) {
+      try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
+      return "";
+    }
+    return obj.text;
+  } catch { return ""; }
+}
+
+function _saveDraft(sessionId: string, text: string): void {
+  if (!text) { _clearDraft(sessionId); return; }
+  // UTF-8 byte length; oversize → don't persist (in-memory Map still works)
+  let bytes: number;
+  try { bytes = new TextEncoder().encode(text).length; } catch { bytes = text.length * 4; }
+  if (bytes > DRAFT_MAX_BYTES) {
+    try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
+    return;
+  }
+  try {
+    localStorage.setItem(_draftKey(sessionId), JSON.stringify({ text, updatedAt: Date.now() }));
+  } catch { /* quota or disabled — ignore */ }
+}
+
+function _clearDraft(sessionId: string): void {
+  try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
+}
+
+function _cleanupExpiredDrafts(): void {
+  try {
+    const now = Date.now();
+    const toRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith(DRAFT_PREFIX)) continue;
+      const raw = localStorage.getItem(key);
+      if (!raw) { toRemove.push(key); continue; }
+      try {
+        const obj = JSON.parse(raw);
+        if (typeof obj?.updatedAt !== "number" || now - obj.updatedAt > DRAFT_TTL_MS) {
+          toRemove.push(key);
+        }
+      } catch { toRemove.push(key); }  // corrupted entry
+    }
+    for (const k of toRemove) {
+      try { localStorage.removeItem(k); } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
   const [messages, setMessages] = useState<RawMessage[]>([]);
   const [tail, setTail] = useState(DEFAULT_TAIL);
   const [total, setTotal] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [input, setInput] = useState(() => _inputDrafts.get(sessionId) ?? "");
+  const [input, setInput] = useState(() => {
+    const inMem = _inputDrafts.get(sessionId);
+    if (inMem !== undefined) return inMem;
+    const persisted = _loadDraft(sessionId);
+    if (persisted) _inputDrafts.set(sessionId, persisted);
+    return persisted;
+  });
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const [optimisticMsgs, setOptimisticMsgs] = useState<OptimisticMsg[]>([]);
   const [newCompactUuids, setNewCompactUuids] = useState<Set<string>>(new Set());
@@ -2941,20 +3064,21 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly
     return map;
   }, [messages]);
 
-  // Claude only pauses to wait for an AUQ answer when the AUQ tool_use is the
-  // very last JSONL entry. Any subsequent entry — tool_result (answered),
-  // ai-title / permission-mode / last-prompt (session resumed past it), or any
-  // further assistant turn — means Claude has moved on and the AUQ is no longer
-  // answerable. So treating "last entry has unanswered AUQ" as the active signal
-  // covers skipped/abandoned/resumed cases without a backend probe.
+  // Used to dedup with `pendingAuqData` (the hook/screen-parsed fallback that
+  // covers the gap before JSONL is written). The body-loop renders ANY
+  // unanswered AUQ tool_use block from JSONL regardless of its position, so we
+  // must report true whenever any such block exists — not just when it's the
+  // last entry. Claude Code appends post-AUQ meta entries (last-prompt,
+  // ai-title, permission-mode) automatically; a "last only" check would push
+  // the AUQ out of last position and break dedup, producing two cards.
   const hasUnansweredAuq = useMemo(() => {
-    if (messages.length === 0) return false;
-    const last = messages[messages.length - 1];
-    if (last.type !== "assistant" || !last.message) return false;
-    const blocks = getBlocks(last.message.content as RawContentBlock[] | string);
-    for (const b of blocks) {
-      if (b.type === "tool_use" && b.name === "AskUserQuestion" && b.id && !toolResults.has(b.id)) {
-        return true;
+    for (const m of messages) {
+      if (m.type !== "assistant" || !m.message) continue;
+      const blocks = getBlocks(m.message.content as RawContentBlock[] | string);
+      for (const b of blocks) {
+        if (b.type === "tool_use" && b.name === "AskUserQuestion" && b.id && !toolResults.has(b.id)) {
+          return true;
+        }
       }
     }
     return false;
@@ -3346,7 +3470,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly
             // Restore the text into the input box so the user can edit/retry.
             // Don't clobber what they may have started typing in the meantime.
             setInput((cur) => cur ? cur : text);
-            if (text) _inputDrafts.set(sessionId, text);
+            if (text) { _inputDrafts.set(sessionId, text); _saveDraft(sessionId, text); }
           },
           onClose: () => {
             if (wsConnectTimer) { clearTimeout(wsConnectTimer); wsConnectTimer = null; }
@@ -3380,6 +3504,24 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly
     };
   }, [sessionId]);
 
+  // ── Input draft persistence ───────────────────────────────────────────────
+
+  // Heartbeat: while the tab is open and the draft is non-empty, periodically
+  // re-write to localStorage so its updatedAt timestamp stays fresh and the
+  // TTL sweeper doesn't reap a draft the user is still composing.
+  useEffect(() => {
+    if (!input) return;
+    const id = setInterval(() => { _saveDraft(sessionId, input); }, DRAFT_HEARTBEAT_MS);
+    return () => clearInterval(id);
+  }, [sessionId, input]);
+
+  // Periodic sweep of expired draft keys across all sessions in this origin.
+  useEffect(() => {
+    _cleanupExpiredDrafts();
+    const id = setInterval(_cleanupExpiredDrafts, DRAFT_CLEANUP_MS);
+    return () => clearInterval(id);
+  }, []);
+
   // ── Input / control ───────────────────────────────────────────────────────
 
   const sendPrompt = useCallback(() => {
@@ -3398,6 +3540,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly
     ]);
     setInput("");
     _inputDrafts.delete(sessionId);
+    _clearDraft(sessionId);
     wsRef.current.sendPrompt(text);
     stickToBottom.current = true;
     requestAnimationFrame(() => scrollToBottom(false));
@@ -3522,6 +3665,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly
                 const sendAnswer = (text: string) => {
                   setInput("");
                   _inputDrafts.delete(sessionId);
+                  _clearDraft(sessionId);
                   wsRef.current?.sendPrompt(text);
                   stickToBottom.current = true;
                   requestAnimationFrame(() => scrollToBottom(true));
@@ -3677,28 +3821,66 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly
         )}
       </div>
 
-      {/* Stop banner – shown while Claude is generating */}
-      {!chatOnly && isStreaming && wsStatus === "connected" && (
-        <div style={{
-          flexShrink: 0, borderTop: "1px solid var(--border)",
-          background: "var(--bg-surface)",
-          padding: "5px 12px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
-        }}>
-          <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Claude is responding…</span>
-          <button
-            onClick={stopResponse}
-            style={{
-              background: "#7f1d1d", color: "#fca5a5",
-              border: "1px solid #991b1b", borderRadius: 5,
-              padding: "3px 12px", fontSize: 11.5, cursor: "pointer",
-              display: "flex", alignItems: "center", gap: 5,
-            }}
-            title="Stop (Ctrl+C)"
-          >
-            <span style={{ fontSize: 10 }}>■</span> Stop
-          </button>
-        </div>
-      )}
+      {/* Status banner – three states: compacting (orange + progress) / responding (stop button) / idle (faint). */}
+      {!chatOnly && wsStatus === "connected" && (() => {
+        if (isStreaming && isCompacting) {
+          const pctNum = compactingProgress ? parseInt(compactingProgress, 10) : NaN;
+          const hasPct = Number.isFinite(pctNum) && pctNum >= 0 && pctNum <= 100;
+          const filled = hasPct ? Math.max(0, Math.min(10, Math.round(pctNum / 10))) : 0;
+          const bar = "▰".repeat(filled) + "▱".repeat(10 - filled);
+          return (
+            <div style={{
+              flexShrink: 0,
+              borderTop: "1px solid color-mix(in srgb, var(--accent-orange, #d59f00) 35%, transparent)",
+              background: "color-mix(in srgb, var(--accent-orange, #d59f00) 14%, var(--bg-surface))",
+              color: "var(--accent-orange, #d59f00)",
+              padding: "5px 12px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+              fontSize: 11.5,
+            }}>
+              <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--accent-orange, #d59f00)", animation: "cursor-blink 1s step-end infinite" }} />
+              <span>Compacting conversation…</span>
+              <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", letterSpacing: 1, opacity: hasPct ? 1 : 0.55 }}>{bar}</span>
+              <span style={{ fontVariantNumeric: "tabular-nums", minWidth: 32, textAlign: "right" }}>{hasPct ? `${pctNum}%` : "…"}</span>
+            </div>
+          );
+        }
+        if (isStreaming) {
+          return (
+            <div style={{
+              flexShrink: 0, borderTop: "1px solid var(--border)",
+              background: "var(--bg-surface)",
+              padding: "5px 12px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+            }}>
+              <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--accent-blue, #58a6ff)", animation: "cursor-blink 1s step-end infinite" }} />
+              <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Claude is responding…</span>
+              <button
+                onClick={stopResponse}
+                style={{
+                  background: "#7f1d1d", color: "#fca5a5",
+                  border: "1px solid #991b1b", borderRadius: 5,
+                  padding: "3px 12px", fontSize: 11.5, cursor: "pointer",
+                  display: "flex", alignItems: "center", gap: 5,
+                }}
+                title="Stop (Ctrl+C)"
+              >
+                <span style={{ fontSize: 10 }}>■</span> Stop
+              </button>
+            </div>
+          );
+        }
+        // Idle — faint state so users can see the session is alive but waiting for input.
+        return (
+          <div style={{
+            flexShrink: 0, borderTop: "1px solid var(--border)",
+            background: "var(--bg-surface)",
+            padding: "4px 12px", display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            opacity: 0.6,
+          }}>
+            <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", border: "1px solid var(--text-faint, #6e7681)" }} />
+            <span style={{ fontSize: 11, color: "var(--text-faint, #6e7681)" }}>Idle · ready for input</span>
+          </div>
+        );
+      })()}
 
       {/* Input bar – hidden in read-only chat mode */}
       {!chatOnly && <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)", background: "var(--bg-surface)" }}>
@@ -3737,7 +3919,8 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, chatOnly
             onChange={(e) => {
               const val = e.target.value;
               setInput(val);
-              if (val) _inputDrafts.set(sessionId, val); else _inputDrafts.delete(sessionId);
+              if (val) { _inputDrafts.set(sessionId, val); _saveDraft(sessionId, val); }
+              else { _inputDrafts.delete(sessionId); _clearDraft(sessionId); }
             }}
             onKeyDown={handleKeyDown}
             placeholder={
