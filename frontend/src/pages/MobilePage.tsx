@@ -44,7 +44,13 @@ import {
   readFile,
   sqliteQuery,
   sqliteExec,
-  openShell,
+  createTerminal,
+  deleteTerminal,
+  heartbeatTerminal,
+  issueTerminalToken,
+  listTerminals,
+  renameTerminal,
+  type TerminalInfo,
   listAvailableClaudeSessions,
   setClaudeSessionId,
   fetchRawFileBlob,
@@ -84,7 +90,6 @@ import {
   type ScheduledTask,
   type FileEntry,
   type SqliteInfo,
-  type AttachResponse,
   type AvailableClaudeSession,
   type UsageInfo,
   type TuiAuqData,
@@ -2542,10 +2547,26 @@ const ROW1_NAV = [
   { label: "→",   seq: "\x1b[C", title: "Arrow Right" },
 ];
 
-function MobileShellPanel({ cwd, res, onClose, onMinimize, minimized, fontFamily }: { cwd: string; res: AttachResponse; onClose: () => void; onMinimize?: () => void; minimized?: boolean; fontFamily?: string }) {
+// Must match EmbeddedTerminalPanel so PC & mobile pick up the same cached
+// term_id when the user switches viewports for the same session.
+const MOBILE_TERM_CACHE_PREFIX = "cmTermLastTermId:v1:";
+const mobileTermCacheKey = (sid: string) => MOBILE_TERM_CACHE_PREFIX + sid;
+const MOBILE_TERM_HEARTBEAT_MS = 30_000;
+const MOBILE_TERM_POLL_MS = 4000;
+
+function MobileShellPanel({ sessionId, cwd, onClose, onMinimize, minimized, fontFamily }: { sessionId: string; cwd: string; onClose: () => void; onMinimize?: () => void; minimized?: boolean; fontFamily?: string }) {
   const sendRawRef = useRef<((data: string) => void) | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
+
+  const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
+  const [attached, setAttached] = useState<{ termId: string; wsUrl: string; name: string | null; isNamed: boolean } | null>(null);
+  const [picking, setPicking] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // Track visual viewport so the panel stays above the soft keyboard
   useEffect(() => {
@@ -2563,6 +2584,154 @@ function MobileShellPanel({ cwd, res, onClose, onMinimize, minimized, fontFamily
     return () => { vv.removeEventListener("resize", update); vv.removeEventListener("scroll", update); };
   }, [minimized]);
 
+  const refreshList = useCallback(async () => {
+    try {
+      const r = await listTerminals(sessionId);
+      setTerminals(r.items);
+    } catch { /* swallow */ }
+  }, [sessionId]);
+
+  const openEphemeral = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await createTerminal(sessionId, {});
+      setAttached({ termId: r.term_id, wsUrl: r.ws_url, name: r.name, isNamed: r.is_named });
+      setPicking(false);
+      await refreshList();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, busy, refreshList]);
+
+  const attachExisting = useCallback(async (term: TerminalInfo) => {
+    if (busy) return;
+    if (attached && attached.termId === term.term_id) {
+      setPicking(false);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const t = await issueTerminalToken(sessionId, term.term_id);
+      setAttached({ termId: term.term_id, wsUrl: t.ws_url, name: term.name, isNamed: term.is_named });
+      setPicking(false);
+      await refreshList();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, busy, attached, refreshList]);
+
+  const saveAsNamed = useCallback(async (name: string) => {
+    if (!attached || busy) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setRenameError(null);
+    try {
+      const r = await renameTerminal(sessionId, attached.termId, trimmed);
+      setAttached((a) => (a ? { ...a, name: r.name, isNamed: r.is_named } : a));
+      setRenaming(false);
+      setRenameValue("");
+      await refreshList();
+    } catch (e) {
+      setRenameError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, attached, busy, refreshList]);
+
+  const deleteCurrent = useCallback(async () => {
+    if (!attached || busy) return;
+    const label = attached.name ? `"${attached.name}"` : "this ephemeral terminal";
+    if (!confirm(`Delete ${label}? Any running processes inside will be killed.`)) return;
+    setBusy(true);
+    try {
+      await deleteTerminal(sessionId, attached.termId);
+      setAttached(null);
+      await refreshList();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, attached, busy, refreshList]);
+
+  // Auto-attach: try cached term_id first, fall back to a fresh ephemeral.
+  // Mirrors EmbeddedTerminalPanel so reopening the panel reattaches instead
+  // of leaving an orphaned ephemeral behind.
+  useEffect(() => {
+    if (attached) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const cachedId = localStorage.getItem(mobileTermCacheKey(sessionId));
+        if (cachedId) {
+          try {
+            const t = await issueTerminalToken(sessionId, cachedId);
+            if (cancelled) return;
+            setAttached({
+              termId: t.term_id,
+              wsUrl: t.ws_url,
+              name: t.name ?? null,
+              isNamed: !!t.is_named,
+            });
+            listTerminals(sessionId).then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
+            return;
+          } catch {
+            localStorage.removeItem(mobileTermCacheKey(sessionId));
+          }
+        }
+        const r = await listTerminals(sessionId);
+        if (cancelled) return;
+        setTerminals(r.items);
+        const c = await createTerminal(sessionId, {});
+        if (cancelled) return;
+        setAttached({ termId: c.term_id, wsUrl: c.ws_url, name: c.name, isNamed: c.is_named });
+        listTerminals(sessionId).then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [sessionId, attached]);
+
+  // Persist currently-attached term_id for next mount.
+  useEffect(() => {
+    if (!attached) return;
+    try { localStorage.setItem(mobileTermCacheKey(sessionId), attached.termId); }
+    catch { /* quota — ignore */ }
+  }, [sessionId, attached]);
+
+  // Heartbeat keepalive (also runs while minimized).
+  useEffect(() => {
+    if (!attached) return;
+    const tick = async () => {
+      try {
+        await heartbeatTerminal(sessionId, attached.termId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/gone|404|410/i.test(msg)) {
+          try { localStorage.removeItem(mobileTermCacheKey(sessionId)); } catch { /* ignore */ }
+          setAttached(null);
+        }
+      }
+    };
+    const id = setInterval(tick, MOBILE_TERM_HEARTBEAT_MS);
+    return () => clearInterval(id);
+  }, [sessionId, attached]);
+
+  // Periodic list refresh (for attach_count badges in picker).
+  useEffect(() => {
+    const id = setInterval(refreshList, MOBILE_TERM_POLL_MS);
+    return () => clearInterval(id);
+  }, [refreshList]);
+
   const sendKey = (seq: string) => sendRawRef.current?.(seq);
   const sendCtrlLetter = (letter: string) => {
     sendKey(String.fromCharCode(letter.charCodeAt(0) - 64));
@@ -2576,33 +2745,186 @@ function MobileShellPanel({ cwd, res, onClose, onMinimize, minimized, fontFamily
     cursor: "pointer", padding: 0, userSelect: "none",
   };
 
+  const named = terminals.filter(t => t.is_named);
+  const ephemeral = terminals.filter(t => !t.is_named);
+  const currentLabel = attached
+    ? (attached.name ? `📌 ${attached.name}` : `▶ ephemeral (${attached.termId.slice(0, 6)})`)
+    : (busy ? "(connecting…)" : "(no terminal)");
+
   return (
     <div ref={containerRef} style={{ position: "fixed", left: 0, right: 0, top: 0, height: "100%", background: "var(--bg-base)", zIndex: 200, display: minimized ? "none" : "flex", flexDirection: "column" }}>
       {/* Header */}
-      <div style={{ padding: "10px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+      <div style={{ padding: "10px 12px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
         <button onClick={onClose} title="Close terminal" style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
-        <span style={{ fontSize: 13, color: "var(--text-secondary)", fontFamily: "monospace", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          &gt;_ {cwd}
-        </span>
+        <button
+          onClick={() => setPicking(p => !p)}
+          title="Switch terminal"
+          disabled={busy}
+          style={{
+            background: "var(--bg-hover)", color: "var(--text-body)",
+            fontSize: 12, padding: "5px 10px", border: "none", borderRadius: 6,
+            display: "flex", alignItems: "center", gap: 5, flex: 1, minWidth: 0,
+            fontFamily: "monospace", cursor: busy ? "default" : "pointer",
+          }}
+        >
+          <span style={{ flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{currentLabel}</span>
+          <span style={{ fontSize: 9, color: "var(--text-muted)", flexShrink: 0 }}>▾</span>
+        </button>
+        {attached && !attached.isNamed && !renaming && (
+          <button
+            onClick={() => { setRenameValue(""); setRenameError(null); setRenaming(true); }}
+            disabled={busy}
+            title="Save (name) this terminal so it persists"
+            style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 12, padding: "5px 9px", border: "none", borderRadius: 6, lineHeight: 1 }}
+          >💾</button>
+        )}
+        {attached && (
+          <button
+            onClick={deleteCurrent}
+            disabled={busy}
+            title="Delete this terminal"
+            style={{ background: "var(--bg-hover)", color: "var(--text-muted)", fontSize: 12, padding: "5px 9px", border: "none", borderRadius: 6, lineHeight: 1 }}
+          >🗑</button>
+        )}
         {onMinimize && (
           <button onClick={onMinimize} title="Minimize (keep alive)" style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-secondary)", fontSize: 16, padding: "2px 10px", cursor: "pointer", lineHeight: 1, borderRadius: 6 }}>
             ─
           </button>
         )}
       </div>
+
+      {/* cwd */}
+      <div style={{ padding: "4px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", fontSize: 11, color: "var(--text-faint)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 0 }}>
+        &gt;_ {cwd}
+      </div>
+
+      {/* Rename form */}
+      {attached && renaming && (
+        <div style={{ padding: "8px 12px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+          <input
+            autoFocus
+            value={renameValue}
+            onChange={(e) => { setRenameValue(e.target.value); if (renameError) setRenameError(null); }}
+            onKeyDown={(e) => { if (e.key === "Escape") { setRenaming(false); setRenameError(null); } }}
+            placeholder="terminal name"
+            style={{
+              flex: 1, fontSize: 13, padding: "6px 8px",
+              background: "var(--bg-base)",
+              border: `1px solid ${renameError ? "var(--accent-red, #f85149)" : "var(--border)"}`,
+              color: "var(--text-body)",
+              borderRadius: 4,
+            }}
+          />
+          <button
+            onClick={() => saveAsNamed(renameValue)}
+            disabled={!renameValue.trim() || busy}
+            style={{
+              background: renameValue.trim() ? "var(--accent-blue)" : "var(--text-faintest)",
+              color: "#fff", fontSize: 12, padding: "6px 12px", border: "none", borderRadius: 4, fontWeight: 600,
+            }}
+          >OK</button>
+          <button
+            onClick={() => { setRenaming(false); setRenameError(null); }}
+            style={{ background: "var(--bg-hover)", color: "var(--text-muted)", fontSize: 12, padding: "6px 10px", border: "none", borderRadius: 4 }}
+          >✕</button>
+        </div>
+      )}
+      {renameError && (
+        <div style={{ padding: "4px 14px 8px", fontSize: 11, color: "var(--accent-red, #f85149)", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+          {renameError}
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <div style={{ padding: "8px 12px", fontSize: 12, color: "var(--accent-red, #f85149)", background: "var(--bg-surface)", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+          {error}
+        </div>
+      )}
+
       {/* Terminal */}
       <div style={{ flex: 1, overflow: "hidden", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
-        <TerminalPane
-          key={res.session_id + res.ws_token + (fontFamily || "")}
-          sessionId={res.session_id}
-          wsUrl={res.ws_url}
-          onDisconnect={onClose}
-          defaultFit
-          showWideToggle
-          fontFamily={fontFamily}
-          sendRawRef={sendRawRef}
-        />
+        {attached && (
+          <TerminalPane
+            key={attached.termId + attached.wsUrl + (fontFamily || "")}
+            sessionId={attached.termId}
+            wsUrl={attached.wsUrl}
+            scrollMode="tmux"
+            onDisconnect={() => setAttached(null)}
+            defaultFit
+            showWideToggle
+            fontFamily={fontFamily}
+            sendRawRef={sendRawRef}
+          />
+        )}
       </div>
+
+      {/* Picker bottom sheet */}
+      {picking && (
+        <>
+          <div onClick={() => setPicking(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 210 }} />
+          <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, background: "var(--bg-surface)", borderTop: "1px solid var(--border-strong)", borderRadius: "12px 12px 0 0", padding: "12px 0 24px", zIndex: 211, maxHeight: "70%", overflowY: "auto", boxShadow: "0 -4px 16px rgba(0,0,0,0.4)" }}>
+            <div style={{ width: 40, height: 4, background: "var(--text-faintest)", borderRadius: 2, margin: "0 auto 12px" }} />
+            <div style={{ fontSize: 10, color: "var(--text-faint)", padding: "4px 16px", textTransform: "uppercase", letterSpacing: 0.6 }}>Named</div>
+            {named.length === 0 && (
+              <div style={{ padding: "6px 16px", fontSize: 12, color: "var(--text-muted)" }}>(none — save current to name it)</div>
+            )}
+            {named.map(t => (
+              <button
+                key={t.term_id}
+                onClick={() => attachExisting(t)}
+                style={{
+                  display: "flex", width: "100%", textAlign: "left", padding: "10px 16px",
+                  background: attached?.termId === t.term_id ? "rgba(88,166,255,0.12)" : "transparent",
+                  color: attached?.termId === t.term_id ? "var(--accent-blue)" : "var(--text-body)",
+                  border: "none", fontSize: 13, gap: 8, alignItems: "center",
+                  cursor: "pointer", fontFamily: "monospace",
+                }}
+              >
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>📌 {t.name}</span>
+                {t.attach_count > 0 && (
+                  <span style={{ fontSize: 10, padding: "2px 6px", background: "rgba(34,197,94,0.18)", color: "#22c55e", borderRadius: 3 }}>
+                    👥{t.attach_count}
+                  </span>
+                )}
+              </button>
+            ))}
+
+            <div style={{ fontSize: 10, color: "var(--text-faint)", padding: "10px 16px 4px", textTransform: "uppercase", letterSpacing: 0.6 }}>Ephemeral</div>
+            {ephemeral.length === 0 && (
+              <div style={{ padding: "6px 16px", fontSize: 12, color: "var(--text-muted)" }}>(none)</div>
+            )}
+            {ephemeral.map(t => (
+              <button
+                key={t.term_id}
+                onClick={() => attachExisting(t)}
+                style={{
+                  display: "flex", width: "100%", textAlign: "left", padding: "10px 16px",
+                  background: attached?.termId === t.term_id ? "rgba(88,166,255,0.12)" : "transparent",
+                  color: attached?.termId === t.term_id ? "var(--accent-blue)" : "var(--text-body)",
+                  border: "none", fontSize: 13, gap: 8, alignItems: "center",
+                  cursor: "pointer", fontFamily: "monospace",
+                }}
+              >
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>▶ {t.term_id.slice(0, 8)}</span>
+                {t.attach_count > 0 && (
+                  <span style={{ fontSize: 10, padding: "2px 6px", background: "rgba(34,197,94,0.18)", color: "#22c55e", borderRadius: 3 }}>
+                    👥{t.attach_count}
+                  </span>
+                )}
+              </button>
+            ))}
+
+            <div style={{ borderTop: "1px solid var(--border-subtle)", marginTop: 8, paddingTop: 8 }}>
+              <button
+                onClick={() => openEphemeral()}
+                disabled={busy}
+                style={{ display: "block", width: "100%", textAlign: "left", padding: "12px 16px", background: "transparent", border: "none", color: "var(--accent-blue)", fontSize: 13, cursor: "pointer", fontFamily: "monospace" }}
+              >+ New ephemeral terminal</button>
+            </div>
+          </div>
+        </>
+      )}
       {/* Toolbar — two rows, always above keyboard */}
       <div style={{ flexShrink: 0, background: "var(--bg-surface)", borderTop: "1px solid var(--border)" }}>
         {/* Row 1: CTRL toggle + navigation */}
@@ -4135,7 +4457,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const [showTasks, setShowTasks] = useState(false);
   const [showGoals, setShowGoals] = useState(false);
   const [showAuqs, setShowAuqs] = useState(false);
-  const [shellRes, setShellRes] = useState<AttachResponse | null>(null);
+  const [shellOpen, setShellOpen] = useState(false);
   const [shellMinimized, setShellMinimized] = useState(false);
   const [showResumeSelect, setShowResumeSelect] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
@@ -4176,7 +4498,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const showGitRef = useRef(false);
   const showScheduleRef = useRef(false);
   const showFilesRef = useRef(false);
-  const shellResRef = useRef<AttachResponse | null>(null);
+  const shellOpenRef = useRef(false);
   const filesBackHandlerRef = useRef<(() => void) | null>(null);
   const showResumeSelectRef = useRef(false);
   const showModelPickerRef = useRef(false);
@@ -4193,7 +4515,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   showTasksRef.current = showTasks;
   showGoalsRef.current = showGoals;
   showAuqsRef.current = showAuqs;
-  shellResRef.current = shellRes;
+  shellOpenRef.current = shellOpen;
   showResumeSelectRef.current = showResumeSelect;
   showModelPickerRef.current = showModelPicker;
   showCapsRef.current = showCaps;
@@ -4210,7 +4532,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       if (showTasksRef.current) { setShowTasks(false); return; }
       if (showGoalsRef.current) { setShowGoals(false); return; }
       if (showAuqsRef.current) { setShowAuqs(false); return; }
-      if (shellResRef.current) { setShellRes(null); setShellMinimized(false); return; }
+      if (shellOpenRef.current) { setShellOpen(false); setShellMinimized(false); return; }
       if (showResumeSelectRef.current) { setShowResumeSelect(false); return; }
       if (showModelPickerRef.current) { setShowModelPicker(false); return; }
       if (showCapsRef.current) { setShowCaps(false); return; }
@@ -4229,7 +4551,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   useEffect(() => { if (showGoals) history.pushState({ mobileDetail: true, sub: "goals" }, ""); }, [showGoals]);
   useEffect(() => { if (showAuqs) history.pushState({ mobileDetail: true, sub: "auqs" }, ""); }, [showAuqs]);
   useEffect(() => { if (showFiles) history.pushState({ mobileDetail: true, sub: "files" }, ""); }, [showFiles]);
-  useEffect(() => { if (shellRes) history.pushState({ mobileDetail: true, sub: "shell" }, ""); }, [shellRes]);
+  useEffect(() => { if (shellOpen) history.pushState({ mobileDetail: true, sub: "shell" }, ""); }, [shellOpen]);
   useEffect(() => { if (showResumeSelect) history.pushState({ mobileDetail: true, sub: "resumeSelect" }, ""); }, [showResumeSelect]);
   useEffect(() => { if (showModelPicker) history.pushState({ mobileDetail: true, sub: "modelPicker" }, ""); }, [showModelPicker]);
   useEffect(() => { if (showCaps) history.pushState({ mobileDetail: true, sub: "caps" }, ""); }, [showCaps]);
@@ -4354,11 +4676,10 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
           type Btn = { icon: React.ReactNode; onClick: () => void; color: string; bg: string; title: string; disabled?: boolean };
           const canStop = !isTerminated && session.is_streaming;
           const btns: Btn[] = [
-            { icon: <img src={terminalIcon} style={svgStyle} />, title: "Shell", onClick: async () => {
-                if (shellRes && shellMinimized) { setShellMinimized(false); return; }
-                if (shellRes) { setShellMinimized(false); return; }
-                try { const r = await openShell(session.id); setShellRes(r); setShellMinimized(false); } catch (e) { alert(String(e)); }
-              }, color: shellRes && shellMinimized ? "var(--accent-blue)" : iconMuted, bg: "transparent" },
+            { icon: <img src={terminalIcon} style={svgStyle} />, title: "Shell", onClick: () => {
+                if (shellOpen) { setShellMinimized(false); return; }
+                setShellOpen(true); setShellMinimized(false);
+              }, color: shellOpen && shellMinimized ? "var(--accent-blue)" : iconMuted, bg: "transparent" },
             { icon: <FileIcon isDir size={14} />, title: "Files", onClick: () => setShowFiles(true), color: iconMuted, bg: "transparent" },
             { icon: <img src={gitIcon} style={svgStyle} />, title: "Git", onClick: () => setShowGit(true), color: iconMuted, bg: "transparent" },
             {
@@ -4443,8 +4764,8 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         terminalFont={terminalFont} onTerminalFontChange={onTerminalFontChange}
       />
 
-      {shellRes && <MobileShellPanel cwd={session.cwd} res={shellRes} onClose={() => history.back()} onMinimize={() => setShellMinimized(true)} minimized={shellMinimized} fontFamily={terminalFont} />}
-      {shellRes && shellMinimized && (
+      {shellOpen && <MobileShellPanel sessionId={session.id} cwd={session.cwd} onClose={() => history.back()} onMinimize={() => setShellMinimized(true)} minimized={shellMinimized} fontFamily={terminalFont} />}
+      {shellOpen && shellMinimized && (
         <button
           onClick={() => setShellMinimized(false)}
           title="Restore terminal"
