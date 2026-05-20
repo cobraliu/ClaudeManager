@@ -2048,7 +2048,7 @@ const ROW1_NAV = [
   { label: "→",   seq: "\x1b[C", title: "Arrow Right" },
 ];
 
-function MobileShellPanel({ cwd, res, onClose, fontFamily }: { cwd: string; res: AttachResponse; onClose: () => void; fontFamily?: string }) {
+function MobileShellPanel({ cwd, res, onClose, onMinimize, minimized, fontFamily }: { cwd: string; res: AttachResponse; onClose: () => void; onMinimize?: () => void; minimized?: boolean; fontFamily?: string }) {
   const sendRawRef = useRef<((data: string) => void) | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
@@ -2059,7 +2059,7 @@ function MobileShellPanel({ cwd, res, onClose, fontFamily }: { cwd: string; res:
     if (!vv) return;
     const update = () => {
       const el = containerRef.current;
-      if (!el) return;
+      if (!el || minimized) return;
       el.style.top = `${vv.offsetTop}px`;
       el.style.height = `${vv.height}px`;
     };
@@ -2067,7 +2067,7 @@ function MobileShellPanel({ cwd, res, onClose, fontFamily }: { cwd: string; res:
     vv.addEventListener("scroll", update);
     update();
     return () => { vv.removeEventListener("resize", update); vv.removeEventListener("scroll", update); };
-  }, []);
+  }, [minimized]);
 
   const sendKey = (seq: string) => sendRawRef.current?.(seq);
   const sendCtrlLetter = (letter: string) => {
@@ -2083,13 +2083,18 @@ function MobileShellPanel({ cwd, res, onClose, fontFamily }: { cwd: string; res:
   };
 
   return (
-    <div ref={containerRef} style={{ position: "fixed", left: 0, right: 0, top: 0, height: "100%", background: "var(--bg-base)", zIndex: 200, display: "flex", flexDirection: "column" }}>
+    <div ref={containerRef} style={{ position: "fixed", left: 0, right: 0, top: 0, height: "100%", background: "var(--bg-base)", zIndex: 200, display: minimized ? "none" : "flex", flexDirection: "column" }}>
       {/* Header */}
       <div style={{ padding: "10px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
+        <button onClick={onClose} title="Close terminal" style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1 }}>‹</button>
         <span style={{ fontSize: 13, color: "var(--text-secondary)", fontFamily: "monospace", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           &gt;_ {cwd}
         </span>
+        {onMinimize && (
+          <button onClick={onMinimize} title="Minimize (keep alive)" style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-secondary)", fontSize: 16, padding: "2px 10px", cursor: "pointer", lineHeight: 1, borderRadius: 6 }}>
+            ─
+          </button>
+        )}
       </div>
       {/* Terminal */}
       <div style={{ flex: 1, overflow: "hidden", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -3651,6 +3656,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const [showGoals, setShowGoals] = useState(false);
   const [showAuqs, setShowAuqs] = useState(false);
   const [shellRes, setShellRes] = useState<AttachResponse | null>(null);
+  const [shellMinimized, setShellMinimized] = useState(false);
   const [showResumeSelect, setShowResumeSelect] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -3724,7 +3730,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       if (showTasksRef.current) { setShowTasks(false); return; }
       if (showGoalsRef.current) { setShowGoals(false); return; }
       if (showAuqsRef.current) { setShowAuqs(false); return; }
-      if (shellResRef.current) { setShellRes(null); return; }
+      if (shellResRef.current) { setShellRes(null); setShellMinimized(false); return; }
       if (showResumeSelectRef.current) { setShowResumeSelect(false); return; }
       if (showModelPickerRef.current) { setShowModelPicker(false); return; }
       if (showCapsRef.current) { setShowCaps(false); return; }
@@ -3868,7 +3874,11 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
           type Btn = { icon: React.ReactNode; onClick: () => void; color: string; bg: string; title: string; disabled?: boolean };
           const canStop = !isTerminated && session.is_streaming;
           const btns: Btn[] = [
-            { icon: <img src={terminalIcon} style={svgStyle} />, title: "Shell", onClick: async () => { try { const r = await openShell(session.id); setShellRes(r); } catch (e) { alert(String(e)); } }, color: iconMuted, bg: "transparent" },
+            { icon: <img src={terminalIcon} style={svgStyle} />, title: "Shell", onClick: async () => {
+                if (shellRes && shellMinimized) { setShellMinimized(false); return; }
+                if (shellRes) { setShellMinimized(false); return; }
+                try { const r = await openShell(session.id); setShellRes(r); setShellMinimized(false); } catch (e) { alert(String(e)); }
+              }, color: shellRes && shellMinimized ? "var(--accent-blue)" : iconMuted, bg: "transparent" },
             { icon: "📁", title: "Files", onClick: () => setShowFiles(true), color: iconMuted, bg: "transparent" },
             { icon: <img src={gitIcon} style={svgStyle} />, title: "Git", onClick: () => setShowGit(true), color: iconMuted, bg: "transparent" },
             {
@@ -3953,7 +3963,24 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         terminalFont={terminalFont} onTerminalFontChange={onTerminalFontChange}
       />
 
-      {shellRes && <MobileShellPanel cwd={session.cwd} res={shellRes} onClose={() => history.back()} fontFamily={terminalFont} />}
+      {shellRes && <MobileShellPanel cwd={session.cwd} res={shellRes} onClose={() => history.back()} onMinimize={() => setShellMinimized(true)} minimized={shellMinimized} fontFamily={terminalFont} />}
+      {shellRes && shellMinimized && (
+        <button
+          onClick={() => setShellMinimized(false)}
+          title="Restore terminal"
+          style={{
+            position: "fixed", right: 14, bottom: 84, zIndex: 199,
+            background: "var(--bg-surface)", border: "1px solid var(--accent-blue)",
+            color: "var(--accent-blue)", borderRadius: 22, padding: "8px 14px",
+            fontSize: 13, fontFamily: "monospace", fontWeight: 600,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.4)", cursor: "pointer",
+            display: "flex", alignItems: "center", gap: 6,
+          }}
+        >
+          <span>&gt;_</span>
+          <span style={{ fontSize: 11, color: "var(--text-muted)", fontWeight: 400 }}>Terminal</span>
+        </button>
+      )}
       {showFiles && (
         <MobileFileBrowserPanel
           sessionId={session.id}
