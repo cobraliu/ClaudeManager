@@ -2047,14 +2047,35 @@ def get_raw_messages(
                     cache_dir = _Path.home() / ".claude" / "cached_messages" / chat_sid
                     if cache_dir.is_dir():
                         seen_ids: set[str] = set()
+                        # Track the max JSONL timestamp; any snapshot whose ts_ns
+                        # is already ≤ this is "stale" — the CLI has flushed past
+                        # it, even though its request_id never landed in
+                        # message.id. The canonical case is /compact: the
+                        # compact assistant response IS captured by the proxy,
+                        # but the CLI writes a `compact_boundary` + synthetic
+                        # continuation user prompt instead of a normal assistant
+                        # entry, so dedup-by-message.id alone leaves the
+                        # snapshot stranded until proxy_tap_cleanup catches up
+                        # (~30s). The timestamp filter drops it immediately.
+                        max_ts_ns: int = 0
                         for entry in collected:
-                            if not isinstance(entry, dict) or entry.get("type") != "assistant":
+                            if not isinstance(entry, dict):
                                 continue
-                            msg = entry.get("message")
-                            if isinstance(msg, dict):
-                                mid = msg.get("id")
-                                if isinstance(mid, str):
-                                    seen_ids.add(mid)
+                            if entry.get("type") == "assistant":
+                                msg = entry.get("message")
+                                if isinstance(msg, dict):
+                                    mid = msg.get("id")
+                                    if isinstance(mid, str):
+                                        seen_ids.add(mid)
+                            raw_ts = entry.get("timestamp")
+                            if isinstance(raw_ts, str) and raw_ts:
+                                try:
+                                    ts_s = _dt.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+                                    ts_ns_i = int(ts_s * 1_000_000_000)
+                                    if ts_ns_i > max_ts_ns:
+                                        max_ts_ns = ts_ns_i
+                                except ValueError:
+                                    pass
                         latest_by_req: dict[str, tuple[int, dict]] = {}
                         for snap_path in cache_dir.iterdir():
                             name = snap_path.name
@@ -2063,6 +2084,8 @@ def get_raw_messages(
                             try:
                                 ts_ns = int(name[:-5])
                             except ValueError:
+                                continue
+                            if ts_ns <= max_ts_ns:
                                 continue
                             try:
                                 snap = _json.loads(snap_path.read_text())
