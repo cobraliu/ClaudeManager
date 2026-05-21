@@ -1041,20 +1041,23 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
   const [diffFile, setDiffFile] = useState<GitDiffFile | null>(null);
   const [committing, setCommitting] = useState(false);
   const [showMerge, setShowMerge] = useState(false);
+  const [mergeStatus, setMergeStatus] = useState<MergeStatus | null>(null);
 
   useEffect(() => {
     setLoading(true);
     Promise.all([
       getGitInfo(sessionId).catch(() => null),
       getGitBranches(sessionId).catch(() => ({ current: "", local: [] }) as GitBranchInfo),
+      getMergeStatus(sessionId).catch(() => null),
     ])
-      .then(([info, br]) => {
+      .then(([info, br, ms]) => {
         if (info) {
           setIsRepo(info.is_repo); setLog(info.log);
           setGitignore(info.gitignore ?? ""); setGitignoreDraft(info.gitignore ?? "");
           setAutoCommit(info.auto_commit); setRemote(info.remote ?? ""); setRemoteInput(info.remote ?? "");
         }
         setBranches(br);
+        setMergeStatus(ms);
       })
       .finally(() => setLoading(false));
   }, [sessionId]);
@@ -1170,12 +1173,14 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
             <MobileGitPullButton
               sessionId={sessionId}
               onPulled={async () => {
-                const [info, br] = await Promise.all([
+                const [info, br, ms] = await Promise.all([
                   getGitInfo(sessionId).catch(() => null),
                   getGitBranches(sessionId).catch(() => branches),
+                  getMergeStatus(sessionId).catch(() => null),
                 ]);
                 if (info) setLog(info.log);
                 setBranches(br);
+                setMergeStatus(ms);
               }}
             />
           )}
@@ -1239,6 +1244,23 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
 
       {isRepo && (
         <>
+          {mergeStatus?.in_progress && (
+            <div style={{ padding: "10px 12px", background: "rgba(248,81,73,0.12)", borderBottom: "1px solid var(--accent-red)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+              <span style={{ color: "var(--accent-red)", fontSize: 14, flexShrink: 0 }}>⚠</span>
+              <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: "var(--text-body)" }}>
+                <div>Merge in progress — <span style={{ fontFamily: "monospace", color: "var(--accent-amber)" }}>{mergeStatus.merge_head}</span> → <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{mergeStatus.current_branch}</span></div>
+                {mergeStatus.conflicted_files.length > 0 && (
+                  <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
+                    {mergeStatus.conflicted_files.length} file{mergeStatus.conflicted_files.length === 1 ? "" : "s"} with conflicts
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => setShowMerge(true)}
+                style={{ background: "var(--accent-red)", color: "#fff", fontSize: 11, padding: "5px 12px", border: "none", borderRadius: 6, flexShrink: 0 }}
+              >Resolve →</button>
+            </div>
+          )}
           {/* Remote URL bar */}
           <div
             onClick={() => { setRemoteInput(remote); setEditingRemote(true); }}
@@ -1570,14 +1592,16 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
           branches={branches}
           onClose={() => setShowMerge(false)}
           onCompleted={async () => {
-            // Refresh log + branches after a successful merge/abort
+            // Refresh log + branches + merge status after a successful merge/abort
             try {
-              const [info, br] = await Promise.all([
+              const [info, br, ms] = await Promise.all([
                 getGitInfo(sessionId).catch(() => null),
                 getGitBranches(sessionId).catch(() => branches),
+                getMergeStatus(sessionId).catch(() => null),
               ]);
               if (info) setLog(info.log);
               setBranches(br);
+              setMergeStatus(ms);
             } catch {}
           }}
         />
@@ -1643,6 +1667,7 @@ function MobileMergePanel({
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [preview, setPreview] = useState<MergePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [backupBranch, setBackupBranch] = useState<string | null>(null);
 
   const refresh = useCallback(() =>
     getMergeStatus(sessionId).then(s => { setStatus(s); return s; }).catch(e => { setErr(String(e)); return null; }),
@@ -1683,7 +1708,13 @@ function MobileMergePanel({
     try {
       const r = await gitMergeStart(sessionId, source, target);
       if (r.up_to_date) { setMsg({ text: `${target} is already up to date with ${source}.`, ok: true }); onCompleted(); return; }
-      if (r.clean) { setMsg({ text: `Merged ${source} into ${target} cleanly.`, ok: true }); onCompleted(); return; }
+      if (r.clean) {
+        const bk = r.backup_branch ? ` Backup: ${r.backup_branch}` : "";
+        setMsg({ text: `Merged ${source} into ${target} cleanly.${bk}`, ok: true });
+        onCompleted();
+        return;
+      }
+      setBackupBranch(r.backup_branch ?? null);
       await refresh();
     } catch (e) {
       setErr(String(e).replace(/^Error:\s*/, ""));
@@ -1709,8 +1740,9 @@ function MobileMergePanel({
         <MobileMergeResolver
           sessionId={sessionId}
           status={status}
+          backupBranch={backupBranch}
           onStatusChange={setStatus}
-          onCompleted={() => { setStatus(null); onCompleted(); onClose(); }}
+          onCompleted={() => { setStatus(null); setBackupBranch(null); onCompleted(); onClose(); }}
           setMsg={setMsg}
         />
       ) : branches.local.length < 2 ? (
@@ -1999,10 +2031,11 @@ function _MobileDiffTabBody({
 }
 
 function MobileMergeResolver({
-  sessionId, status, onStatusChange, onCompleted, setMsg,
+  sessionId, status, backupBranch, onStatusChange, onCompleted, setMsg,
 }: {
   sessionId: string;
   status: MergeStatus;
+  backupBranch: string | null;
   onStatusChange: (s: MergeStatus) => void;
   onCompleted: () => void;
   setMsg: (m: { text: string; ok: boolean } | null) => void;
@@ -2049,6 +2082,12 @@ function MobileMergeResolver({
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+      {backupBranch && (
+        <div style={{ padding: "6px 14px", fontSize: 11, background: "rgba(88,166,255,0.08)", borderBottom: "1px solid var(--border)", color: "var(--text-body)", display: "flex", flexDirection: "column", gap: 2, flexShrink: 0 }}>
+          <span><span style={{ color: "var(--accent-blue)" }}>💾 Backup:</span> <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{backupBranch}</span></span>
+          <span style={{ color: "var(--text-muted)" }}>Roll back: <span style={{ fontFamily: "monospace" }}>git reset --hard {backupBranch}</span></span>
+        </div>
+      )}
       <div style={{ padding: "10px 14px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
         <div style={{ fontSize: 13, color: "var(--text-body)" }}>
           Merging <span style={{ fontFamily: "monospace", color: "var(--accent-amber)" }}>{status.merge_head}</span> → <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{status.current_branch}</span>
