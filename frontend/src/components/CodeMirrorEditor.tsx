@@ -1,5 +1,5 @@
 import { useEffect, useImperativeHandle, useRef, forwardRef } from "react";
-import { EditorState, type Extension } from "@codemirror/state";
+import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, rectangularSelection, crosshairCursor, highlightActiveLineGutter } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { searchKeymap, highlightSelectionMatches, search, openSearchPanel } from "@codemirror/search";
@@ -20,6 +20,14 @@ import { go } from "@codemirror/lang-go";
 export interface CodeMirrorEditorHandle {
   focus: () => void;
   openSearch: () => void;
+}
+
+const rectCompartment = new Compartment();
+
+function rectSelectionFor(columnMode: boolean) {
+  return rectangularSelection({
+    eventFilter: (e) => columnMode || e.altKey,
+  });
 }
 
 function langFor(ext: string): Extension | null {
@@ -45,7 +53,8 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   onSave?: () => void;
   ext?: string;
   readOnly?: boolean;
-}>(function CodeMirrorEditor({ content, onChange, onSave, ext = "", readOnly = false }, ref) {
+  columnMode?: boolean;
+}>(function CodeMirrorEditor({ content, onChange, onSave, ext = "", readOnly = false, columnMode = false }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -67,7 +76,7 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       highlightActiveLineGutter(),
       foldGutter(),
       drawSelection({ drawRangeCursor: true }),
-      rectangularSelection(),
+      rectCompartment.of(rectSelectionFor(columnMode)),
       crosshairCursor(),
       highlightActiveLine(),
       highlightSelectionMatches(),
@@ -117,6 +126,15 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       });
     }
   }, [content]);
+
+  // Hot-swap rectangular selection behavior when columnMode toggles
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: rectCompartment.reconfigure(rectSelectionFor(columnMode)),
+    });
+  }, [columnMode]);
 
   return (
     <div

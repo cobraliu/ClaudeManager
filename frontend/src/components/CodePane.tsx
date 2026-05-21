@@ -1144,6 +1144,7 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const [editing, setEditing] = useState(false);
   const [editBuffer, setEditBuffer] = useState<string>("");
   const [saving, setSaving] = useState(false);
+  const [columnMode, setColumnMode] = useState(false);
   const editingRef = useRef(false);
   const cmRef = useRef<CodeMirrorEditorHandle | null>(null);
   const name = path.split("/").pop() ?? path;
@@ -1302,13 +1303,37 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
         <ConfigValidationBanner content={fileData.content} format={sourceFmt} compact />
       )}
       {editing && fileData ? (
-        <CodeMirrorEditor
-          ref={cmRef}
-          content={editBuffer}
-          ext={name.split(".").pop()?.toLowerCase() ?? ""}
-          onChange={setEditBuffer}
-          onSave={handleSave}
-        />
+        <>
+          <div style={{ padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)", display: "flex", alignItems: "center", gap: 8, background: "var(--bg-base)", flexShrink: 0 }}>
+            <button
+              onClick={() => setColumnMode(v => !v)}
+              title={columnMode ? "Column-select mode ON: drag = rectangular selection" : "Column-select mode OFF: hold Alt to drag column"}
+              style={{
+                padding: "2px 8px",
+                fontSize: 11,
+                fontFamily: "monospace",
+                background: columnMode ? "var(--accent-blue)" : "var(--bg-elevated)",
+                color: columnMode ? "#fff" : "var(--text-secondary)",
+                border: "1px solid var(--bg-hover)",
+                borderRadius: 3,
+                cursor: "pointer",
+              }}
+            >
+              COL {columnMode ? "ON" : "OFF"}
+            </button>
+            <span style={{ fontSize: 10, color: "var(--text-muted)", fontFamily: "monospace" }}>
+              Ctrl+D select next · Ctrl+F find/replace · {columnMode ? "drag = rectangle" : "Alt+drag = rectangle"}
+            </span>
+          </div>
+          <CodeMirrorEditor
+            ref={cmRef}
+            content={editBuffer}
+            ext={name.split(".").pop()?.toLowerCase() ?? ""}
+            onChange={setEditBuffer}
+            onSave={handleSave}
+            columnMode={columnMode}
+          />
+        </>
       ) : (
         <ViewerContent
           sessionId={sessionId}
