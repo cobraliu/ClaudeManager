@@ -1273,6 +1273,12 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
             flex: 1,
             overflowY: "auto",
             overflowX: "hidden",
+            // Reserve scrollbar width even when the list fits without
+            // scrolling, so toggling Active/All doesn't shift card widths
+            // by the scrollbar's ~15px (caused subtle reflow jitter).
+            // The card-collapse bug itself is fixed in SessionCard by
+            // using overflow:clip instead of overflow:hidden.
+            scrollbarGutter: "stable",
             minHeight: 0,
             padding: "6px 10px",
             display: "grid",
