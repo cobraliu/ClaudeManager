@@ -11,7 +11,8 @@ import {
   type ChangedFile, type FileData, type FileEntry,
   type GitLogEntry,
 } from "../api/sessionApi";
-import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker, EditorWithLineNumbers } from "./FileEditorModal";
+import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker } from "./FileEditorModal";
+import { CodeMirrorEditor, type CodeMirrorEditorHandle } from "./CodeMirrorEditor";
 import { GitPanel, CommitDetailModal } from "./GitPanel";
 import { GitBranchPicker, GitPullButton } from "./GitBranchPicker";
 import { ConfigFormatToggle } from "./ConfigFormatToggle";
@@ -1144,7 +1145,7 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const [editBuffer, setEditBuffer] = useState<string>("");
   const [saving, setSaving] = useState(false);
   const editingRef = useRef(false);
-  const editTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const cmRef = useRef<CodeMirrorEditorHandle | null>(null);
   const name = path.split("/").pop() ?? path;
   const isMd = isMdFile(name);
   const isCsv = isCsvFile(name);
@@ -1232,7 +1233,7 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
     if (!fileData || saving) return;
     setEditBuffer(fileData.content);
     setEditing(true);
-    setTimeout(() => editTextareaRef.current?.focus(), 30);
+    setTimeout(() => cmRef.current?.focus(), 30);
   };
 
   const handleSave = async () => {
@@ -1255,17 +1256,6 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
     if (saving) return;
     setEditing(false);
     setEditBuffer("");
-  };
-
-  const handleEditTabKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key !== "Tab") return;
-    e.preventDefault();
-    const el = e.currentTarget;
-    const start = el.selectionStart;
-    const end = el.selectionEnd;
-    const next = editBuffer.slice(0, start) + "  " + editBuffer.slice(end);
-    setEditBuffer(next);
-    requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = start + 2; });
   };
 
   return (
@@ -1312,11 +1302,12 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
         <ConfigValidationBanner content={fileData.content} format={sourceFmt} compact />
       )}
       {editing && fileData ? (
-        <EditorWithLineNumbers
-          textareaRef={editTextareaRef}
+        <CodeMirrorEditor
+          ref={cmRef}
           content={editBuffer}
+          ext={name.split(".").pop()?.toLowerCase() ?? ""}
           onChange={setEditBuffer}
-          onKeyDown={handleEditTabKey}
+          onSave={handleSave}
         />
       ) : (
         <ViewerContent

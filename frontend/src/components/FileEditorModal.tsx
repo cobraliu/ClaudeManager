@@ -11,6 +11,7 @@ import { marked } from "../lib/markdown";
 import { ConfigFormatToggle } from "./ConfigFormatToggle";
 import { ConfigCheckButton } from "./ConfigCheckButton";
 import { ConfigValidationBanner } from "./ConfigValidationBanner";
+import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { detectFormat, convert, extFor, type ConfigFormat } from "../lib/configConvert";
 import {
   listFiles,
@@ -2115,20 +2116,6 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
 
   const isModified = openFile ? openFile.content !== openFile.savedContent : false;
 
-  const handleTabKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key !== "Tab") return;
-    e.preventDefault();
-    const el = e.currentTarget;
-    const start = el.selectionStart;
-    const end = el.selectionEnd;
-    const newContent =
-      openFile!.content.slice(0, start) + "  " + openFile!.content.slice(end);
-    setOpenFile((f) => (f ? { ...f, content: newContent } : f));
-    requestAnimationFrame(() => {
-      el.selectionStart = el.selectionEnd = start + 2;
-    });
-  };
-
   const ext = openFile ? getExt(openFile.path) : "";
   const supportsPreview = openFile && (openFile.kind === "code" || openFile.kind === "csv" || openFile.kind === "jsonl" || openFile.kind === "markdown" || openFile.kind === "pdf");
   const isJsonl = openFile && ext === "jsonl";
@@ -2683,11 +2670,11 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
                 ) : openFile.kind === "code" && viewMode === "preview" ? (
                   <CodeViewer content={openFile.content} ext={ext} />
                 ) : (
-                  <EditorWithLineNumbers
-                    textareaRef={textareaRef}
+                  <CodeMirrorEditor
                     content={openFile.content}
+                    ext={ext}
                     onChange={(v) => setOpenFile((f) => f ? { ...f, content: v } : f)}
-                    onKeyDown={handleTabKey}
+                    onSave={handleSave}
                   />
                 )}
               </>
