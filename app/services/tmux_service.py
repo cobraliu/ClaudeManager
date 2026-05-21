@@ -124,6 +124,7 @@ class TmuxService:
         claude_bin: str = "claude",
         claude_shell: str = "",
         cursor_bin: str = "agent",
+        anthropic_proxy_port: int = 0,
     ) -> None:
         self.socket_name = socket_name
         self._tmux = os.getenv("TMUX_BIN", "tmux")
@@ -133,6 +134,7 @@ class TmuxService:
         )
         self.claude_bin = claude_bin or "claude"
         self.cursor_bin = cursor_bin or "agent"
+        self.anthropic_proxy_port = anthropic_proxy_port
         # Optional shell wrapper, e.g. "bash -l" for WSL/nvm users whose PATH
         # is only set up in .profile/.bashrc (login shell).
         self.claude_shell = claude_shell or ""
@@ -182,6 +184,21 @@ class TmuxService:
         inner_id: str | None = None,
         tool: str = "claude",
     ) -> None:
+        # Route Claude through our local Anthropic API tap proxy so we can
+        # preview streaming content before the CLI flushes JSONL. NO_PROXY
+        # makes the local hop bypass the system upstream proxy; the tap proxy
+        # itself walks the upstream proxy to reach api.anthropic.com.
+        if tool == "claude" and self.anthropic_proxy_port:
+            tap_url = f"http://127.0.0.1:{self.anthropic_proxy_port}"
+            existing_no = env.get("NO_PROXY") or env.get("no_proxy") or ""
+            no_proxy = ",".join(filter(None, [existing_no, "127.0.0.1", "localhost"]))
+            env = {
+                **env,
+                "ANTHROPIC_BASE_URL": env.get("ANTHROPIC_BASE_URL") or tap_url,
+                "NO_PROXY": no_proxy,
+                "no_proxy": no_proxy,
+            }
+
         env_args = self._build_env_args(env)
 
         if tool == "cursor":

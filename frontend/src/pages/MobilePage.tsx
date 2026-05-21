@@ -17,6 +17,7 @@ import {
   getGitGraph,
   gitCheckoutBranch,
   GitCheckoutConflictError,
+  gitPull,
   gitRollback,
   gitManualCommit,
   getCommitDetail,
@@ -102,6 +103,10 @@ import {
 import gitIcon from "../assets/git.svg";
 import terminalIcon from "../assets/terminal.svg";
 import scheduleIcon from "../assets/schedule.svg";
+import { ConfigFormatToggle } from "../components/ConfigFormatToggle";
+import { ConfigCheckButton } from "../components/ConfigCheckButton";
+import { ConfigValidationBanner } from "../components/ConfigValidationBanner";
+import { detectFormat, convert, extFor, type ConfigFormat } from "../lib/configConvert";
 import { TerminalPane } from "../components/TerminalPane";
 import { TuiPane } from "../components/TuiPane";
 import { ConversationPane } from "../components/ConversationPane";
@@ -948,6 +953,63 @@ function MobileFileDiff({ file, onClose }: { file: GitDiffFile; onClose: () => v
 /* ─── Mobile Git Panel ─── */
 const GIT_PAGE_SIZE = 15;
 
+function MobileGitPullButton({ sessionId, onPulled }: { sessionId: string; onPulled?: () => void | Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  const handleClick = async () => {
+    if (busy) return;
+    setBusy(true);
+    setToast(null);
+    try {
+      const r = await gitPull(sessionId);
+      const msg = r.output?.split("\n")[0] || "Up to date";
+      setToast({ kind: "ok", text: msg });
+      await onPulled?.();
+    } catch (e) {
+      setToast({ kind: "err", text: String(e).replace(/^Error:\s*/, "") });
+    } finally {
+      setBusy(false);
+      setTimeout(() => setToast(null), 4000);
+    }
+  };
+
+  return (
+    <div style={{ position: "relative", display: "inline-block", flexShrink: 0 }}>
+      <button
+        onClick={handleClick}
+        disabled={busy}
+        title={busy ? "Pulling…" : "git pull --ff-only"}
+        style={{
+          display: "inline-flex", alignItems: "center", gap: 4,
+          fontSize: 11, padding: "3px 10px",
+          background: "var(--bg-hover)", border: "1px solid var(--text-faintest)",
+          color: "var(--text-secondary)", borderRadius: 11,
+          cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1,
+        }}
+      >
+        <svg width={10} height={10} viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0 }}>
+          <path d="M7.78 12.53a.75.75 0 01-1.06 0L2.47 8.28a.75.75 0 011.06-1.06l2.72 2.72V2.75a.75.75 0 011.5 0v7.19l2.72-2.72a.75.75 0 111.06 1.06l-4.25 4.25zM2.75 14a.75.75 0 000 1.5h10.5a.75.75 0 000-1.5H2.75z" />
+        </svg>
+        <span>{busy ? "Pulling…" : "Pull"}</span>
+      </button>
+      {toast && (
+        <div
+          style={{
+            position: "absolute", top: "calc(100% + 4px)", left: 0, zIndex: 200,
+            background: toast.kind === "ok" ? "rgba(46,160,67,0.95)" : "rgba(248,81,73,0.95)",
+            color: "#fff", fontSize: 11, padding: "4px 8px", borderRadius: 4,
+            maxWidth: 280, whiteSpace: "pre-wrap", wordBreak: "break-word",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
+          }}
+        >
+          {toast.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sessionId: string; session: SessionMeta; onSessionChange: (s: SessionMeta) => void; onClose: () => void }) {
   const [log, setLog] = useState<GitLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1103,6 +1165,19 @@ function MobileGitPanel({ sessionId, session, onSessionChange, onClose }: { sess
               onClick={() => setShowBranchSheet(true)}
               style={{ fontSize: 11, padding: "3px 10px", background: "rgba(88,166,255,0.12)", border: "1px solid rgba(88,166,255,0.3)", color: "var(--accent-blue)", borderRadius: 11, fontFamily: "monospace", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 1 }}
             >⎇ {branches.current}</button>
+          )}
+          {isRepo && (
+            <MobileGitPullButton
+              sessionId={sessionId}
+              onPulled={async () => {
+                const [info, br] = await Promise.all([
+                  getGitInfo(sessionId).catch(() => null),
+                  getGitBranches(sessionId).catch(() => branches),
+                ]);
+                if (info) setLog(info.log);
+                setBranches(br);
+              }}
+            />
           )}
           <span style={{ fontSize: 12, color: "var(--text-muted)", marginLeft: "auto", flexShrink: 0 }}>{filtered.length} commits</span>
         </div>
@@ -3644,6 +3719,7 @@ function MobileFileBrowserPanel({
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState("");
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [convertTarget, setConvertTarget] = useState<"raw" | ConfigFormat>("raw");
 
   // ── Toolbar / action-sheet state ─────────────────────────────────────────
   const [sheet, setSheet] = useState<FileSheetKind>(null);
@@ -3909,6 +3985,7 @@ function MobileFileBrowserPanel({
   const openFile = useCallback(async (entry: FileEntry) => {
     setPreviewEntry(entry);
     setBlobUrl(null);
+    setConvertTarget("raw");
     if (entry.is_sqlite) return;
     const kind = getMobileFileKind(entry);
     if (kind === "pdf" || kind === "image") {
@@ -4036,6 +4113,12 @@ function MobileFileBrowserPanel({
     const kind = getMobileFileKind(previewEntry);
     const ext = previewEntry.name.split(".").pop()?.toLowerCase() || "";
     const rawUrl = `/api/sessions/${sessionId}/fs/raw?path=${encodeURIComponent(previewEntry.path)}`;
+    const sourceFmt = detectFormat(previewEntry.name);
+    const conversion = sourceFmt && convertTarget !== "raw"
+      ? convert(fileContent, sourceFmt, convertTarget)
+      : null;
+    const displayContent = conversion?.ok ? conversion.content : fileContent;
+    const displayExt = sourceFmt && convertTarget !== "raw" ? extFor(convertTarget) : ext;
     return (
       <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 210, display: "flex", flexDirection: "column" }}>
         <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
@@ -4043,12 +4126,32 @@ function MobileFileBrowserPanel({
           <span style={{ flex: 1, fontSize: 14, fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{previewEntry.name}</span>
           <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{kind}</span>
         </div>
+        {sourceFmt && !fileLoading && !fileError && (
+          <div style={{ padding: "6px 12px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0, overflowX: "auto" }}>
+            <ConfigFormatToggle
+              source={sourceFmt}
+              target={convertTarget}
+              onChange={setConvertTarget}
+              error={conversion && !conversion.ok ? conversion.error : null}
+              compact
+            />
+            <ConfigCheckButton
+              content={fileContent}
+              format={sourceFmt}
+              disabled={convertTarget !== "raw"}
+              compact
+            />
+          </div>
+        )}
+        {sourceFmt && convertTarget === "raw" && !fileLoading && !fileError && (
+          <ConfigValidationBanner content={fileContent} format={sourceFmt} compact />
+        )}
         <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
           {fileLoading && <div style={{ padding: 24, color: "var(--text-muted)", textAlign: "center" }}>Loading…</div>}
           {fileError && <div style={{ padding: 16, color: "var(--accent-red)", fontSize: 13 }}>{fileError}</div>}
           {!fileLoading && !fileError && (
             <>
-              {kind === "code" && <MobileCodeViewer content={fileContent} ext={ext} />}
+              {kind === "code" && <MobileCodeViewer content={displayContent} ext={displayExt} />}
               {kind === "markdown" && (
                 <div className="md-preview" dangerouslySetInnerHTML={{ __html: marked.parse(fileContent) as string }}
                   style={{ flex: 1, overflow: "auto", padding: "16px", color: "var(--text-primary)", fontSize: 14, lineHeight: 1.7 }} />

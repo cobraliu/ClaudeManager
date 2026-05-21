@@ -354,7 +354,14 @@ export function SessionCard({
         cursor: (canAttach && onAttach) || (canResume && onViewChat) ? "pointer" : "default",
         breakInside: "avoid",
         minWidth: 0,
-        overflow: "hidden",
+        // `clip` (not `hidden`) — same visual clipping, but unlike `hidden`
+        // it does NOT reset the box's automatic min-size to 0. With `hidden`,
+        // grid-auto-rows: auto resolves to minmax(0, max-content), so when
+        // the flex-constrained grid container can't fit every row at its
+        // max-content height (e.g., "Showing all sessions" with many items
+        // in a narrow single-column layout), the browser compresses rows
+        // toward 0 and overflow:hidden silently clips most of the card.
+        overflow: "clip",
       }}
       onClick={() => {
         if (canAttach && onAttach) { onAttach(); }

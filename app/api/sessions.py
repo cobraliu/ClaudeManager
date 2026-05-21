@@ -2033,6 +2033,69 @@ def get_raw_messages(
                         })
                     collected = transformed
                     total = len(transformed)
+                elif chat_sid:
+                    # Merge in-flight Anthropic-proxy snapshots so the frontend
+                    # sees streaming assistant content before the CLI flushes
+                    # the JSONL line. Snapshots live in
+                    # ~/.claude/cached_messages/{csid}/{ts_ns}.json and are
+                    # written by tools/anthropic_proxy/server.py. Dedup against
+                    # JSONL by message.id; for one in-flight request we keep
+                    # only the latest snapshot. The cleanup loop in
+                    # app/services/proxy_tap_cleanup.py drops snapshots whose
+                    # request_id has been written into JSONL.
+                    from pathlib import Path as _Path
+                    cache_dir = _Path.home() / ".claude" / "cached_messages" / chat_sid
+                    if cache_dir.is_dir():
+                        seen_ids: set[str] = set()
+                        for entry in collected:
+                            if not isinstance(entry, dict) or entry.get("type") != "assistant":
+                                continue
+                            msg = entry.get("message")
+                            if isinstance(msg, dict):
+                                mid = msg.get("id")
+                                if isinstance(mid, str):
+                                    seen_ids.add(mid)
+                        latest_by_req: dict[str, tuple[int, dict]] = {}
+                        for snap_path in cache_dir.iterdir():
+                            name = snap_path.name
+                            if not name.endswith(".json") or name.startswith("."):
+                                continue
+                            try:
+                                ts_ns = int(name[:-5])
+                            except ValueError:
+                                continue
+                            try:
+                                snap = _json.loads(snap_path.read_text())
+                            except (OSError, _json.JSONDecodeError):
+                                continue
+                            req_id = snap.get("request_id")
+                            if not isinstance(req_id, str) or req_id in seen_ids:
+                                continue
+                            cur = latest_by_req.get(req_id)
+                            if cur is None or ts_ns > cur[0]:
+                                latest_by_req[req_id] = (ts_ns, snap)
+                        if latest_by_req:
+                            from datetime import timezone as _tz
+                            synth: list = []
+                            last_real_uuid = collected[-1].get("uuid") if collected else None
+                            for ts_ns, snap in latest_by_req.values():
+                                iso = _dt.fromtimestamp(ts_ns / 1_000_000_000, tz=_tz.utc).isoformat().replace("+00:00", "Z")
+                                synth.append({
+                                    "type": "assistant",
+                                    "uuid": f"tap-{snap.get('request_id')}",
+                                    "parentUuid": last_real_uuid,
+                                    "timestamp": iso,
+                                    "sessionId": chat_sid,
+                                    "_synthetic": True,
+                                    "_snapshot_kind": snap.get("kind", "snapshot"),
+                                    "message": {
+                                        "role": "assistant",
+                                        "id": snap.get("request_id"),
+                                        "content": snap.get("content") or [],
+                                    },
+                                })
+                            synth.sort(key=lambda d: d["timestamp"])
+                            collected.extend(synth)
 
                 return {"messages": collected, "total": total}
 

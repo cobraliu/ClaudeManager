@@ -11,9 +11,14 @@ import {
   type ChangedFile, type FileData, type FileEntry,
   type GitLogEntry,
 } from "../api/sessionApi";
-import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker, EditorWithLineNumbers } from "./FileEditorModal";
+import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker } from "./FileEditorModal";
+import { CodeMirrorEditor, type CodeMirrorEditorHandle } from "./CodeMirrorEditor";
 import { GitPanel, CommitDetailModal } from "./GitPanel";
 import { GitBranchPicker, GitPullButton } from "./GitBranchPicker";
+import { ConfigFormatToggle } from "./ConfigFormatToggle";
+import { ConfigCheckButton } from "./ConfigCheckButton";
+import { ConfigValidationBanner } from "./ConfigValidationBanner";
+import { detectFormat, convert, languageFor, type ConfigFormat } from "../lib/configConvert";
 import downloadIcon from "../assets/download.svg";
 
 const MAX_TRANSFER_MB = 16;
@@ -1139,8 +1144,9 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const [editing, setEditing] = useState(false);
   const [editBuffer, setEditBuffer] = useState<string>("");
   const [saving, setSaving] = useState(false);
+  const [columnMode, setColumnMode] = useState(false);
   const editingRef = useRef(false);
-  const editTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const cmRef = useRef<CodeMirrorEditorHandle | null>(null);
   const name = path.split("/").pop() ?? path;
   const isMd = isMdFile(name);
   const isCsv = isCsvFile(name);
@@ -1190,6 +1196,29 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const selectedChanged = changedFiles.find(f => f.path === path);
   const entry: FileEntry = { name, path, type: "file", size: null, is_text: !showSqlite && !showPdf && !showArchive, is_skipped: false, is_sqlite: showSqlite, is_archive: showArchive };
 
+  // ── Config format conversion / validation ─────────────────────────────────
+  const sourceFmt = detectFormat(name);
+  const [convertTarget, setConvertTarget] = useState<"raw" | ConfigFormat>("raw");
+  useEffect(() => { setConvertTarget("raw"); }, [path]);
+
+  const conversion = useMemo(() => {
+    if (!fileData || !sourceFmt || convertTarget === "raw") return null;
+    return convert(fileData.content, sourceFmt, convertTarget);
+  }, [fileData, sourceFmt, convertTarget]);
+
+  const displayedFileData: FileData | null = useMemo(() => {
+    if (!fileData) return null;
+    if (!sourceFmt || convertTarget === "raw" || !conversion?.ok) return fileData;
+    return {
+      ...fileData,
+      content: conversion.content,
+      language: languageFor(convertTarget),
+      added_lines: [],
+      removed_lines: [],
+      diff_raw: undefined,
+    };
+  }, [fileData, sourceFmt, convertTarget, conversion]);
+
   const canEdit = !!fileData && !fileData.is_binary && !showSqlite && !showArchive && !showPdf && !showImage;
   const isModified = editing && !!fileData && editBuffer !== fileData.content;
 
@@ -1205,7 +1234,7 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
     if (!fileData || saving) return;
     setEditBuffer(fileData.content);
     setEditing(true);
-    setTimeout(() => editTextareaRef.current?.focus(), 30);
+    setTimeout(() => cmRef.current?.focus(), 30);
   };
 
   const handleSave = async () => {
@@ -1228,17 +1257,6 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
     if (saving) return;
     setEditing(false);
     setEditBuffer("");
-  };
-
-  const handleEditTabKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key !== "Tab") return;
-    e.preventDefault();
-    const el = e.currentTarget;
-    const start = el.selectionStart;
-    const end = el.selectionEnd;
-    const next = editBuffer.slice(0, start) + "  " + editBuffer.slice(end);
-    setEditBuffer(next);
-    requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = start + 2; });
   };
 
   return (
@@ -1264,18 +1282,63 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
         onEditToggle={editing ? handleSave : beginEdit}
         onCancelEdit={cancelEdit}
       />
+      {sourceFmt && fileData && !editing && (
+        <div style={{ padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)", display: "flex", alignItems: "center", gap: 8, background: "var(--bg-base)", flexShrink: 0 }}>
+          <ConfigFormatToggle
+            source={sourceFmt}
+            target={convertTarget}
+            onChange={setConvertTarget}
+            error={conversion && !conversion.ok ? conversion.error : null}
+            compact
+          />
+          <ConfigCheckButton
+            content={fileData.content}
+            format={sourceFmt}
+            disabled={convertTarget !== "raw"}
+            compact
+          />
+        </div>
+      )}
+      {sourceFmt && fileData && convertTarget === "raw" && !editing && (
+        <ConfigValidationBanner content={fileData.content} format={sourceFmt} compact />
+      )}
       {editing && fileData ? (
-        <EditorWithLineNumbers
-          textareaRef={editTextareaRef}
-          content={editBuffer}
-          onChange={setEditBuffer}
-          onKeyDown={handleEditTabKey}
-        />
+        <>
+          <div style={{ padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)", display: "flex", alignItems: "center", gap: 8, background: "var(--bg-base)", flexShrink: 0 }}>
+            <button
+              onClick={() => setColumnMode(v => !v)}
+              title={columnMode ? "Column-select mode ON: drag = rectangular selection" : "Column-select mode OFF: hold Alt to drag column"}
+              style={{
+                padding: "2px 8px",
+                fontSize: 11,
+                fontFamily: "monospace",
+                background: columnMode ? "var(--accent-blue)" : "var(--bg-elevated)",
+                color: columnMode ? "#fff" : "var(--text-secondary)",
+                border: "1px solid var(--bg-hover)",
+                borderRadius: 3,
+                cursor: "pointer",
+              }}
+            >
+              COL {columnMode ? "ON" : "OFF"}
+            </button>
+            <span style={{ fontSize: 10, color: "var(--text-muted)", fontFamily: "monospace" }}>
+              Ctrl+D select next · Ctrl+F find/replace · {columnMode ? "drag = rectangle" : "Alt+drag = rectangle"}
+            </span>
+          </div>
+          <CodeMirrorEditor
+            ref={cmRef}
+            content={editBuffer}
+            ext={name.split(".").pop()?.toLowerCase() ?? ""}
+            onChange={setEditBuffer}
+            onSave={handleSave}
+            columnMode={columnMode}
+          />
+        </>
       ) : (
         <ViewerContent
           sessionId={sessionId}
           entry={entry}
-          fileData={fileData}
+          fileData={displayedFileData}
           fileLoading={fileLoading}
           scrollToFirst={false}
           viewMode={viewMode}
