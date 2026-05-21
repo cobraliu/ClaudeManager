@@ -22,6 +22,7 @@ from app.api import claude_caps_api
 from app.api import code_api
 from app.api import config_api
 from app.api import files as files_api
+from app.api import proxy_tap
 from app.api import fs as fs_api
 from app.api import sessions as sessions_api
 from app.api import usage_api
@@ -42,6 +43,7 @@ from app.models.user import UserRole
 from app.models.session import SessionStatus
 from app.observability import configure_logging
 from app.services.bash_term_service import TerminalManager
+from app.services.proxy_tap_cleanup import run_once as proxy_tap_cleanup_once
 from app.services.session_store import SessionStore
 from app.services.tmux_service import TmuxService
 from app.services.user_store import UserStore
@@ -52,7 +54,17 @@ from app.api import terminals as terminals_api
 _db_path = get_session_db_path()
 user_store = UserStore(_db_path)
 session_store = SessionStore(db_path=_db_path)
-tmux = TmuxService(proxy=get_proxy(), claude_bin=get_claude_bin(), claude_shell=get_claude_shell(), cursor_bin=get_cursor_bin())
+if os.environ.get("CLAUDE_PROXY_DISABLED", "").strip() in ("1", "true", "True", "yes"):
+    _anthropic_proxy_port = 0
+else:
+    _anthropic_proxy_port = int(os.environ.get("CLAUDE_PROXY_PORT", "19098"))
+tmux = TmuxService(
+    proxy=get_proxy(),
+    claude_bin=get_claude_bin(),
+    claude_shell=get_claude_shell(),
+    cursor_bin=get_cursor_bin(),
+    anthropic_proxy_port=_anthropic_proxy_port,
+)
 term_mgr = TerminalManager(
     tmux,
     idle_grace_getter=lambda: float(get_term_idle_grace_seconds()),
@@ -97,6 +109,7 @@ auth_api.configure(user_store)
 sessions_api.configure(session_store, tmux)
 files_api.configure(session_store)
 code_api.configure(session_store)
+proxy_tap.configure(session_store)
 terminal_ws.configure(session_store, tmux)
 shell_ws.configure(tmux, sessions_api._shell_tokens)
 term_ws.configure(tmux, term_mgr)
@@ -593,10 +606,23 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("task scheduler error")
 
+    async def _proxy_tap_cleanup_loop():
+        # First pass after a short delay so startup isn't slowed by FS scans.
+        await asyncio.sleep(15)
+        while True:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, proxy_tap_cleanup_once, session_store
+                )
+            except Exception:
+                logger.exception("proxy_tap cleanup error")
+            await asyncio.sleep(30)
+
     watchdog = asyncio.create_task(_session_watchdog())
     scheduler = asyncio.create_task(_task_scheduler())
+    proxy_tap_cleaner = asyncio.create_task(_proxy_tap_cleanup_loop())
     yield
-    for t in (watchdog, scheduler):
+    for t in (watchdog, scheduler, proxy_tap_cleaner):
         t.cancel()
         try:
             await t
@@ -622,6 +648,7 @@ app.include_router(sessions_api.router)
 app.include_router(sessions_api.models_router)
 app.include_router(files_api.router)
 app.include_router(code_api.router)
+app.include_router(proxy_tap.router)
 app.include_router(usage_api.router)
 app.include_router(terminal_ws.router)
 app.include_router(shell_ws.router)
