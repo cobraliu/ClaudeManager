@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 _DEFAULT_GITIGNORE = """\
@@ -995,10 +996,16 @@ def git_merge_start(cwd: str, source: str, target: str) -> dict:
     """Merge `source` into `target` (no-ff). If `target` is not the current branch,
     checks out `target` first.
 
+    Before running `git merge`, creates `backup/before-merge-<timestamp>` pointing
+    at the target branch's HEAD so users can always recover the pre-merge state
+    via `git reset --hard <backup>`. The backup branch is preserved through both
+    success and conflict paths; UI surfaces its name so it can be cleaned up
+    manually when the user is confident the merge went well.
+
     Returns:
-      - {"ok": True, "clean": True, "output": ...} when merge completed (no conflicts)
-      - {"ok": True, "clean": False, "conflicted_files": [...]} when conflicts surfaced
-      - {"ok": True, "up_to_date": True, "output": ...} when already up to date
+      - {"ok": True, "clean": True, "output": ..., "backup_branch": ...} when merge completed (no conflicts)
+      - {"ok": True, "clean": False, "conflicted_files": [...], "backup_branch": ...} when conflicts surfaced
+      - {"ok": True, "up_to_date": True, "output": ...} when already up to date (no backup created)
       - {"ok": False, "output": ...} on hard failure (dirty tree, unknown branch, ...)
     """
     if source == target:
@@ -1020,6 +1027,32 @@ def git_merge_start(cwd: str, source: str, target: str) -> dict:
         if co.returncode != 0:
             return {"ok": False, "output": f"failed to checkout target branch '{target}': {(co.stdout + co.stderr).strip()}"}
 
+    # Create a backup pointer at target's current HEAD before touching anything.
+    # The %Y%m%d-%H%M%S stamp makes collisions effectively impossible across
+    # repeat attempts; if the user merges 4 times in the same minute, we fall
+    # back to appending a short HEAD sha.
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_branch = f"backup/before-merge-{ts}"
+    bk = subprocess.run(
+        ["git", "branch", backup_branch, "HEAD"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
+    if bk.returncode != 0:
+        # Likely cause: rare same-second collision. Disambiguate with HEAD short sha.
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        )
+        suffix = sha.stdout.strip() if sha.returncode == 0 else "x"
+        backup_branch = f"backup/before-merge-{ts}-{suffix}"
+        bk2 = subprocess.run(
+            ["git", "branch", backup_branch, "HEAD"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        )
+        if bk2.returncode != 0:
+            # Don't block the merge if backup creation fails; just warn via output.
+            return {"ok": False, "output": f"failed to create backup branch: {(bk2.stdout + bk2.stderr).strip()}"}
+
     result = subprocess.run(
         ["git", "merge", "--no-ff", "--no-edit", source],
         cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=120,
@@ -1027,8 +1060,14 @@ def git_merge_start(cwd: str, source: str, target: str) -> dict:
     out = (result.stdout + result.stderr).strip()
     if result.returncode == 0:
         if "Already up to date" in out or "Already up-to-date" in out:
+            # Nothing actually happened — delete the unused backup so we don't
+            # accumulate empty pointers on repeat "already up-to-date" calls.
+            subprocess.run(
+                ["git", "branch", "-D", backup_branch],
+                cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+            )
             return {"ok": True, "up_to_date": True, "output": out}
-        return {"ok": True, "clean": True, "output": out}
+        return {"ok": True, "clean": True, "output": out, "backup_branch": backup_branch}
 
     # Non-zero exit: either a conflict (merge in progress, files unmerged) or a real error.
     status = git_merge_status(cwd)
@@ -1038,7 +1077,13 @@ def git_merge_start(cwd: str, source: str, target: str) -> dict:
             "clean": False,
             "conflicted_files": status["conflicted_files"],
             "output": out,
+            "backup_branch": backup_branch,
         }
+    # Hard failure with no merge in progress — the backup is now dead weight, drop it.
+    subprocess.run(
+        ["git", "branch", "-D", backup_branch],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+    )
     return {"ok": False, "output": out}
 
 

@@ -977,6 +977,8 @@ export interface MergeStartResult {
   up_to_date?: boolean;
   conflicted_files?: string[];
   output?: string;
+  /** Backup branch created at target's pre-merge HEAD; absent when up-to-date. */
+  backup_branch?: string;
 }
 
 export interface ConflictFileVersions {
