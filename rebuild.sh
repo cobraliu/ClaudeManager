@@ -25,9 +25,9 @@ npm install --silent
 npm run build
 
 if [[ "$RESTART" == true ]]; then
-  echo "[2/2] Restarting server..."
+  echo "[2/2] Restarting backend (proxy left running)..."
   cd "$ROOT"
-  exec bash restart.sh
+  exec bash restart.sh --no-proxy
 else
   echo "[2/2] Done. (run with -r to restart)"
 fi
