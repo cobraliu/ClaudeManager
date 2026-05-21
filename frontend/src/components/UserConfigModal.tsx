@@ -32,6 +32,12 @@ const LAYOUTS: { id: LayoutScheme; label: string; desc: string; preview: React.R
     desc: "对话居中最大化，Files 树/查看器移到右侧检查器。底部可选 Terminal 面板。",
     preview: <LayoutPreviewChatCentric />,
   },
+  {
+    id: "file-centric",
+    label: "File-Centric",
+    desc: "宽屏 4 列：Sidebar / 宽 Files 树 / 多 tab 查看器 / Chat·TUI。tab 可同时打开多个文件、Git、JSONL，切换 session 自动保留。",
+    preview: <LayoutPreviewFileCentric />,
+  },
 ];
 
 function LayoutPreviewClassic() {
@@ -63,6 +69,36 @@ function LayoutPreviewChatCentric() {
       <line x1="34" y1="0" x2="34" y2="100" stroke="var(--border)" />
       <line x1="118" y1="0" x2="118" y2="100" stroke="var(--border)" />
       <line x1="34" y1="72" x2="118" y2="72" stroke="var(--border)" />
+    </svg>
+  );
+}
+
+function LayoutPreviewFileCentric() {
+  // 4-column horizontal: Sidebar | Tree | Viewer (tabs+content) | Chat (+ term strip)
+  return (
+    <svg viewBox="0 0 160 100" width="160" height="100" style={{ display: "block" }}>
+      <rect x="0" y="0" width="160" height="100" fill="var(--bg-base)" stroke="var(--border)" />
+      {/* Sidebar */}
+      <rect x="0" y="0" width="18" height="100" fill="var(--bg-sidebar)" />
+      {/* Tree */}
+      <rect x="18" y="0" width="42" height="100" fill="var(--bg-surface)" />
+      <text x="22" y="54" fontSize="7" fill="var(--text-muted)" fontFamily="monospace">tree</text>
+      {/* Viewer with tab bar */}
+      <rect x="60" y="0" width="60" height="10" fill="var(--bg-hover)" />
+      <text x="62" y="8" fontSize="6" fill="var(--text-muted)" fontFamily="monospace">[a][b]×</text>
+      <rect x="60" y="10" width="60" height="90" fill="var(--bg-base)" />
+      <text x="76" y="58" fontSize="7" fill="var(--text-muted)" fontFamily="monospace">viewer</text>
+      {/* Chat + term strip */}
+      <rect x="120" y="0" width="40" height="72" fill="var(--bg-base)" />
+      <text x="128" y="40" fontSize="8" fill="var(--text-muted)" fontFamily="monospace">chat</text>
+      <rect x="120" y="72" width="40" height="28" fill="#0d1117" />
+      <text x="124" y="86" fontSize="6" fill="#3fb950" fontFamily="monospace">&gt;_ term</text>
+      {/* Dividers */}
+      <line x1="18" y1="0" x2="18" y2="100" stroke="var(--border)" />
+      <line x1="60" y1="0" x2="60" y2="100" stroke="var(--border)" />
+      <line x1="60" y1="10" x2="120" y2="10" stroke="var(--border)" />
+      <line x1="120" y1="0" x2="120" y2="100" stroke="var(--border)" />
+      <line x1="120" y1="72" x2="160" y2="72" stroke="var(--border)" />
     </svg>
   );
 }

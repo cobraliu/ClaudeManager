@@ -51,8 +51,145 @@ import { SessionSideDock } from "../components/SessionSideDock";
 import { UserConfigModal } from "../components/UserConfigModal";
 import { EmbeddedTerminalPanel } from "../components/EmbeddedTerminalPanel";
 import { useUserConfig, type LayoutScheme } from "../hooks/useUserConfig";
+import { useSessionTabs, type TabEntry } from "../hooks/useSessionTabs";
 
 const PAGE_SIZE = 30;
+
+/* ───── File-Centric Viewer Column ─────
+ * The middle column in file-centric layout. Holds a tab bar + the active tab's
+ * content. All tab contents are mounted simultaneously with display:none for
+ * inactive ones so CodeMirror state (scroll position, selection, history) is
+ * preserved across tab switches.
+ */
+function FileCentricViewerColumn(props: {
+  sessionId: string;
+  sessionMeta: SessionMeta;
+  tabs: TabEntry[];
+  activeTabId: string | null;
+  onActivate: (id: string) => void;
+  onClose: (id: string) => void;
+}) {
+  const { sessionId, sessionMeta, tabs, activeTabId, onActivate, onClose } = props;
+
+  const labelFor = (t: TabEntry): string => {
+    if (t.kind === "file") {
+      const base = t.path.split("/").filter(Boolean).pop() || t.path;
+      return base;
+    }
+    if (t.kind === "git") return "Git";
+    return "JSONL";
+  };
+  const titleFor = (t: TabEntry): string => {
+    if (t.kind === "file") return t.path;
+    if (t.kind === "git") return "Git status, diff, history, branches";
+    return "Conversation JSONL preview";
+  };
+
+  return (
+    <div style={{
+      flex: "1 1 0%", minWidth: 240, minHeight: 0, overflow: "hidden",
+      background: "var(--bg-base)",
+      display: "flex", flexDirection: "column",
+      borderRight: "1px solid var(--border)",
+    }}>
+      {/* Tab bar */}
+      <div style={{
+        flexShrink: 0, display: "flex", alignItems: "stretch",
+        background: "var(--bg-surface)",
+        borderBottom: "1px solid var(--border)",
+        overflowX: "auto", overflowY: "hidden",
+        minHeight: 28,
+      }}>
+        {tabs.length === 0 && (
+          <div style={{ padding: "6px 12px", fontSize: 11, color: "var(--text-faint)" }}>
+            Click a file in the tree, or use Git / JSONL buttons to open a tab.
+          </div>
+        )}
+        {tabs.map(t => {
+          const isActive = t.id === activeTabId;
+          return (
+            <div
+              key={t.id}
+              onClick={() => onActivate(t.id)}
+              title={titleFor(t)}
+              style={{
+                display: "flex", alignItems: "center", gap: 4,
+                padding: "4px 8px 4px 10px", cursor: "pointer",
+                fontSize: 11, color: isActive ? "var(--text-body)" : "var(--text-faint)",
+                background: isActive ? "var(--bg-base)" : "transparent",
+                borderRight: "1px solid var(--border)",
+                borderTop: isActive ? "1px solid var(--accent-blue)" : "1px solid transparent",
+                userSelect: "none", whiteSpace: "nowrap", flexShrink: 0,
+              }}
+              onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
+              onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
+            >
+              <span style={{ fontSize: 9, opacity: 0.7 }}>
+                {t.kind === "file" ? "📄" : t.kind === "git" ? "⎇" : "📋"}
+              </span>
+              <span>{labelFor(t)}</span>
+              <span
+                onClick={(e) => { e.stopPropagation(); onClose(t.id); }}
+                title="Close tab"
+                style={{
+                  marginLeft: 4, padding: "0 4px", fontSize: 12, lineHeight: 1,
+                  color: "var(--text-faint)", borderRadius: 3,
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text-body)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-faint)"; }}
+              >×</span>
+            </div>
+          );
+        })}
+      </div>
+      {/* Tab content: mount all, display:none for inactive */}
+      <div style={{ flex: 1, minHeight: 0, position: "relative", overflow: "hidden" }}>
+        {tabs.length === 0 && (
+          <div style={{
+            position: "absolute", inset: 0,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            color: "var(--text-faint)", fontSize: 12,
+          }}>
+            No tab open
+          </div>
+        )}
+        {tabs.map(t => {
+          const isActive = t.id === activeTabId;
+          return (
+            <div
+              key={t.id}
+              style={{
+                position: "absolute", inset: 0,
+                display: isActive ? "flex" : "none",
+                flexDirection: "column", minHeight: 0, overflow: "hidden",
+              }}
+            >
+              {t.kind === "file" && (
+                <FileViewerPane
+                  sessionId={sessionId}
+                  path={t.path}
+                  viewMode={t.viewMode}
+                  noDiff={t.noDiff}
+                />
+              )}
+              {t.kind === "git" && (
+                <GitPanel inline sessionId={sessionId} onClose={() => onClose(t.id)} />
+              )}
+              {t.kind === "jsonl" && (
+                <JsonlPreviewModal
+                  inline
+                  sessionId={sessionId}
+                  sessionTitle={sessionMeta.name || sessionMeta.project}
+                  onClose={() => onClose(t.id)}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 interface Props {
   username: string;
@@ -685,6 +822,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const { config: userConfig, patch: patchUserConfig } = useUserConfig();
   const layout = userConfig.layout;
   const isChatCentric = layout === "chat-centric";
+  const isFileCentric = layout === "file-centric";
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [rightMode, setRightMode] = useState<"terminal" | "bubble">("bubble");
   const [codeOpen, setCodeOpen] = useState(() => localStorage.getItem("codeOpen") === "1");
@@ -709,6 +847,11 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const activeSessionMeta = sessions.find((s) => s.id === activeSessionId);
   const isCursorSession = activeSessionMeta?.tool === "cursor";
+
+  // Per-session file/git/jsonl tabs (file-centric layout). Lives at the page
+  // level so switching sessions reloads each session's tab set from localStorage.
+  const sessionTabs = useSessionTabs(activeSessionId);
+  const activeTab = sessionTabs.activeTab;
 
   // Reset model list when active session tool changes
   const prevToolRef = useRef<string | undefined>(undefined);
@@ -1006,19 +1149,28 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       if (isChatCentric) {
         // Chat-centric: file panel is on the RIGHT — width grows as mouse moves left
         w = Math.max(200, Math.min(window.innerWidth - e.clientX, window.innerWidth * 0.5));
+      } else if (isFileCentric) {
+        // File-centric: tree is the second column (after sidebar). Left edge =
+        // sidebar (0 or leftWidth+5 resize bar). No toggle-strip in file-centric.
+        const leftEdge = sidebarCollapsed ? 0 : leftWidth + 5;
+        w = Math.max(180, Math.min(e.clientX - leftEdge, window.innerWidth * 0.4));
       } else {
         // Classic: file panel left edge = sidebar (0 or leftWidth) + toggle-strip (16) + resize-bar (0 or 5, only when sidebar is open)
         const leftEdge = sidebarCollapsed ? 16 : leftWidth + 21;
         w = Math.max(200, Math.min(e.clientX - leftEdge, window.innerWidth * 0.5));
       }
-      setCodeWidth(w);
+      if (isFileCentric) {
+        patchUserConfig({ fileCentricTreeWidth: w });
+      } else {
+        setCodeWidth(w);
+      }
     };
     const onUp = () => {
       if (codeDragging.current) {
         codeDragging.current = false;
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
-        localStorage.setItem("codeW", String(codeWidth));
+        if (!isFileCentric) localStorage.setItem("codeW", String(codeWidth));
       }
     };
     window.addEventListener("mousemove", onMove);
@@ -1027,7 +1179,43 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [leftWidth, codeWidth, sidebarCollapsed, isChatCentric]);
+  }, [leftWidth, codeWidth, sidebarCollapsed, isChatCentric, isFileCentric, patchUserConfig]);
+
+  // File-centric: column drag between viewer (flex) and chat (fixed width).
+  // Bar sits at chat's left edge; dragging right shrinks chat, dragging left grows it.
+  const fcChatDragging = useRef(false);
+  const startFcChatDrag = useCallback(() => {
+    fcChatDragging.current = true;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+  useEffect(() => {
+    if (!isFileCentric) return;
+    const onMove = (e: MouseEvent) => {
+      if (!fcChatDragging.current) return;
+      // Chat width = window right edge - mouse X. Clamp to leave viewer ≥ 240.
+      const minChat = 320;
+      const minViewer = 240;
+      const sidebar = sidebarCollapsed ? 0 : leftWidth + 5;
+      const tree = userConfig.fileCentricTreeWidth + 5;
+      const maxChat = Math.max(minChat, window.innerWidth - sidebar - tree - minViewer);
+      const w = Math.max(minChat, Math.min(window.innerWidth - e.clientX, maxChat));
+      patchUserConfig({ fileCentricChatWidth: w });
+    };
+    const onUp = () => {
+      if (fcChatDragging.current) {
+        fcChatDragging.current = false;
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [isFileCentric, sidebarCollapsed, leftWidth, userConfig.fileCentricTreeWidth, patchUserConfig]);
 
   useEffect(() => {
     if (!showModelPicker) return;
@@ -1444,10 +1632,11 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       )}
 
       {/* ── Middle: Code panel — tree only ── */}
-      {active && activeSessionMeta && codeOpen && (
+      {active && activeSessionMeta && (codeOpen || isFileCentric) && (
         <>
           <div style={{
-            width: codeWidth, flexShrink: 0, minWidth: 180,
+            width: isFileCentric ? userConfig.fileCentricTreeWidth : codeWidth,
+            flexShrink: 0, minWidth: 180,
             display: "flex", flexDirection: "column", overflow: "hidden",
             borderRight: "1px solid var(--border)",
             order: isChatCentric ? 5 : 0,
@@ -1456,12 +1645,22 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               key={active.session_id}
               sessionId={active.session_id}
               onFileSelect={(path, vm) => {
-                setCodeFileView({ path, v: Date.now(), viewMode: vm, noDiff: vm === "full" });
-                setInlineView(null);
+                if (isFileCentric) {
+                  sessionTabs.openFileTab(path, vm, vm === "full");
+                } else {
+                  setCodeFileView({ path, v: Date.now(), viewMode: vm, noDiff: vm === "full" });
+                  setInlineView(null);
+                }
               }}
-              selectedPathExternal={codeFileView?.path ?? null}
+              selectedPathExternal={
+                isFileCentric
+                  ? (activeTab?.kind === "file" ? activeTab.path : null)
+                  : (codeFileView?.path ?? null)
+              }
               onGitClick={() => {
-                if (inlineView === "git") {
+                if (isFileCentric) {
+                  sessionTabs.openGitTab();
+                } else if (inlineView === "git") {
                   setInlineView(null);
                 } else {
                   setInlineView("git");
@@ -1482,8 +1681,8 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         </>
       )}
 
-      {/* ── Toggle strip: context-aware ── */}
-      {active && activeSessionMeta && (
+      {/* ── Toggle strip (hidden in file-centric — tree is always visible) ── */}
+      {active && activeSessionMeta && !isFileCentric && (
         <div
           onClick={() => {
             if (codeOpen && codeFileView) {
@@ -1511,10 +1710,34 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         </div>
       )}
 
+      {/* ── File-centric: Viewer column with tabs + content (always visible, flex 1) ── */}
+      {isFileCentric && active && activeSessionMeta && (
+        <>
+          <FileCentricViewerColumn
+            sessionId={active.session_id}
+            sessionMeta={activeSessionMeta}
+            tabs={sessionTabs.tabs}
+            activeTabId={sessionTabs.activeId}
+            onActivate={sessionTabs.activate}
+            onClose={sessionTabs.closeTab}
+          />
+          <div
+            onMouseDown={startFcChatDrag}
+            title="Drag to resize chat column"
+            style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
+            onMouseLeave={(e) => { if (!fcChatDragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
+          />
+        </>
+      )}
+
       {/* ── Right: File viewer (when file selected) ── */}
       {/* ── Right: Conversation / TUI ── */}
       <div style={{
-        flex: "1 1 0%", minWidth: 0, minHeight: 0, overflow: "hidden", background: "var(--bg-base)",
+        ...(isFileCentric
+          ? { width: userConfig.fileCentricChatWidth, flexShrink: 0, minWidth: 320 }
+          : { flex: "1 1 0%", minWidth: 0 }),
+        minHeight: 0, overflow: "hidden", background: "var(--bg-base)",
         display: "flex", flexDirection: "column",
         order: isChatCentric ? 2 : 0,
       }}>
@@ -1697,7 +1920,9 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               {activeSessionMeta && activeSessionMeta.claude_session_id && (
                 <button
                   onClick={() => {
-                    if (inlineView === "jsonl") {
+                    if (isFileCentric) {
+                      sessionTabs.openJsonlTab();
+                    } else if (inlineView === "jsonl") {
                       setInlineView(null);
                     } else {
                       setInlineView("jsonl");
@@ -1705,7 +1930,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                     }
                   }}
                   title="Preview conversation JSONL"
-                  style={{ fontSize: 11, padding: "2px 10px", background: inlineView === "jsonl" ? "var(--bg-hover)" : "transparent", color: inlineView === "jsonl" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (inlineView === "jsonl" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                  style={{ fontSize: 11, padding: "2px 10px", background: (!isFileCentric && inlineView === "jsonl") ? "var(--bg-hover)" : "transparent", color: (!isFileCentric && inlineView === "jsonl") ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + ((!isFileCentric && inlineView === "jsonl") ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
                 >
                   📄 JSONL
                 </button>

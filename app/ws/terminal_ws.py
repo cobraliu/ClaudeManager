@@ -291,7 +291,7 @@ async def terminal_ws(
                             if text_part:
                                 await loop.run_in_executor(
                                     None, tmux._run,
-                                    "set-buffer", "-b", buf_name, text_part,
+                                    "set-buffer", "-b", buf_name, "--", text_part,
                                 )
                                 await loop.run_in_executor(
                                     None, tmux._run,
