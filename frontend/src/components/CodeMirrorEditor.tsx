@@ -101,8 +101,14 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       EditorView.updateListener.of((v) => {
         if (v.docChanged) onChangeRef.current(v.state.doc.toString());
       }),
+      EditorView.theme({
+        "&": { height: "100%", maxHeight: "100%" },
+        ".cm-scroller": { overflow: "auto" },
+        ".cm-content": { minHeight: "100%" },
+      }),
       oneDark,
       EditorState.readOnly.of(readOnly),
+      EditorState.allowMultipleSelections.of(true),
     ];
     if (lang) extensions.push(lang);
 
