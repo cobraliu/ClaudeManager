@@ -103,6 +103,10 @@ import {
 import gitIcon from "../assets/git.svg";
 import terminalIcon from "../assets/terminal.svg";
 import scheduleIcon from "../assets/schedule.svg";
+import { ConfigFormatToggle } from "../components/ConfigFormatToggle";
+import { ConfigCheckButton } from "../components/ConfigCheckButton";
+import { ConfigValidationBanner } from "../components/ConfigValidationBanner";
+import { detectFormat, convert, extFor, type ConfigFormat } from "../lib/configConvert";
 import { TerminalPane } from "../components/TerminalPane";
 import { TuiPane } from "../components/TuiPane";
 import { ConversationPane } from "../components/ConversationPane";
@@ -3715,6 +3719,7 @@ function MobileFileBrowserPanel({
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState("");
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [convertTarget, setConvertTarget] = useState<"raw" | ConfigFormat>("raw");
 
   // ── Toolbar / action-sheet state ─────────────────────────────────────────
   const [sheet, setSheet] = useState<FileSheetKind>(null);
@@ -3980,6 +3985,7 @@ function MobileFileBrowserPanel({
   const openFile = useCallback(async (entry: FileEntry) => {
     setPreviewEntry(entry);
     setBlobUrl(null);
+    setConvertTarget("raw");
     if (entry.is_sqlite) return;
     const kind = getMobileFileKind(entry);
     if (kind === "pdf" || kind === "image") {
@@ -4107,6 +4113,12 @@ function MobileFileBrowserPanel({
     const kind = getMobileFileKind(previewEntry);
     const ext = previewEntry.name.split(".").pop()?.toLowerCase() || "";
     const rawUrl = `/api/sessions/${sessionId}/fs/raw?path=${encodeURIComponent(previewEntry.path)}`;
+    const sourceFmt = detectFormat(previewEntry.name);
+    const conversion = sourceFmt && convertTarget !== "raw"
+      ? convert(fileContent, sourceFmt, convertTarget)
+      : null;
+    const displayContent = conversion?.ok ? conversion.content : fileContent;
+    const displayExt = sourceFmt && convertTarget !== "raw" ? extFor(convertTarget) : ext;
     return (
       <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", zIndex: 210, display: "flex", flexDirection: "column" }}>
         <div style={{ padding: "12px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
@@ -4114,12 +4126,32 @@ function MobileFileBrowserPanel({
           <span style={{ flex: 1, fontSize: 14, fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{previewEntry.name}</span>
           <span style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>{kind}</span>
         </div>
+        {sourceFmt && !fileLoading && !fileError && (
+          <div style={{ padding: "6px 12px", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0, overflowX: "auto" }}>
+            <ConfigFormatToggle
+              source={sourceFmt}
+              target={convertTarget}
+              onChange={setConvertTarget}
+              error={conversion && !conversion.ok ? conversion.error : null}
+              compact
+            />
+            <ConfigCheckButton
+              content={fileContent}
+              format={sourceFmt}
+              disabled={convertTarget !== "raw"}
+              compact
+            />
+          </div>
+        )}
+        {sourceFmt && convertTarget === "raw" && !fileLoading && !fileError && (
+          <ConfigValidationBanner content={fileContent} format={sourceFmt} compact />
+        )}
         <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
           {fileLoading && <div style={{ padding: 24, color: "var(--text-muted)", textAlign: "center" }}>Loading…</div>}
           {fileError && <div style={{ padding: 16, color: "var(--accent-red)", fontSize: 13 }}>{fileError}</div>}
           {!fileLoading && !fileError && (
             <>
-              {kind === "code" && <MobileCodeViewer content={fileContent} ext={ext} />}
+              {kind === "code" && <MobileCodeViewer content={displayContent} ext={displayExt} />}
               {kind === "markdown" && (
                 <div className="md-preview" dangerouslySetInnerHTML={{ __html: marked.parse(fileContent) as string }}
                   style={{ flex: 1, overflow: "auto", padding: "16px", color: "var(--text-primary)", fontSize: 14, lineHeight: 1.7 }} />

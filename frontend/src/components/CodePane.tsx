@@ -14,6 +14,10 @@ import {
 import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker, EditorWithLineNumbers } from "./FileEditorModal";
 import { GitPanel, CommitDetailModal } from "./GitPanel";
 import { GitBranchPicker, GitPullButton } from "./GitBranchPicker";
+import { ConfigFormatToggle } from "./ConfigFormatToggle";
+import { ConfigCheckButton } from "./ConfigCheckButton";
+import { ConfigValidationBanner } from "./ConfigValidationBanner";
+import { detectFormat, convert, languageFor, type ConfigFormat } from "../lib/configConvert";
 import downloadIcon from "../assets/download.svg";
 
 const MAX_TRANSFER_MB = 16;
@@ -1190,6 +1194,29 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const selectedChanged = changedFiles.find(f => f.path === path);
   const entry: FileEntry = { name, path, type: "file", size: null, is_text: !showSqlite && !showPdf && !showArchive, is_skipped: false, is_sqlite: showSqlite, is_archive: showArchive };
 
+  // ── Config format conversion / validation ─────────────────────────────────
+  const sourceFmt = detectFormat(name);
+  const [convertTarget, setConvertTarget] = useState<"raw" | ConfigFormat>("raw");
+  useEffect(() => { setConvertTarget("raw"); }, [path]);
+
+  const conversion = useMemo(() => {
+    if (!fileData || !sourceFmt || convertTarget === "raw") return null;
+    return convert(fileData.content, sourceFmt, convertTarget);
+  }, [fileData, sourceFmt, convertTarget]);
+
+  const displayedFileData: FileData | null = useMemo(() => {
+    if (!fileData) return null;
+    if (!sourceFmt || convertTarget === "raw" || !conversion?.ok) return fileData;
+    return {
+      ...fileData,
+      content: conversion.content,
+      language: languageFor(convertTarget),
+      added_lines: [],
+      removed_lines: [],
+      diff_raw: undefined,
+    };
+  }, [fileData, sourceFmt, convertTarget, conversion]);
+
   const canEdit = !!fileData && !fileData.is_binary && !showSqlite && !showArchive && !showPdf && !showImage;
   const isModified = editing && !!fileData && editBuffer !== fileData.content;
 
@@ -1264,6 +1291,26 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
         onEditToggle={editing ? handleSave : beginEdit}
         onCancelEdit={cancelEdit}
       />
+      {sourceFmt && fileData && !editing && (
+        <div style={{ padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)", display: "flex", alignItems: "center", gap: 8, background: "var(--bg-base)", flexShrink: 0 }}>
+          <ConfigFormatToggle
+            source={sourceFmt}
+            target={convertTarget}
+            onChange={setConvertTarget}
+            error={conversion && !conversion.ok ? conversion.error : null}
+            compact
+          />
+          <ConfigCheckButton
+            content={fileData.content}
+            format={sourceFmt}
+            disabled={convertTarget !== "raw"}
+            compact
+          />
+        </div>
+      )}
+      {sourceFmt && fileData && convertTarget === "raw" && !editing && (
+        <ConfigValidationBanner content={fileData.content} format={sourceFmt} compact />
+      )}
       {editing && fileData ? (
         <EditorWithLineNumbers
           textareaRef={editTextareaRef}
@@ -1275,7 +1322,7 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
         <ViewerContent
           sessionId={sessionId}
           entry={entry}
-          fileData={fileData}
+          fileData={displayedFileData}
           fileLoading={fileLoading}
           scrollToFirst={false}
           viewMode={viewMode}

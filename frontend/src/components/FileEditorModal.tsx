@@ -8,7 +8,10 @@ import { FileIcon, NewFolderIcon } from "./FileIcon";
 import hljs from "highlight.js/lib/common";
 import "highlight.js/styles/github-dark.css";
 import { marked } from "../lib/markdown";
-import * as yaml from "js-yaml";
+import { ConfigFormatToggle } from "./ConfigFormatToggle";
+import { ConfigCheckButton } from "./ConfigCheckButton";
+import { ConfigValidationBanner } from "./ConfigValidationBanner";
+import { detectFormat, convert, extFor, type ConfigFormat } from "../lib/configConvert";
 import {
   listFiles,
   searchFiles,
@@ -2128,60 +2131,53 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
 
   const ext = openFile ? getExt(openFile.path) : "";
   const supportsPreview = openFile && (openFile.kind === "code" || openFile.kind === "csv" || openFile.kind === "jsonl" || openFile.kind === "markdown" || openFile.kind === "pdf");
-  const isJson = openFile && (ext === "json" || ext === "jsonl");
-  const isYaml = openFile && (ext === "yaml" || ext === "yml");
+  const isJsonl = openFile && ext === "jsonl";
+  const sourceFmt: ConfigFormat | null = openFile && !isJsonl ? detectFormat(openFile.path) : null;
 
   const [jsonFmtError, setJsonFmtError] = useState<string | null>(null);
+  const [convertTarget, setConvertTarget] = useState<"raw" | ConfigFormat>("raw");
 
-  // Format JSON → preview only (does NOT modify openFile.content)
-  const handleFormatJson = useCallback(() => {
-    if (!openFile) return;
-    // Toggle: if already showing formatted preview, exit it
-    if (previewLabel === "Formatted JSON" || previewLabel === "Formatted JSONL") {
-      clearPreview(); return;
+  // Reset target on file change
+  useEffect(() => {
+    setConvertTarget("raw");
+    setJsonFmtError(null);
+  }, [openFile?.path]);
+
+  // Apply target → preview content
+  const [convertError, setConvertError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!openFile || !sourceFmt || convertTarget === "raw") {
+      setConvertError(null);
+      if (!previewLabel.startsWith("Formatted JSONL")) clearPreview();
+      return;
     }
-    clearPreview();
-    if (ext === "jsonl") {
-      try {
-        const lines = openFile.content.split("\n").map((line) => {
-          const trimmed = line.trim();
-          if (!trimmed) return "";
-          return repairAndFormatJson(trimmed);
-        });
-        setPreviewContent(lines.join("\n"));
-        setPreviewExt("jsonl");
-        setPreviewLabel("Formatted JSONL");
-      } catch (e) { setJsonFmtError(String(e)); }
+    const r = convert(openFile.content, sourceFmt, convertTarget, { jsonRepair: repairAndFormatJson });
+    if (r.ok) {
+      setConvertError(null);
+      setPreviewContent(r.content);
+      setPreviewExt(extFor(convertTarget));
+      setPreviewLabel(sourceFmt === convertTarget ? `Formatted ${convertTarget.toUpperCase()}` : `→ ${convertTarget.toUpperCase()}`);
     } else {
-      try {
-        setPreviewContent(repairAndFormatJson(openFile.content));
-        setPreviewExt("json");
-        setPreviewLabel("Formatted JSON");
-      } catch (e) { setJsonFmtError(String(e)); }
+      setConvertError(r.error);
+      clearPreview();
     }
-  }, [openFile, ext, previewLabel, clearPreview]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openFile?.content, sourceFmt, convertTarget]);
 
-  const handleConvertToYaml = useCallback(() => {
+  // JSONL: keep per-line format button
+  const handleFormatJsonl = useCallback(() => {
     if (!openFile) return;
-    if (previewLabel === "→ YAML") { clearPreview(); return; }
+    if (previewLabel === "Formatted JSONL") { clearPreview(); return; }
     clearPreview();
     try {
-      const obj = JSON.parse(repairAndFormatJson(openFile.content));
-      setPreviewContent(yaml.dump(obj, { indent: 2, lineWidth: 120 }));
-      setPreviewExt("yaml");
-      setPreviewLabel("→ YAML");
-    } catch (e) { setJsonFmtError(String(e)); }
-  }, [openFile, previewLabel, clearPreview]);
-
-  const handleConvertToJson = useCallback(() => {
-    if (!openFile) return;
-    if (previewLabel === "→ JSON") { clearPreview(); return; }
-    clearPreview();
-    try {
-      const obj = yaml.load(openFile.content);
-      setPreviewContent(JSON.stringify(obj, null, 2));
-      setPreviewExt("json");
-      setPreviewLabel("→ JSON");
+      const lines = openFile.content.split("\n").map((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return "";
+        return repairAndFormatJson(trimmed);
+      });
+      setPreviewContent(lines.join("\n"));
+      setPreviewExt("jsonl");
+      setPreviewLabel("Formatted JSONL");
     } catch (e) { setJsonFmtError(String(e)); }
   }, [openFile, previewLabel, clearPreview]);
 
@@ -2257,32 +2253,30 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
             {jsonFmtError && (
               <span style={{ fontSize: 11, color: "var(--accent-red)" }}>Format failed</span>
             )}
-            {/* Format JSON / Raw toggle */}
-            {isJson && (
+            {/* JSONL: per-line format button */}
+            {isJsonl && (
               <button
-                onClick={handleFormatJson}
-                style={{ background: (previewLabel === "Formatted JSON" || previewLabel === "Formatted JSONL") ? "var(--accent-blue)" : "var(--text-faintest)", color: "#fff", fontSize: 11, padding: "4px 10px" }}
+                onClick={handleFormatJsonl}
+                style={{ background: previewLabel === "Formatted JSONL" ? "var(--accent-blue)" : "var(--text-faintest)", color: "#fff", fontSize: 11, padding: "4px 10px" }}
               >
-                {(previewLabel === "Formatted JSON" || previewLabel === "Formatted JSONL") ? "Raw" : "Format JSON"}
+                {previewLabel === "Formatted JSONL" ? "Raw" : "Format JSONL"}
               </button>
             )}
-            {/* JSON → YAML conversion */}
-            {isJson && !isYaml && (
-              <button
-                onClick={handleConvertToYaml}
-                style={{ background: previewLabel === "→ YAML" ? "var(--accent-blue)" : "var(--text-faintest)", color: "#fff", fontSize: 11, padding: "4px 10px" }}
-              >
-                {previewLabel === "→ YAML" ? "Raw" : "→ YAML"}
-              </button>
-            )}
-            {/* YAML → JSON conversion */}
-            {isYaml && (
-              <button
-                onClick={handleConvertToJson}
-                style={{ background: previewLabel === "→ JSON" ? "var(--accent-blue)" : "var(--text-faintest)", color: "#fff", fontSize: 11, padding: "4px 10px" }}
-              >
-                {previewLabel === "→ JSON" ? "Raw" : "→ JSON"}
-              </button>
+            {/* JSON / YAML / TOML conversion */}
+            {sourceFmt && openFile && (
+              <>
+                <ConfigFormatToggle
+                  source={sourceFmt}
+                  target={convertTarget}
+                  onChange={setConvertTarget}
+                  error={convertError}
+                />
+                <ConfigCheckButton
+                  content={openFile.content}
+                  format={sourceFmt}
+                  disabled={convertTarget !== "raw"}
+                />
+              </>
             )}
             {supportsPreview && (
               <button
@@ -2659,6 +2653,11 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
                     </button>
                   )}
                 </div>
+
+                {/* Auto-validation banner (only on Raw view of config files) */}
+                {sourceFmt && convertTarget === "raw" && (
+                  <ConfigValidationBanner content={openFile.content} format={sourceFmt} />
+                )}
 
                 {/* Content area */}
                 {openFile.kind === "sqlite" ? (
