@@ -513,4 +513,6 @@ class TmuxService:
 
     def send_keys(self, session_name: str, text: str) -> None:
         """Send text followed by Enter to a tmux session (as if typed by the user)."""
-        self._run("send-keys", "-t", session_name, text, "Enter")
+        # `--` terminates tmux's option parsing so text starting with `-` is not
+        # mistaken for a flag. Enter goes after the terminator as a key name.
+        self._run("send-keys", "-t", session_name, "--", text, "Enter")

@@ -2272,7 +2272,7 @@ def answer_auq(session_id: str, body: AuqAnswerRequest, user_id: CurrentUser) ->
                 tmux._run("send-keys", "-t", pane, "-l", nav)
             time.sleep(0.2)  # wait for Ink to render text input at "Type something"
             if text:
-                tmux._run("send-keys", "-t", pane, "-l", text)
+                tmux._run("send-keys", "-t", pane, "-l", "--", text)
             if answer.is_multi:
                 # Multi-select: navigate from "Type something" (n_options) to Submit/Next
                 # (n_options+1) so the generic final Enter below hits Submit.
