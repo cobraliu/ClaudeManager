@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 
-export type LayoutScheme = "classic" | "chat-centric";
+export type LayoutScheme = "classic" | "chat-centric" | "file-centric";
 
 export interface UserConfig {
   layout: LayoutScheme;
   terminalOpen: boolean;
   terminalHeight: number;
   chatCentricRightWidth: number;
+  fileCentricTreeWidth: number;
+  fileCentricChatWidth: number;
 }
 
 const STORAGE_KEY = "cm_user_config_v1";
@@ -16,6 +18,8 @@ const DEFAULT_CONFIG: UserConfig = {
   terminalOpen: false,
   terminalHeight: 280,
   chatCentricRightWidth: 320,
+  fileCentricTreeWidth: 200,
+  fileCentricChatWidth: 460,
 };
 
 function loadConfig(): UserConfig {
@@ -24,9 +28,12 @@ function loadConfig(): UserConfig {
     if (!raw) return DEFAULT_CONFIG;
     const parsed = JSON.parse(raw);
     const merged = { ...DEFAULT_CONFIG, ...parsed };
-    // Migrate removed "focus" layout to classic
-    if (merged.layout !== "classic" && merged.layout !== "chat-centric") {
+    if (merged.layout !== "classic" && merged.layout !== "chat-centric" && merged.layout !== "file-centric") {
       merged.layout = "classic";
+    }
+    // Drop deprecated field carried over from earlier shape (vertical split impl).
+    if ("fileCentricChatHeight" in merged) {
+      delete (merged as Record<string, unknown>).fileCentricChatHeight;
     }
     return merged;
   } catch {
