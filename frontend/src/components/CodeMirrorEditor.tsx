@@ -3,7 +3,7 @@ import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, rectangularSelection, crosshairCursor, highlightActiveLineGutter } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { searchKeymap, highlightSelectionMatches, search, openSearchPanel } from "@codemirror/search";
-import { bracketMatching, indentOnInput, foldGutter, foldKeymap, syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
+import { bracketMatching, indentOnInput, foldGutter, foldKeymap, syntaxHighlighting, defaultHighlightStyle, StreamLanguage } from "@codemirror/language";
 import { oneDark } from "@codemirror/theme-one-dark";
 
 import { javascript } from "@codemirror/lang-javascript";
@@ -16,6 +16,28 @@ import { markdown } from "@codemirror/lang-markdown";
 import { sql } from "@codemirror/lang-sql";
 import { rust } from "@codemirror/lang-rust";
 import { go } from "@codemirror/lang-go";
+import { cpp } from "@codemirror/lang-cpp";
+import { java } from "@codemirror/lang-java";
+import { php } from "@codemirror/lang-php";
+import { vue } from "@codemirror/lang-vue";
+import { graphql } from "cm6-graphql";
+
+import { shell } from "@codemirror/legacy-modes/mode/shell";
+import { toml } from "@codemirror/legacy-modes/mode/toml";
+import { ruby } from "@codemirror/legacy-modes/mode/ruby";
+import { lua } from "@codemirror/legacy-modes/mode/lua";
+import { properties } from "@codemirror/legacy-modes/mode/properties";
+import { dockerFile } from "@codemirror/legacy-modes/mode/dockerfile";
+import { swift } from "@codemirror/legacy-modes/mode/swift";
+import { dart, kotlin, scala, csharp } from "@codemirror/legacy-modes/mode/clike";
+import { groovy } from "@codemirror/legacy-modes/mode/groovy";
+import { r } from "@codemirror/legacy-modes/mode/r";
+import { perl } from "@codemirror/legacy-modes/mode/perl";
+import { haskell } from "@codemirror/legacy-modes/mode/haskell";
+import { clojure } from "@codemirror/legacy-modes/mode/clojure";
+import { powerShell } from "@codemirror/legacy-modes/mode/powershell";
+import { nginx } from "@codemirror/legacy-modes/mode/nginx";
+import { protobuf } from "@codemirror/legacy-modes/mode/protobuf";
 
 export interface CodeMirrorEditorHandle {
   focus: () => void;
@@ -32,18 +54,56 @@ function rectSelectionFor(columnMode: boolean) {
 
 function langFor(ext: string): Extension | null {
   const e = ext.toLowerCase();
+  // JS/TS
   if (e === "js" || e === "mjs" || e === "cjs") return javascript();
-  if (e === "ts" || e === "tsx") return javascript({ typescript: true, jsx: true });
+  if (e === "ts") return javascript({ typescript: true });
+  if (e === "tsx") return javascript({ typescript: true, jsx: true });
   if (e === "jsx") return javascript({ jsx: true });
+  // Python
   if (e === "py" || e === "pyw") return python();
+  // Data formats
   if (e === "json" || e === "jsonl") return json();
   if (e === "yaml" || e === "yml") return yaml();
+  if (e === "toml") return StreamLanguage.define(toml);
+  if (e === "ini" || e === "env" || e === "properties" || e === "conf" || e === "cfg") return StreamLanguage.define(properties);
+  // Markup
   if (e === "html" || e === "htm" || e === "xml" || e === "svg") return html();
-  if (e === "css" || e === "scss" || e === "sass" || e === "less") return css();
+  if (e === "vue") return vue();
   if (e === "md" || e === "markdown") return markdown();
+  // CSS family
+  if (e === "css" || e === "scss" || e === "sass" || e === "less") return css();
+  // SQL
   if (e === "sql") return sql();
+  // Native / systems
   if (e === "rs") return rust();
   if (e === "go") return go();
+  if (e === "c" || e === "cpp" || e === "cc" || e === "cxx" || e === "h" || e === "hpp" || e === "hxx") return cpp();
+  if (e === "java") return java();
+  if (e === "kt" || e === "kts") return StreamLanguage.define(kotlin);
+  if (e === "scala" || e === "sc") return StreamLanguage.define(scala);
+  if (e === "cs") return StreamLanguage.define(csharp);
+  if (e === "swift") return StreamLanguage.define(swift);
+  if (e === "dart") return StreamLanguage.define(dart);
+  // Scripting
+  if (e === "sh" || e === "bash" || e === "zsh" || e === "fish" || e === "ksh") return StreamLanguage.define(shell);
+  if (e === "rb" || e === "rake" || e === "gemspec") return StreamLanguage.define(ruby);
+  if (e === "php" || e === "phtml") return php();
+  if (e === "lua") return StreamLanguage.define(lua);
+  if (e === "pl" || e === "pm") return StreamLanguage.define(perl);
+  if (e === "ps1" || e === "psm1") return StreamLanguage.define(powerShell);
+  if (e === "groovy" || e === "gradle") return StreamLanguage.define(groovy);
+  // Functional
+  if (e === "hs") return StreamLanguage.define(haskell);
+  if (e === "clj" || e === "cljs" || e === "edn") return StreamLanguage.define(clojure);
+  // Data science
+  if (e === "r") return StreamLanguage.define(r);
+  // Schema / interface
+  if (e === "proto") return StreamLanguage.define(protobuf);
+  if (e === "graphql" || e === "gql") return graphql();
+  // DevOps / build
+  if (e === "dockerfile") return StreamLanguage.define(dockerFile);
+  if (e === "nginx") return StreamLanguage.define(nginx);
+  if (e === "makefile" || e === "mk") return StreamLanguage.define(shell); // approximation: Make has no CM6 mode
   return null;
 }
 
