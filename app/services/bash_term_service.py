@@ -327,7 +327,34 @@ class TerminalManager:
         command, a backgrounded job, an editor) are spared at both transitions
         — the heartbeat may have lapsed because the browser closed, but the
         work inside tmux is still live.
+
+        Also prunes records whose underlying tmux session is already gone
+        (user typed `exit`, bash crashed, or `tmux kill-session` from outside).
+        Without this the dead record lingers in `_terms` — visible in the
+        dropdown for named/kept terms forever, for ephemerals until the
+        idle→standby→kill cycle catches up.
         """
+        # Pass 0: prune records whose tmux session has died on its own.
+        # Probe outside the lock (tmux has-session is cheap but still IPC),
+        # then drop under the lock.
+        with self._lock:
+            all_recs = list(self._terms.values())
+        dead_ids: list[str] = [
+            rec.term_id for rec in all_recs
+            if not self._tmux.has_session(rec.tmux_name)
+        ]
+        if dead_ids:
+            with self._lock:
+                for tid in dead_ids:
+                    rec = self._terms.pop(tid, None)
+                    if rec is None:
+                        continue
+                    stale = [t for t, x in self._tokens.items() if x == tid]
+                    for t in stale:
+                        self._tokens.pop(t, None)
+                    logger.info("term.dead-reap id=%s tmux=%s", tid, rec.tmux_name)
+            self._persist()
+
         idle_grace = float(self._idle_grace_getter())
         standby_grace = float(self._standby_grace_getter())
         now = time.time()
