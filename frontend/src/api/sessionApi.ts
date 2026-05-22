@@ -1288,8 +1288,13 @@ export function getCodeChangedFiles(sessionId: string): Promise<ChangedFile[]> {
   return request(`/api/sessions/${sessionId}/code/changed-files`);
 }
 
-export function getCodeFile(sessionId: string, path: string): Promise<FileData> {
-  return request(`/api/sessions/${sessionId}/code/file?path=${encodeURIComponent(path)}`);
+export function getCodeFile(
+  sessionId: string,
+  path: string,
+  opts?: { metaOnly?: boolean },
+): Promise<FileData> {
+  const qs = opts?.metaOnly ? "&meta_only=true" : "";
+  return request(`/api/sessions/${sessionId}/code/file?path=${encodeURIComponent(path)}${qs}`);
 }
 
 export function getCodeTree(sessionId: string, depth = 2, path = ""): Promise<TreeNode> {

@@ -204,9 +204,15 @@ def get_changed_files(session_id: str, _user: CurrentUser) -> list[dict]:
 def get_file(
     session_id: str,
     path: str = Query(...),
+    meta_only: bool = Query(default=False),
     _user: CurrentUser = None,
 ) -> dict:
-    """Return file content, detected language, and diff line info."""
+    """Return file content, detected language, and diff line info.
+
+    meta_only=true skips the content read entirely and just returns size+mtime.
+    Used by the FileViewer header for sqlite/archive/pdf/image where content
+    is rendered by a specialized viewer but size still needs to be displayed.
+    """
     store = _get_store()
     session = store.get(session_id)
     if session is None:
@@ -219,6 +225,23 @@ def get_file(
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
         raise HTTPException(status_code=400, detail="Not a file")
+
+    if meta_only:
+        try:
+            st = target.stat()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "path": path,
+            "is_binary": True,
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "content": "",
+            "language": "binary",
+            "added_lines": [],
+            "removed_lines": [],
+            "truncated": False,
+        }
 
     try:
         st = target.stat()

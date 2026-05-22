@@ -1193,16 +1193,20 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
 
   useEffect(() => {
     const n = path.split("/").pop() ?? path;
-    if (isArchiveFile(n) || isSqliteFile(n) || isPdfFile(n) || isImage(n)) {
-      setFileData(null); setFileLoading(false); return;
-    }
+    const metaOnly = isArchiveFile(n) || isSqliteFile(n) || isPdfFile(n) || isImage(n);
     let mounted = true;
     setFileData(null);
     setFileLoading(true);
-    const fetch = () => getCodeFile(sessionId, path)
+    const fetch = (opts?: { metaOnly?: boolean }) => getCodeFile(sessionId, path, opts)
       .then(d => { if (mounted) { setFileData(d); setFileLoading(false); } })
       .catch(() => { if (mounted) setFileLoading(false); });
-    fetch();
+    fetch(metaOnly ? { metaOnly: true } : undefined);
+    if (metaOnly) {
+      // Specialized viewers (sqlite/archive/pdf/image) render content
+      // themselves; we only need a one-shot meta fetch so the header can
+      // show size. No polling.
+      return () => { mounted = false; };
+    }
     const id = setInterval(() => {
       if (!mounted || editingRef.current) return;
       getCodeFile(sessionId, path).then(d => { if (mounted && !editingRef.current) setFileData(d); }).catch(() => {});
