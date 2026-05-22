@@ -1194,15 +1194,14 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     if (!isFileCentric) return;
     const onMove = (e: MouseEvent) => {
       if (!fcChatDragging.current) return;
-      // Chat width = window right edge - mouse X. Clamp to leave viewer ≥ 240.
-      const minChat = 320;
+      // Zone width = window right edge − mouse X (zone is right-flush).
+      // Clamp so viewer never drops below 240 px.
+      const minZone = 320;
       const minViewer = 240;
       const sidebar = sidebarCollapsed ? 0 : leftWidth + 5;
       const tree = userConfig.fileCentricTreeWidth + 5;
-      const dockOpen = sideDockOpenRef.current;
-      const dockW = dockOpen ? userConfig.sideDockWidth + 5 : 0;
-      const maxChat = Math.max(minChat, window.innerWidth - sidebar - tree - minViewer - dockW);
-      const w = Math.max(minChat, Math.min(window.innerWidth - e.clientX - dockW, maxChat));
+      const maxZone = Math.max(minZone, window.innerWidth - sidebar - tree - minViewer);
+      const w = Math.max(minZone, Math.min(window.innerWidth - e.clientX, maxZone));
       patchUserConfig({ fileCentricChatWidth: w });
     };
     const onUp = () => {
@@ -1218,7 +1217,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [isFileCentric, sidebarCollapsed, leftWidth, userConfig.fileCentricTreeWidth, userConfig.sideDockWidth, patchUserConfig]);
+  }, [isFileCentric, sidebarCollapsed, leftWidth, userConfig.fileCentricTreeWidth, patchUserConfig]);
 
   // Drag bar between chat and SideDock — only active when the user is actually dragging.
   // Live ref of "any dock section open" so the chat-drag clamp can read it without
@@ -1231,22 +1230,20 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const sideDockDragTotal = useRef(0);
   const startSideDockDrag = useCallback(() => {
     sideDockDragging.current = true;
-    sideDockDragTotal.current = userConfig.fileCentricChatWidth + userConfig.sideDockWidth;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
-  }, [userConfig.fileCentricChatWidth, userConfig.sideDockWidth]);
+  }, []);
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!sideDockDragging.current) return;
       const minDock = 240;
       const minChat = 320;
       if (isFileCentric) {
-        // Preserve total = chat + dock so the viewer column never moves.
-        const total = sideDockDragTotal.current;
-        const maxDock = Math.max(minDock, total - minChat);
-        const newDock = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
-        const newChat = Math.max(minChat, total - newDock);
-        patchUserConfig({ sideDockWidth: newDock, fileCentricChatWidth: newChat });
+        // Dock is inside the zone — only sideDockWidth changes.
+        // InnerCol (flex:1) auto-absorbs the leftover; zone width is unchanged.
+        const maxDock = Math.max(minDock, userConfig.fileCentricChatWidth - 5 - minChat);
+        const w = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
+        patchUserConfig({ sideDockWidth: w });
       } else {
         const maxDock = Math.max(minDock, Math.floor(window.innerWidth * 0.6));
         const w = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
@@ -1266,7 +1263,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [isFileCentric, patchUserConfig]);
+  }, [isFileCentric, userConfig.fileCentricChatWidth, patchUserConfig]);
 
   useEffect(() => {
     if (!showModelPicker) return;
@@ -1790,12 +1787,16 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 />
               </>
             )}
+            {/* Chat+Dock zone — fixed width in file-centric so viewer is never affected
+                by opening/resizing the side dock. Dock and chat redistribute WITHIN this
+                zone; only the bar1 drag (viewer ↔ zone) changes zone width. */}
             <div style={{
               ...(isFileCentric
-                ? { width: userConfig.fileCentricChatWidth, flexShrink: 0, minWidth: 320 }
+                ? { width: userConfig.fileCentricChatWidth, flexShrink: 0 }
                 : { flex: 1, minWidth: 0 }),
-              minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden",
+              minHeight: 0, display: "flex", flexDirection: "row", overflow: "clip",
             }}>
+            <div style={{ flex: 1, minWidth: isFileCentric ? 320 : 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
             {!chatOnlyMode && (
               <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "terminal" ? "flex" : "none", flexDirection: "column" }}>
                 <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -1843,6 +1844,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               </div>
             )}
             </div>
+            {/* ↑ close InnerCol column */}
             {activeSessionMeta && anyDockOpen && (
               <div
                 onMouseDown={startSideDockDrag}
@@ -1867,6 +1869,8 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 width={userConfig.sideDockWidth}
               />
             )}
+            </div>
+            {/* ↑ close Chat+Dock zone */}
           </div>
           {/* Bottom toolbar — three groups: Functional | Views | Term */}
             <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, padding: "3px 8px", background: "var(--bg-base)", borderTop: "1px solid var(--bg-page)" }}>
@@ -1878,7 +1882,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               <div style={{
                 display: "flex", alignItems: "center", gap: 4,
                 ...(isFileCentric ? {
-                  width: userConfig.fileCentricChatWidth + (anyDockOpen ? userConfig.sideDockWidth + 5 : 0) - 8,
+                  width: userConfig.fileCentricChatWidth - 8,
                   justifyContent: "flex-start",
                 } : null),
               }}>
