@@ -8,6 +8,7 @@ import {
   searchFiles, createDir, uploadFile, renameEntry, moveEntry, deleteEntry, writeFile, FileWriteConflictError,
   downloadFile,
   getFileGitLog, getFileGitShow, getFileGitDiff,
+  getCodeSubdirs, checkCodePathExists,
   type ChangedFile, type FileData, type FileEntry,
   type GitLogEntry,
 } from "../api/sessionApi";
@@ -1485,6 +1486,351 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
             </div>
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+// ── Save-As modal (used by scratch tabs) ─────────────────────────────────
+// Cascading directory picker: each chosen segment loads the next level. The
+// final filename is a free-text input. Before saving, we hit /code/exists to
+// confirm overwrite when the target already exists.
+function SaveAsModal({
+  sessionId,
+  defaultName,
+  content,
+  onSaved,
+  onCancel,
+}: {
+  sessionId: string;
+  defaultName: string;
+  content: string;
+  onSaved: (path: string) => void;
+  onCancel: () => void;
+}) {
+  // segments[i] is the directory chosen at level i (relative to cwd).
+  // levels[i] is the list of subdirs at the prefix segments[0..i-1].
+  const [segments, setSegments] = useState<string[]>([]);
+  const [levels, setLevels] = useState<string[][]>([[]]);
+  const [filename, setFilename] = useState(defaultName);
+  const [saving, setSaving] = useState(false);
+  const [overwriteAsk, setOverwriteAsk] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Load level 0 on mount.
+  useEffect(() => {
+    let mounted = true;
+    getCodeSubdirs(sessionId, "")
+      .then(r => { if (mounted) setLevels([r.dirs]); })
+      .catch(() => { if (mounted) setLevels([[]]); });
+    return () => { mounted = false; };
+  }, [sessionId]);
+
+  // When user picks a subdir at level k, append/replace segment, load level k+1.
+  const pickAtLevel = async (k: number, name: string) => {
+    const nextSegments = name === "" ? segments.slice(0, k) : [...segments.slice(0, k), name];
+    setSegments(nextSegments);
+    if (name === "") {
+      // "(save here)" — truncate levels too
+      setLevels(prev => prev.slice(0, k + 1));
+      return;
+    }
+    const prefix = nextSegments.join("/");
+    try {
+      const r = await getCodeSubdirs(sessionId, prefix);
+      setLevels(prev => {
+        const next = prev.slice(0, k + 1);
+        next.push(r.dirs);
+        return next;
+      });
+    } catch {
+      setLevels(prev => prev.slice(0, k + 1));
+    }
+  };
+
+  const dirPath = segments.join("/");
+  const fullPath = dirPath ? `${dirPath}/${filename}` : filename;
+  const canSave = filename.trim().length > 0 && !saving;
+
+  const attemptSave = async () => {
+    setError(null);
+    if (!canSave) return;
+    try {
+      const r = await checkCodePathExists(sessionId, fullPath);
+      if (r.exists) {
+        setOverwriteAsk(true);
+        return;
+      }
+    } catch {
+      // Treat lookup failure as "not exists" — write call will surface real error.
+    }
+    void doWrite(false);
+  };
+
+  const doWrite = async (overwrite: boolean) => {
+    setOverwriteAsk(false);
+    setSaving(true);
+    try {
+      await writeFile(sessionId, fullPath, content, {
+        expectedMtime: overwrite ? null : null,
+        force: overwrite,
+      });
+      onSaved(fullPath);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      onClick={onCancel}
+      style={{
+        position: "fixed", inset: 0, zIndex: 120,
+        background: "rgba(0,0,0,0.45)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          minWidth: 460, maxWidth: 640,
+          background: "var(--bg-modal)", border: "1px solid var(--border)",
+          borderRadius: 6, padding: "14px 16px",
+          boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+          display: "flex", flexDirection: "column", gap: 10,
+          fontSize: 12, color: "var(--text-body)",
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Save scratch file</div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ color: "var(--text-secondary)" }}>Directory (relative to session cwd):</div>
+          <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ color: "var(--text-faint)", fontFamily: "var(--font-mono, monospace)" }}>./</span>
+            {levels.map((opts, k) => {
+              const selected = segments[k] ?? "";
+              return (
+                <div key={k} style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                  <select
+                    value={selected}
+                    onChange={(e) => { void pickAtLevel(k, e.target.value); }}
+                    style={{
+                      padding: "3px 6px", fontSize: 11,
+                      background: "var(--bg-surface)", color: "var(--text-body)",
+                      border: "1px solid var(--border)", borderRadius: 3,
+                      maxWidth: 200,
+                    }}
+                  >
+                    <option value="">(here)</option>
+                    {opts.map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                  {selected && <span style={{ color: "var(--text-faint)" }}>/</span>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ color: "var(--text-secondary)" }}>Filename:</div>
+          <input
+            value={filename}
+            onChange={(e) => setFilename(e.target.value)}
+            autoFocus
+            spellCheck={false}
+            style={{
+              padding: "5px 8px", fontSize: 12,
+              background: "var(--bg-surface)", color: "var(--text-body)",
+              border: "1px solid var(--border)", borderRadius: 3,
+              fontFamily: "var(--font-mono, monospace)",
+            }}
+          />
+        </div>
+
+        <div style={{
+          padding: "4px 8px", fontSize: 11,
+          background: "var(--bg-base)", border: "1px solid var(--border-subtle)",
+          borderRadius: 3, fontFamily: "var(--font-mono, monospace)",
+          color: "var(--text-faint)", wordBreak: "break-all",
+        }}>
+          → ./{fullPath}
+        </div>
+
+        {error && (
+          <div style={{ color: "var(--accent-red, #d57f7f)", fontSize: 11 }}>{error}</div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4 }}>
+          <button
+            onClick={onCancel}
+            disabled={saving}
+            style={{
+              padding: "5px 12px", fontSize: 12, cursor: saving ? "default" : "pointer",
+              background: "var(--bg-surface)", color: "var(--text-body)",
+              border: "1px solid var(--border)", borderRadius: 3,
+              opacity: saving ? 0.6 : 1,
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => { void attemptSave(); }}
+            disabled={!canSave}
+            style={{
+              padding: "5px 12px", fontSize: 12, cursor: !canSave ? "default" : "pointer",
+              background: "var(--accent-blue)", color: "#fff",
+              border: "1px solid var(--accent-blue)", borderRadius: 3,
+              fontWeight: 600,
+              opacity: !canSave ? 0.6 : 1,
+            }}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+
+        {overwriteAsk && (
+          <div
+            onClick={() => setOverwriteAsk(false)}
+            style={{
+              position: "fixed", inset: 0, zIndex: 130,
+              background: "rgba(0,0,0,0.55)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                minWidth: 360, maxWidth: 520,
+                background: "var(--bg-modal)", border: "1px solid var(--border)",
+                borderRadius: 6, padding: "14px 16px",
+                boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+                display: "flex", flexDirection: "column", gap: 10,
+                fontSize: 12, color: "var(--text-body)",
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-orange, #d59f00)" }}>
+                File already exists
+              </div>
+              <div style={{ color: "var(--text-secondary)" }}>
+                <code style={{ color: "var(--text-body)" }}>./{fullPath}</code> already exists.
+                Overwrite it?
+              </div>
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4 }}>
+                <button
+                  onClick={() => setOverwriteAsk(false)}
+                  style={{
+                    padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                    background: "var(--bg-surface)", color: "var(--text-body)",
+                    border: "1px solid var(--border)", borderRadius: 3,
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => { void doWrite(true); }}
+                  style={{
+                    padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                    background: "var(--accent-orange, #d59f00)", color: "#1c2128",
+                    border: "1px solid var(--accent-orange, #d59f00)", borderRadius: 3,
+                    fontWeight: 600,
+                  }}
+                >
+                  Overwrite
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── ScratchEditorPane — in-memory text buffer until first save ────────────
+// Content lives in the tab's state (passed in via `content`/`onContentChange`)
+// so it persists across tab switches and page reloads (localStorage). Once
+// saved, the parent promotes the scratch tab to a real FileTab; this pane
+// unmounts and FileViewerPane takes over.
+export function ScratchEditorPane({
+  sessionId,
+  title,
+  content,
+  onContentChange,
+  onDirtyChange,
+  onSaved,
+}: {
+  sessionId: string;
+  title: string;
+  content: string;
+  onContentChange: (c: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  onSaved: (path: string) => void;
+}) {
+  const cmRef = useRef<CodeMirrorEditorHandle | null>(null);
+  const [showSaveAs, setShowSaveAs] = useState(false);
+  const [columnMode, setColumnMode] = useState(false);
+
+  // Scratch is dirty whenever there's any content (it has never been saved).
+  const isDirty = content.length > 0;
+  useEffect(() => { onDirtyChange?.(isDirty); }, [isDirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+
+  useEffect(() => { setTimeout(() => cmRef.current?.focus(), 30); }, []);
+
+  return (
+    <div style={{ display: "flex", flex: 1, flexDirection: "column", minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
+      <div style={{
+        padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)",
+        display: "flex", alignItems: "center", gap: 10, background: "var(--bg-base)", flexShrink: 0,
+      }}>
+        <span style={{ fontSize: 11, color: "var(--text-body)", fontWeight: 600 }}>{title}</span>
+        <span style={{ fontSize: 10, color: "var(--text-faint)" }}>
+          scratch · not yet saved {isDirty ? "· modified" : ""}
+        </span>
+        <div style={{ flex: 1 }} />
+        <button
+          onClick={() => setColumnMode(v => !v)}
+          title={columnMode ? "Column-select mode ON" : "Column-select mode OFF"}
+          style={{
+            padding: "2px 8px", fontSize: 11, fontFamily: "monospace",
+            background: columnMode ? "var(--accent-blue)" : "var(--bg-elevated)",
+            color: columnMode ? "#fff" : "var(--text-secondary)",
+            border: "1px solid var(--bg-hover)", borderRadius: 3, cursor: "pointer",
+          }}
+        >
+          COL {columnMode ? "ON" : "OFF"}
+        </button>
+        <button
+          onClick={() => setShowSaveAs(true)}
+          title="Save scratch file (choose path + filename)"
+          style={{
+            padding: "3px 12px", fontSize: 11,
+            background: "var(--accent-blue)", color: "#fff",
+            border: "1px solid var(--accent-blue)", borderRadius: 3,
+            cursor: "pointer", fontWeight: 600,
+          }}
+        >
+          Save As…
+        </button>
+      </div>
+      <CodeMirrorEditor
+        ref={cmRef}
+        content={content}
+        ext="txt"
+        onChange={onContentChange}
+        onSave={() => setShowSaveAs(true)}
+        columnMode={columnMode}
+      />
+      {showSaveAs && (
+        <SaveAsModal
+          sessionId={sessionId}
+          defaultName={`${title}.txt`}
+          content={content}
+          onSaved={(p) => { setShowSaveAs(false); onSaved(p); }}
+          onCancel={() => setShowSaveAs(false)}
+        />
       )}
     </div>
   );

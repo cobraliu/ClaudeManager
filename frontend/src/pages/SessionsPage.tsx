@@ -40,7 +40,7 @@ import {
 import { TuiPane } from "../components/TuiPane";
 import { BubblePane } from "../components/BubblePane";
 import { ConversationPane } from "../components/ConversationPane";
-import { CodePane, FileViewerPane, FileSidePanel } from "../components/CodePane";
+import { CodePane, FileViewerPane, FileSidePanel, ScratchEditorPane } from "../components/CodePane";
 import { SessionCard, PromptText } from "../components/SessionCard";
 import { UsageBar, UsageCenter } from "../components/UsageBar";
 import { FileEditorModal } from "../components/FileEditorModal";
@@ -69,8 +69,15 @@ function FileCentricViewerColumn(props: {
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onCloseMany: (ids: string[]) => void;
+  onCreateScratch: () => string;
+  onUpdateScratch: (id: string, content: string) => void;
+  onPromoteScratch: (id: string, path: string) => void;
 }) {
-  const { sessionId, sessionMeta, tabs, activeTabId, onActivate, onClose, onCloseMany } = props;
+  const {
+    sessionId, sessionMeta, tabs, activeTabId,
+    onActivate, onClose, onCloseMany,
+    onCreateScratch, onUpdateScratch, onPromoteScratch,
+  } = props;
 
   // Per-tab dirty flag, reported up by FileViewerPane via onDirtyChange.
   // Git/JSONL tabs are never dirty (absent from the map = treated as clean).
@@ -130,8 +137,38 @@ function FileCentricViewerColumn(props: {
     if (!t) return id;
     if (t.kind === "file") return t.path;
     if (t.kind === "git") return "(Git)";
-    return "(JSONL)";
+    if (t.kind === "jsonl") return "(JSONL)";
+    return t.title;
   };
+
+  // Tab-list dropdown (⌄ N) — clicking a row jumps + scrolls active into view.
+  const [tabListOpen, setTabListOpen] = useState(false);
+  const [tabListPos, setTabListPos] = useState<{ top: number; right: number } | null>(null);
+  const tabListRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!tabListOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (tabListRef.current && !tabListRef.current.contains(e.target as Node)) {
+        setTabListOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setTabListOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [tabListOpen]);
+
+  // Scroll the active tab into view (used after activate-from-dropdown or
+  // after openScratchTab appends to the end). The ref is keyed by tab id.
+  const tabElRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  useEffect(() => {
+    if (!activeTabId) return;
+    const el = tabElRefs.current[activeTabId];
+    if (el) el.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }, [activeTabId]);
 
   const requestSingleClose = (id: string) => {
     if (dirtyMap[id]) {
@@ -175,12 +212,25 @@ function FileCentricViewerColumn(props: {
       return base;
     }
     if (t.kind === "git") return "Git";
-    return "JSONL";
+    if (t.kind === "jsonl") return "JSONL";
+    return t.title;
   };
   const titleFor = (t: TabEntry): string => {
     if (t.kind === "file") return t.path;
     if (t.kind === "git") return "Git status, diff, history, branches";
-    return "Conversation JSONL preview";
+    if (t.kind === "jsonl") return "Conversation JSONL preview";
+    return `${t.title} (unsaved scratch)`;
+  };
+  const iconFor = (t: TabEntry): string => {
+    if (t.kind === "file") return "📄";
+    if (t.kind === "git") return "⎇";
+    if (t.kind === "jsonl") return "📋";
+    return "📝";
+  };
+
+  const handleCreateScratch = () => {
+    setTabListOpen(false);
+    onCreateScratch();
   };
 
   return (
@@ -190,75 +240,121 @@ function FileCentricViewerColumn(props: {
       display: "flex", flexDirection: "column",
       borderRight: "1px solid var(--border)",
     }}>
-      {/* Tab bar */}
+      {/* Tab bar: scrollable tabs + filler (inside scroll), then ⌄ N dropdown
+          and a right blank strip (outside scroll, always visible). Double-
+          clicking either the inside filler or the right strip creates a new
+          scratch tab. */}
       <div style={{
         flexShrink: 0, display: "flex", alignItems: "stretch",
         background: "var(--bg-surface)",
         borderBottom: "1px solid var(--border)",
-        overflowX: "auto", overflowY: "hidden",
         minHeight: 28,
       }}>
-        {tabs.length === 0 && (
-          <div style={{ padding: "6px 12px", fontSize: 11, color: "var(--text-faint)" }}>
-            Click a file in the tree, or use Git / JSONL buttons to open a tab.
+        <div style={{
+          flex: "1 1 0%", minWidth: 0,
+          display: "flex", alignItems: "stretch",
+          overflowX: "auto", overflowY: "hidden",
+        }}>
+          {tabs.length === 0 && (
+            <div style={{ padding: "6px 12px", fontSize: 11, color: "var(--text-faint)" }}>
+              Click a file in the tree, double-click the blank strip to create a scratch file.
+            </div>
+          )}
+          {tabs.map(t => {
+            const isActive = t.id === activeTabId;
+            const isDirty = !!dirtyMap[t.id];
+            const menuOpen = menuTabId === t.id;
+            return (
+              <div
+                key={t.id}
+                ref={(el) => { tabElRefs.current[t.id] = el; }}
+                onClick={() => onActivate(t.id)}
+                title={titleFor(t)}
+                style={{
+                  position: "relative",
+                  display: "flex", alignItems: "center", gap: 4,
+                  padding: "4px 8px 4px 10px", cursor: "pointer",
+                  fontSize: 11, color: isActive ? "var(--text-body)" : "var(--text-faint)",
+                  background: isActive ? "var(--bg-base)" : "transparent",
+                  borderRight: "1px solid var(--border)",
+                  borderTop: isActive ? "1px solid var(--accent-blue)" : "1px solid transparent",
+                  userSelect: "none", whiteSpace: "nowrap", flexShrink: 0,
+                }}
+                onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
+              >
+                <span style={{ fontSize: 9, opacity: 0.7 }}>{iconFor(t)}</span>
+                <span>{labelFor(t)}{isDirty ? " ●" : ""}</span>
+                <span
+                  onClick={(e) => { e.stopPropagation(); requestSingleClose(t.id); }}
+                  title={isDirty ? "Close tab (unsaved changes — will prompt)" : "Close tab"}
+                  style={{
+                    marginLeft: 4, padding: "0 4px", fontSize: 12, lineHeight: 1,
+                    color: "var(--text-faint)", borderRadius: 3,
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text-body)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-faint)"; }}
+                >×</span>
+                <span
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (menuOpen) { setMenuTabId(null); setMenuPos(null); return; }
+                    const r = e.currentTarget.getBoundingClientRect();
+                    setMenuPos({ top: r.bottom + 2, right: Math.max(4, window.innerWidth - r.right) });
+                    setMenuTabId(t.id);
+                  }}
+                  title="Close options"
+                  style={{
+                    marginLeft: 1, padding: "0 4px", fontSize: 10, lineHeight: 1,
+                    color: "var(--accent-orange, #d59f00)", borderRadius: 3,
+                    background: menuOpen ? "color-mix(in srgb, var(--accent-orange, #d59f00) 18%, transparent)" : "transparent",
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--accent-orange, #d59f00) 22%, transparent)"; }}
+                  onMouseLeave={(e) => { if (!menuOpen) e.currentTarget.style.background = "transparent"; }}
+                >▾</span>
+              </div>
+            );
+          })}
+          {/* Filler inside scroll — double-click empty area to create scratch */}
+          <div
+            onDoubleClick={handleCreateScratch}
+            title="Double-click to create a new scratch file"
+            style={{ flex: "1 1 60px", minWidth: 60, cursor: "default" }}
+          />
+        </div>
+        {tabs.length > 0 && (
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+              if (tabListOpen) { setTabListOpen(false); return; }
+              const r = e.currentTarget.getBoundingClientRect();
+              setTabListPos({ top: r.bottom + 2, right: Math.max(4, window.innerWidth - r.right) });
+              setTabListOpen(true);
+            }}
+            title="All open tabs"
+            style={{
+              flexShrink: 0, padding: "0 10px",
+              display: "flex", alignItems: "center", gap: 4, cursor: "pointer",
+              fontSize: 11, color: "var(--text-secondary)",
+              borderLeft: "1px solid var(--border)",
+              background: tabListOpen ? "var(--bg-hover)" : "transparent",
+              userSelect: "none",
+            }}
+            onMouseEnter={(e) => { if (!tabListOpen) e.currentTarget.style.background = "var(--bg-hover)"; }}
+            onMouseLeave={(e) => { if (!tabListOpen) e.currentTarget.style.background = "transparent"; }}
+          >
+            <span style={{ fontSize: 12 }}>⌄</span>
+            <span>{tabs.length}</span>
           </div>
         )}
-        {tabs.map(t => {
-          const isActive = t.id === activeTabId;
-          const isDirty = !!dirtyMap[t.id];
-          const menuOpen = menuTabId === t.id;
-          return (
-            <div
-              key={t.id}
-              onClick={() => onActivate(t.id)}
-              title={titleFor(t)}
-              style={{
-                position: "relative",
-                display: "flex", alignItems: "center", gap: 4,
-                padding: "4px 8px 4px 10px", cursor: "pointer",
-                fontSize: 11, color: isActive ? "var(--text-body)" : "var(--text-faint)",
-                background: isActive ? "var(--bg-base)" : "transparent",
-                borderRight: "1px solid var(--border)",
-                borderTop: isActive ? "1px solid var(--accent-blue)" : "1px solid transparent",
-                userSelect: "none", whiteSpace: "nowrap", flexShrink: 0,
-              }}
-              onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
-              onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
-            >
-              <span style={{ fontSize: 9, opacity: 0.7 }}>
-                {t.kind === "file" ? "📄" : t.kind === "git" ? "⎇" : "📋"}
-              </span>
-              <span>{labelFor(t)}{isDirty ? " ●" : ""}</span>
-              <span
-                onClick={(e) => { e.stopPropagation(); requestSingleClose(t.id); }}
-                title={isDirty ? "Close tab (unsaved changes — will prompt)" : "Close tab"}
-                style={{
-                  marginLeft: 4, padding: "0 4px", fontSize: 12, lineHeight: 1,
-                  color: "var(--text-faint)", borderRadius: 3,
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text-body)"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-faint)"; }}
-              >×</span>
-              <span
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (menuOpen) { setMenuTabId(null); setMenuPos(null); return; }
-                  const r = e.currentTarget.getBoundingClientRect();
-                  setMenuPos({ top: r.bottom + 2, right: Math.max(4, window.innerWidth - r.right) });
-                  setMenuTabId(t.id);
-                }}
-                title="Close options"
-                style={{
-                  marginLeft: 1, padding: "0 4px", fontSize: 10, lineHeight: 1,
-                  color: "var(--accent-orange, #d59f00)", borderRadius: 3,
-                  background: menuOpen ? "color-mix(in srgb, var(--accent-orange, #d59f00) 18%, transparent)" : "transparent",
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--accent-orange, #d59f00) 22%, transparent)"; }}
-                onMouseLeave={(e) => { if (!menuOpen) e.currentTarget.style.background = "transparent"; }}
-              >▾</span>
-            </div>
-          );
-        })}
+        <div
+          onDoubleClick={handleCreateScratch}
+          title="Double-click to create a new scratch file"
+          style={{
+            flexShrink: 0, width: 80, cursor: "default",
+            borderLeft: "1px solid var(--border)",
+          }}
+        />
       </div>
       {/* Tab content: mount all, display:none for inactive */}
       <div style={{ flex: 1, minHeight: 0, position: "relative", overflow: "hidden" }}>
@@ -302,10 +398,69 @@ function FileCentricViewerColumn(props: {
                   onClose={() => onClose(t.id)}
                 />
               )}
+              {t.kind === "scratch" && (
+                <ScratchEditorPane
+                  sessionId={sessionId}
+                  title={t.title}
+                  content={t.content}
+                  onContentChange={(c) => onUpdateScratch(t.id, c)}
+                  onDirtyChange={(d) => setTabDirty(t.id, d)}
+                  onSaved={(savedPath) => onPromoteScratch(t.id, savedPath)}
+                />
+              )}
             </div>
           );
         })}
       </div>
+      {tabListOpen && tabListPos && (
+        <div
+          ref={tabListRef}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed", top: tabListPos.top, right: tabListPos.right,
+            minWidth: 260, maxWidth: 460, maxHeight: "60vh", overflowY: "auto",
+            zIndex: 90,
+            background: "var(--bg-modal)", border: "1px solid var(--border)",
+            borderRadius: 4, padding: 4,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+            fontSize: 11, color: "var(--text-body)",
+          }}
+        >
+          {tabs.map(t => {
+            const isActive = t.id === activeTabId;
+            const isDirty = !!dirtyMap[t.id];
+            const sub = t.kind === "file" ? t.path : (t.kind === "scratch" ? "(unsaved)" : "");
+            return (
+              <div
+                key={t.id}
+                onClick={() => { onActivate(t.id); setTabListOpen(false); }}
+                title={titleFor(t)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 6,
+                  padding: "5px 8px", cursor: "pointer", borderRadius: 3,
+                  background: isActive ? "var(--bg-hover)" : "transparent",
+                  borderLeft: isActive ? "2px solid var(--accent-blue)" : "2px solid transparent",
+                }}
+                onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
+              >
+                <span style={{ fontSize: 10, opacity: 0.7 }}>{iconFor(t)}</span>
+                <span style={{ fontWeight: isActive ? 600 : 400, whiteSpace: "nowrap" }}>
+                  {labelFor(t)}{isDirty ? " ●" : ""}
+                </span>
+                {sub && (
+                  <span style={{
+                    flex: 1, minWidth: 0,
+                    fontSize: 10, color: "var(--text-faint)",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    fontFamily: "var(--font-mono, monospace)",
+                  }}>{sub}</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
       {menuTabId && menuPos && (
         <div
           ref={menuRef}
@@ -1993,6 +2148,9 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   onActivate={sessionTabs.activate}
                   onClose={sessionTabs.closeTab}
                   onCloseMany={sessionTabs.closeTabs}
+                  onCreateScratch={sessionTabs.openScratchTab}
+                  onUpdateScratch={sessionTabs.updateScratchContent}
+                  onPromoteScratch={sessionTabs.promoteScratchToFile}
                 />
                 <div
                   onMouseDown={startFcChatDrag}

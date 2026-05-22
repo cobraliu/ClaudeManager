@@ -335,3 +335,58 @@ def get_tree(
         start = root
 
     return _build_tree(start, root, 0, depth)
+
+
+@router.get("/{session_id}/code/dirs")
+def list_subdirs(
+    session_id: str,
+    path: str = Query(default=""),
+    _user: CurrentUser = None,
+) -> dict:
+    """Return immediate subdirectory names of `path` (relative to session cwd).
+
+    Used by the FileViewer Save-As picker for the cascading directory chooser:
+    each chosen segment triggers another call to load the next level's options.
+    """
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404)
+
+    root = Path(session.cwd).resolve()
+    if not root.is_dir():
+        raise HTTPException(status_code=404, detail="cwd not found")
+
+    if path and path != ".":
+        target = _safe_path(session.cwd, path)
+        if not target.is_dir():
+            raise HTTPException(status_code=404, detail="path not found")
+    else:
+        target = root
+
+    dirs: list[str] = []
+    try:
+        for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir():
+                continue
+            if child.name in _SKIP_DIRS:
+                continue
+            dirs.append(child.name)
+    except PermissionError:
+        pass
+    return {"path": path or ".", "dirs": dirs}
+
+
+@router.get("/{session_id}/code/exists")
+def check_exists(
+    session_id: str,
+    path: str = Query(...),
+    _user: CurrentUser = None,
+) -> dict:
+    """Cheap stat check used by Save-As to detect overwrites before writing."""
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404)
+    target = _safe_path(session.cwd, path)
+    return {"exists": target.exists(), "is_file": target.is_file()}

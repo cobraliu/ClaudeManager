@@ -1303,6 +1303,15 @@ export function getCodeTree(sessionId: string, depth = 2, path = ""): Promise<Tr
   return request(`/api/sessions/${sessionId}/code/tree?${params}`);
 }
 
+export function getCodeSubdirs(sessionId: string, path = ""): Promise<{ path: string; dirs: string[] }> {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  return request(`/api/sessions/${sessionId}/code/dirs${qs}`);
+}
+
+export function checkCodePathExists(sessionId: string, path: string): Promise<{ exists: boolean; is_file: boolean }> {
+  return request(`/api/sessions/${sessionId}/code/exists?path=${encodeURIComponent(path)}`);
+}
+
 export interface UsageWindow {
   utilization: number;  // 0..1
   resets_at: string;    // ISO timestamp
