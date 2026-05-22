@@ -27,7 +27,7 @@ class SessionCreateRequest(BaseModel):
     model: str | None = Field(default=None, max_length=120)
     resume_session_id: str | None = Field(default=None, max_length=200)
     git_repo_url: str | None = Field(default=None, max_length=500)
-    tool: Literal["claude", "cursor"] = "claude"
+    tool: Literal["claude", "cursor", "codex"] = "claude"
 
 
 class SessionMetadata(BaseModel):

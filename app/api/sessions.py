@@ -52,46 +52,10 @@ router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 models_router = APIRouter(prefix="/api/models", tags=["models"])
 
-CLAUDE_MODELS = [
-    {"id": "claude-opus-4-7",           "name": "Claude Opus 4.7"},
-    {"id": "claude-sonnet-4-6",         "name": "Claude Sonnet 4.6"},
-    {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5"},
-]
-
-_cursor_models_cache: list[dict] | None = None
-
-
-def _fetch_cursor_models() -> list[dict]:
-    global _cursor_models_cache
-    if _cursor_models_cache is not None:
-        return _cursor_models_cache
-    import shutil, subprocess as _sp
-    agent_bin = shutil.which("agent")
-    if not agent_bin:
-        return []
-    try:
-        out = _sp.check_output([agent_bin, "--list-models"], text=True, timeout=10)
-    except Exception:
-        return []
-    models = []
-    for line in out.splitlines():
-        line = line.strip()
-        if " - " not in line:
-            continue
-        mid, _, name = line.partition(" - ")
-        mid = mid.strip()
-        name = name.strip()
-        if mid and name:
-            models.append({"id": mid, "name": name})
-    _cursor_models_cache = models
-    return models
-
-
 @models_router.get("")
 def list_models(tool: str = "claude") -> list[dict]:
-    if tool == "cursor":
-        return _fetch_cursor_models()
-    return CLAUDE_MODELS
+    from app.agents import get_adapter
+    return get_adapter(tool).list_models()
 
 _store: SessionStore | None = None
 _tmux: TmuxService | None = None
@@ -439,12 +403,10 @@ def _enrich(
     task_map: dict[str, list] | None = None,
 ) -> SessionView:
     """Add Claude title, display prompts, new-output flag, and streaming flag."""
+    from app.agents import get_adapter
     view = SessionView(**session.model_dump())
     if session.claude_session_id:
-        if session.tool == "cursor":
-            data = enrich_cursor_session(session.claude_session_id, session.cwd)
-        else:
-            data = enrich_session(session.claude_session_id, session.cwd)
+        data = get_adapter(session.tool).enrich(session.claude_session_id, session.cwd)
         view.claude_title = data.get("title")
         view.prompts = data.get("prompts", [])
         view.last_user_input_at = data.get("last_user_input_at")
@@ -554,10 +516,8 @@ def browse_cursor_sessions(user_id: CurrentUser) -> list[dict]:
 @router.get("/external-preview")
 def get_external_preview(claude_session_id: str, cwd: str, user_id: CurrentUser, tool: str = "claude") -> dict:
     """Return first 100 + last 100 turns of an external session for preview."""
-    if tool == "cursor":
-        turns = get_cursor_conversation(claude_session_id, cwd)
-    else:
-        turns = get_conversation(claude_session_id, cwd)
+    from app.agents import get_adapter
+    turns = get_adapter(tool).get_conversation(claude_session_id, cwd)
     total = len(turns)
     if total <= 200:
         preview = turns

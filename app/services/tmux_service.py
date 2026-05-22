@@ -192,16 +192,16 @@ class TmuxService:
         inner_id: str | None = None,
         tool: str = "claude",
     ) -> None:
-        # Route Claude through our local Anthropic API tap proxy so we can
-        # preview streaming content before the CLI flushes JSONL. NO_PROXY
-        # makes the local hop bypass the system upstream proxy; the tap proxy
-        # itself walks the upstream proxy to reach api.anthropic.com.
-        # Tap is only active when proxy_mode == "tap_upstream"; if the admin
-        # flipped mode to "real", we skip BASE_URL injection so Claude CLI hits
-        # api.anthropic.com directly via HTTPS_PROXY (the db proxy value).
+        from app.agents import get_adapter
+        adapter = get_adapter(tool)
+
+        # Adapters that need the Anthropic API tap (Claude) get BASE_URL +
+        # NO_PROXY injected. Tap is only active when proxy_mode == "tap_upstream";
+        # if the admin flipped mode to "real", we skip BASE_URL injection so
+        # the CLI hits api.anthropic.com directly via HTTPS_PROXY.
         from app.config import PROXY_MODE_TAP_UPSTREAM, get_proxy_mode
         tap_active = (
-            tool == "claude"
+            adapter.needs_proxy_tap()
             and self.anthropic_proxy_port
             and get_proxy_mode() == PROXY_MODE_TAP_UPSTREAM
         )
@@ -217,36 +217,16 @@ class TmuxService:
             }
 
         env_prefix = self._build_env_prefix(env)
-
-        if tool == "cursor":
-            cursor_bin = shlex.quote(self.cursor_bin)
-            if resume_session_id:
-                command = f"{cursor_bin} --yolo --resume {shlex.quote(resume_session_id)}"
-            else:
-                command = f"{cursor_bin} --yolo"
-        else:
-            claude_bin = shlex.quote(self.claude_bin)
-            if resume_session_id:
-                claude_cmd = f"{claude_bin} --dangerously-skip-permissions --resume {shlex.quote(resume_session_id)}"
-                if inner_id:
-                    pid_file = f"/tmp/claude-inner-{inner_id}.pid"
-                    claude_cmd = f"sh -c 'echo $$ > {pid_file} && exec {claude_cmd}'"
-            else:
-                if claude_model:
-                    claude_cmd = f"{claude_bin} --dangerously-skip-permissions --model {shlex.quote(claude_model)}"
-                else:
-                    claude_cmd = f"{claude_bin} --dangerously-skip-permissions"
-
-                if inner_id:
-                    pid_file = f"/tmp/claude-inner-{inner_id}.pid"
-                    claude_cmd = f"sh -c 'echo $$ > {pid_file} && exec {claude_cmd}'"
-
-            # Optionally wrap with a login shell (e.g. "bash -l") so that .profile
-            # is sourced and nvm/pyenv paths are available — useful for WSL.
-            if self.claude_shell:
-                command = f"{self.claude_shell} -c {shlex.quote(claude_cmd)}"
-            else:
-                command = claude_cmd
+        command = adapter.build_command(
+            cwd=cwd,
+            env=env,
+            model=claude_model,
+            resume_session_id=resume_session_id,
+            inner_id=inner_id,
+            claude_bin=self.claude_bin,
+            cursor_bin=self.cursor_bin,
+            claude_shell=self.claude_shell,
+        )
 
         # Prefix `env K=V ...` so the spawned process gets exactly the env we
         # specify, bypassing the tmux server's (potentially stale) global env.
