@@ -1266,6 +1266,8 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const activeSessionMeta = sessions.find((s) => s.id === activeSessionId);
   const isCursorSession = activeSessionMeta?.tool === "cursor";
+  // Claude-only features (UsageBar, AUQ history, /goal, TodoWrite) — gate UI on this.
+  const isClaudeSession = activeSessionMeta?.tool === "claude";
 
   // Per-session file/git/jsonl tabs (file-centric layout). Lives at the page
   // level so switching sessions reloads each session's tab set from localStorage.
@@ -1353,7 +1355,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     } catch { /* ignore */ }
   }, [activeSessionId]);
   useEffect(() => {
-    if (!activeSessionId || isCursorSession) {
+    if (!activeSessionId || !isClaudeSession) {
       setDockTodos([]); setDockTodoHistory([]); setDockActiveGoal(null); setDockGoalHistory([]);
       return;
     }
@@ -1361,7 +1363,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     refreshDockGoals();
     const id = setInterval(() => { refreshDockTodos(); refreshDockGoals(); }, 5000);
     return () => clearInterval(id);
-  }, [activeSessionId, isCursorSession, refreshDockTodos, refreshDockGoals]);
+  }, [activeSessionId, isClaudeSession, refreshDockTodos, refreshDockGoals]);
 
   const { width: winW, height: winH } = useWindowSize();
 
@@ -2341,7 +2343,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               <SessionSideDock
                 sessionId={activeSessionMeta.id}
                 sessionName={activeSessionMeta.name || activeSessionMeta.project}
-                isCursor={isCursorSession}
+                isCursor={!isClaudeSession}
                 open={dockOpen}
                 onClose={(key) => setDockSection(key, false)}
                 todos={dockTodos}
@@ -2357,7 +2359,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
           </div>
           {/* Bottom toolbar — three groups: Functional | Views | Term */}
             <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, padding: "3px 8px", background: "var(--bg-base)", borderTop: "1px solid var(--bg-page)" }}>
-              {!isCursorSession && <UsageBar />}
+              {isClaudeSession && <UsageBar />}
               {/* In file-centric, push the button cluster rightward so it sits below
                   the chat column. The cluster gets a fixed width = chat + dock so
                   its left edge hits chat col's left edge exactly. */}
@@ -2371,7 +2373,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               }}>
               {/* Group 1: Functional — Auqs / Tasks / Goals / Model */}
               <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              {activeSessionMeta && activeSessionMeta.tool !== "cursor" && (
+              {activeSessionMeta && isClaudeSession && (
                 <button
                   onClick={() => setDockSection("auqs", !dockOpen.auqs)}
                   title="Show AskUserQuestion history for this session"
@@ -2402,7 +2404,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   </button>
                 );
               })()}
-              {activeSessionMeta && activeSessionMeta.tool !== "cursor" && (() => {
+              {activeSessionMeta && isClaudeSession && (() => {
                 const hasActive = !!dockActiveGoal;
                 return (
                   <button
