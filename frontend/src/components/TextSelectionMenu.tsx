@@ -29,6 +29,7 @@ const COL_WIDTH: Record<ToolCategory, number> = {
   Case: 130,
   Lines: 120,
   Hash: 120,
+  Time: 130,
   Info: 70,
 };
 const MENU_WIDTH = Object.values(COL_WIDTH).reduce((a, b) => a + b, 0) + 2; // + outer border

@@ -5,8 +5,9 @@
 
 import { convert, validateConfig } from "./configConvert";
 import { md5 as wasmMd5, xxhash3 as wasmXxh3, xxhash128 as wasmXxh3_128 } from "hash-wasm";
+import { timeStringToTimestamp, timestampToDatetime } from "./timeConvert";
 
-export type ToolCategory = "Encode" | "Format" | "Case" | "Lines" | "Hash" | "Info";
+export type ToolCategory = "Encode" | "Format" | "Case" | "Lines" | "Hash" | "Time" | "Info";
 
 export interface StringTool {
   id: string;
@@ -211,7 +212,10 @@ export const STRING_TOOLS: StringTool[] = [
   { id: "xxh3-64", label: "xxhash3 (64)", category: "Hash", run: s => wasmXxh3(s) },
   { id: "xxh3-128", label: "xxhash3 (128)", category: "Hash", run: s => wasmXxh3_128(s) },
 
+  { id: "time-to-ts", label: "→ Timestamp", category: "Time", run: timeStringToTimestamp },
+  { id: "ts-to-time", label: "→ Datetime", category: "Time", run: timestampToDatetime },
+
   { id: "info-stats", label: "Stats", category: "Info", run: stats },
 ];
 
-export const CATEGORY_ORDER: ToolCategory[] = ["Encode", "Format", "Case", "Lines", "Hash", "Info"];
+export const CATEGORY_ORDER: ToolCategory[] = ["Encode", "Format", "Case", "Lines", "Hash", "Time", "Info"];
