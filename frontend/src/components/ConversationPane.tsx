@@ -2944,7 +2944,7 @@ function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
 
 interface Props {
   sessionId: string;
-  tool?: "claude" | "cursor";
+  tool?: "claude" | "cursor" | "codex";
   isStreaming?: boolean;
   /** True while claude is running its compaction pass — drives the bottom banner's compacting variant. */
   isCompacting?: boolean;

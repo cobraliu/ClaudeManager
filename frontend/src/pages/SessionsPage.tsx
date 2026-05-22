@@ -19,6 +19,7 @@ import {
   getAvailableTools,
   browseExternalSessions,
   browseCursorSessions,
+  browseCodexSessions,
   getExternalPreview,
   listModels,
   setSessionModel,
@@ -574,7 +575,7 @@ function NewSessionModal({
 }: {
   workspaceBase: string;
   loading: boolean;
-  onSubmit: (p: { project: string; cwd?: string; git_repo_url?: string; tool: "claude" | "cursor" }) => void;
+  onSubmit: (p: { project: string; cwd?: string; git_repo_url?: string; tool: "claude" | "cursor" | "codex" }) => void;
   onClose: () => void;
 }) {
   // Always read username from the current JWT to stay in sync with actual token
@@ -582,7 +583,7 @@ function NewSessionModal({
   const prefix = `${workspaceBase}/${username}/`;
 
   const [project, setProject] = useState("");
-  const tool = "claude" as const;
+  const [tool, setTool] = useState<"claude" | "cursor" | "codex">("claude");
 
   // suffix is the editable part after the fixed prefix
   const [suffix, setSuffix] = useState("");
@@ -661,6 +662,33 @@ function NewSessionModal({
           style={inputStyle}
           autoFocus
         />
+        <div>
+          <label style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+            Agent
+          </label>
+          <div style={{ display: "flex", gap: 6 }}>
+            {(["claude", "codex"] as const).map((k) => (
+              <button
+                key={k}
+                onClick={() => setTool(k)}
+                style={{
+                  flex: 1,
+                  padding: "5px 8px",
+                  fontSize: 12,
+                  borderRadius: 5,
+                  border: "1px solid " + (tool === k ? "var(--accent-blue)" : "var(--border)"),
+                  background: tool === k ? "rgba(88,166,255,0.15)" : "var(--bg-main)",
+                  color: tool === k ? "var(--text-body)" : "var(--text-secondary)",
+                  fontWeight: tool === k ? 600 : 400,
+                  cursor: "pointer",
+                  textTransform: "capitalize",
+                }}
+              >
+                {k}
+              </button>
+            ))}
+          </div>
+        </div>
         <div>
           <label style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
             Working Directory
@@ -920,9 +948,10 @@ function BrowseExternalPanel({
   onLoad,
   onClose,
 }: {
-  onLoad: (session: ExternalSession) => void;
+  onLoad: (tool: "claude" | "cursor" | "codex", session: ExternalSession) => void;
   onClose: () => void;
 }) {
+  const [tool, setTool] = useState<"claude" | "cursor" | "codex">("claude");
   const [groups, setGroups] = useState<ExternalSessionGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -931,14 +960,21 @@ function BrowseExternalPanel({
   const [viewingSession, setViewingSession] = useState<ExternalSession | null>(null);
 
   useEffect(() => {
-    browseExternalSessions()
+    setLoading(true);
+    setGroups([]);
+    setSelectedDir(null);
+    const fetcher =
+      tool === "cursor" ? browseCursorSessions :
+      tool === "codex" ? browseCodexSessions :
+      browseExternalSessions;
+    fetcher()
       .then((data) => {
         setGroups(data);
         if (data.length > 0) setSelectedDir(data[0].dir);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tool]);
 
   const isEmpty = (s: ExternalSession) => !s.title && s.prompts.length === 0;
 
@@ -989,6 +1025,27 @@ function BrowseExternalPanel({
         {/* Header */}
         <div style={{ padding: "11px 16px 10px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
           <span style={{ fontSize: 14, fontWeight: 600, marginRight: 4 }}>Browse External Sessions</span>
+          <div style={{ display: "flex", gap: 4 }}>
+            {(["claude", "codex"] as const).map((k) => (
+              <button
+                key={k}
+                onClick={() => setTool(k)}
+                style={{
+                  padding: "3px 10px",
+                  fontSize: 11,
+                  borderRadius: 4,
+                  border: "1px solid " + (tool === k ? "var(--accent-blue)" : "var(--border)"),
+                  background: tool === k ? "rgba(88,166,255,0.15)" : "transparent",
+                  color: tool === k ? "var(--text-body)" : "var(--text-secondary)",
+                  fontWeight: tool === k ? 600 : 400,
+                  cursor: "pointer",
+                  textTransform: "capitalize",
+                }}
+              >
+                {k}
+              </button>
+            ))}
+          </div>
           <div style={{ flex: 1 }} />
           <input
             autoFocus
@@ -1127,7 +1184,7 @@ function BrowseExternalPanel({
                         onClick={async () => {
                           if (!canLoad) return;
                           setLoadingId(s.claude_session_id);
-                          try { await onLoad(s); } finally { setLoadingId(null); }
+                          try { await onLoad(tool, s); } finally { setLoadingId(null); }
                         }}
                         style={{
                           background: canLoad ? "var(--accent-blue)" : "var(--bg-hover)",
@@ -1150,7 +1207,7 @@ function BrowseExternalPanel({
         </div>
       </div>
       {viewingSession && (
-        <SessionPreviewModal session={viewingSession} tool="claude" onClose={() => setViewingSession(null)} />
+        <SessionPreviewModal session={viewingSession} tool={tool} onClose={() => setViewingSession(null)} />
       )}
     </div>
   );
@@ -1657,7 +1714,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     project: string;
     cwd?: string;
     git_repo_url?: string;
-    tool: "claude" | "cursor";
+    tool: "claude" | "cursor" | "codex";
   }) => {
     setLoading(true);
     try {
@@ -1764,6 +1821,22 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       cwd: ext.cwd,
       resume_session_id: ext.claude_session_id,
       tool: "cursor",
+    });
+    await refresh();
+    const res = await attachSession(newSession.id);
+    setActive(res);
+    setActiveSessionId(newSession.id);
+    setChatOnlyMode(false);
+    setShowBrowse(false);
+  };
+
+  const handleLoadCodex = async (ext: ExternalSession) => {
+    const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
+    const newSession = await createSession({
+      project: dirName,
+      cwd: ext.cwd,
+      resume_session_id: ext.claude_session_id,
+      tool: "codex",
     });
     await refresh();
     const res = await attachSession(newSession.id);
@@ -2521,7 +2594,11 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       {/* Browse external sessions panel */}
       {showBrowse && (
         <BrowseExternalPanel
-          onLoad={handleLoadExternal}
+          onLoad={(t, s) => {
+            if (t === "codex") return handleLoadCodex(s);
+            if (t === "cursor") return handleLoadCursor(s);
+            return handleLoadExternal(s);
+          }}
           onClose={() => setShowBrowse(false)}
         />
       )}

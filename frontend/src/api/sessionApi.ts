@@ -27,7 +27,7 @@ export interface SessionMeta {
   scheduled_tasks: ScheduledTask[];
   git_auto_commit: boolean;
   git_repo_url: string | null;
-  tool: "claude" | "cursor";
+  tool: "claude" | "cursor" | "codex";
 }
 
 export interface SessionListResponse {
@@ -363,7 +363,7 @@ export function createSession(body: {
   model?: string;
   resume_session_id?: string;
   git_repo_url?: string;
-  tool?: "claude" | "cursor";
+  tool?: "claude" | "cursor" | "codex";
 }): Promise<SessionMeta> {
   return request("/api/sessions", {
     method: "POST",
@@ -1411,6 +1411,10 @@ export function browseExternalSessions(): Promise<ExternalSessionGroup[]> {
 
 export function browseCursorSessions(): Promise<ExternalSessionGroup[]> {
   return request<ExternalSessionGroup[]>("/api/sessions/external-cursor");
+}
+
+export function browseCodexSessions(): Promise<ExternalSessionGroup[]> {
+  return request<ExternalSessionGroup[]>("/api/sessions/external-codex");
 }
 
 export interface ExternalPreview {
