@@ -47,7 +47,19 @@ export function TextSelectionMenu() {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   // ── contextmenu trap (Shift + right-click only) ─────────────────────────────
+  // Shift+mousedown is the browser's native "extend selection to click point"
+  // gesture. If we let it through, the selection has already been mutated by
+  // the time `contextmenu` fires and we'd read the wrong text. So we trap
+  // mousedown in capture phase and preventDefault on shift+right — that
+  // blocks selection extension only; the contextmenu event still fires.
   useEffect(() => {
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 2 || !e.shiftKey) return;
+      if (isInExcludedZone(e.target)) return;
+      const sel = window.getSelection();
+      if (!sel || sel.toString().length === 0) return;
+      e.preventDefault();
+    };
     const onCtx = (e: MouseEvent) => {
       if (e.defaultPrevented) return;
       if (!e.shiftKey) return; // plain right-click → let native menu fire
@@ -61,8 +73,12 @@ export function TextSelectionMenu() {
       const y = Math.max(8, Math.min(e.clientY, window.innerHeight - 280));
       setMenu({ x, y, text });
     };
+    window.addEventListener("mousedown", onMouseDown, true);
     window.addEventListener("contextmenu", onCtx, true);
-    return () => window.removeEventListener("contextmenu", onCtx, true);
+    return () => {
+      window.removeEventListener("mousedown", onMouseDown, true);
+      window.removeEventListener("contextmenu", onCtx, true);
+    };
   }, []);
 
   // ── dismiss on outside click / Esc / page scroll / resize ───────────────────
