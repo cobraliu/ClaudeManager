@@ -907,6 +907,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       return next;
     });
   };
+  const anyDockOpen = dockOpen.auqs || dockOpen.tasks || dockOpen.goals;
   // Goals + tasks polled at page level so bottom buttons can reflect active state
   // even when the dock section is collapsed or hidden.
   const [dockTodos, setDockTodos] = useState<TodoItem[]>([]);
@@ -1198,8 +1199,10 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       const minViewer = 240;
       const sidebar = sidebarCollapsed ? 0 : leftWidth + 5;
       const tree = userConfig.fileCentricTreeWidth + 5;
-      const maxChat = Math.max(minChat, window.innerWidth - sidebar - tree - minViewer);
-      const w = Math.max(minChat, Math.min(window.innerWidth - e.clientX, maxChat));
+      const dockOpen = sideDockOpenRef.current;
+      const dockW = dockOpen ? userConfig.sideDockWidth + 5 : 0;
+      const maxChat = Math.max(minChat, window.innerWidth - sidebar - tree - minViewer - dockW);
+      const w = Math.max(minChat, Math.min(window.innerWidth - e.clientX - dockW, maxChat));
       patchUserConfig({ fileCentricChatWidth: w });
     };
     const onUp = () => {
@@ -1215,7 +1218,56 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [isFileCentric, sidebarCollapsed, leftWidth, userConfig.fileCentricTreeWidth, patchUserConfig]);
+  }, [isFileCentric, sidebarCollapsed, leftWidth, userConfig.fileCentricTreeWidth, userConfig.sideDockWidth, patchUserConfig]);
+
+  // Drag bar between chat and SideDock — only active when the user is actually dragging.
+  // Live ref of "any dock section open" so the chat-drag clamp can read it without
+  // re-binding listeners every time dockOpen flips.
+  const sideDockOpenRef = useRef(false);
+  useEffect(() => { sideDockOpenRef.current = anyDockOpen; }, [anyDockOpen]);
+  const sideDockDragging = useRef(false);
+  const startSideDockDrag = useCallback(() => {
+    sideDockDragging.current = true;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!sideDockDragging.current) return;
+      const minDock = 240;
+      let maxDock: number;
+      if (isFileCentric) {
+        const sidebar = sidebarCollapsed ? 0 : leftWidth + 5;
+        const tree = userConfig.fileCentricTreeWidth + 5;
+        const minViewer = 240;
+        maxDock = Math.max(
+          minDock,
+          window.innerWidth - sidebar - tree - 5 - userConfig.fileCentricChatWidth - 5 - minViewer,
+        );
+      } else {
+        maxDock = Math.max(minDock, Math.floor(window.innerWidth * 0.6));
+      }
+      const w = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
+      patchUserConfig({ sideDockWidth: w });
+    };
+    const onUp = () => {
+      if (sideDockDragging.current) {
+        sideDockDragging.current = false;
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [
+    isFileCentric, sidebarCollapsed, leftWidth,
+    userConfig.fileCentricTreeWidth, userConfig.fileCentricChatWidth,
+    patchUserConfig,
+  ]);
 
   useEffect(() => {
     if (!showModelPicker) return;
@@ -1792,6 +1844,15 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               </div>
             )}
             </div>
+            {activeSessionMeta && anyDockOpen && (
+              <div
+                onMouseDown={startSideDockDrag}
+                title="Drag to resize side dock"
+                style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
+                onMouseLeave={(e) => { if (!sideDockDragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
+              />
+            )}
             {activeSessionMeta && (
               <SessionSideDock
                 sessionId={activeSessionMeta.id}
@@ -1804,12 +1865,24 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 activeGoal={dockActiveGoal}
                 goalHistory={dockGoalHistory}
                 onTodosChanged={refreshDockTodos}
+                width={userConfig.sideDockWidth}
               />
             )}
           </div>
           {/* Bottom toolbar — three groups: Functional | Views | Term */}
             <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, padding: "3px 8px", background: "var(--bg-base)", borderTop: "1px solid var(--bg-page)" }}>
               {!isCursorSession && <UsageBar />}
+              {/* In file-centric, push the button cluster rightward so it sits below
+                  the chat column. The cluster gets a fixed width = chat + dock so
+                  its left edge hits chat col's left edge exactly. */}
+              {isFileCentric && <div style={{ flex: 1, minWidth: 0 }} />}
+              <div style={{
+                display: "flex", alignItems: "center", gap: 4,
+                ...(isFileCentric ? {
+                  width: userConfig.fileCentricChatWidth + (anyDockOpen ? userConfig.sideDockWidth + 5 : 0) - 8,
+                  justifyContent: "flex-start",
+                } : null),
+              }}>
               {/* Group 1: Functional — Auqs / Tasks / Goals / Model */}
               <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               {activeSessionMeta && activeSessionMeta.tool !== "cursor" && (
@@ -1995,6 +2068,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 >
                   &gt;_ Term
                 </button>
+              </div>
               </div>
             </div>
             <EmbeddedTerminalPanel

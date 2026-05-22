@@ -753,7 +753,7 @@ export interface AuqQuestion {
   question: string;
   header?: string;
   multiSelect?: boolean;
-  options?: Array<{ label: string; description?: string }>;
+  options?: Array<{ label: string; description?: string; preview?: string }>;
 }
 export interface AuqEntry {
   tool_use_id: string;

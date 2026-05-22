@@ -1019,12 +1019,11 @@ function AskUserQuestionDisplay({ questions, answer }: {
       {/* Questions */}
       <div style={{ padding: "8px 10px 10px", display: "flex", flexDirection: "column", gap: 10 }}>
         {questions.map((q, qi) => {
-          const chosenWithPreview = q.options.filter(
-            o => answeredLabels[qi]?.has(o.label) && o.preview,
-          );
-          const chosenWithDescription = q.options.filter(
-            o => answeredLabels[qi]?.has(o.label) && o.description,
-          );
+          // For answered AUQs we keep every option's description + preview visible
+          // so the historical decision can be re-read in full context. Chosen options
+          // get accent styling, others get muted styling to preserve the hierarchy.
+          const optionsWithDescription = q.options.filter(o => o.description);
+          const optionsWithPreview = q.options.filter(o => o.preview);
           return (
             <div key={qi}>
               {questions.length > 1 && q.header && (
@@ -1071,43 +1070,51 @@ function AskUserQuestionDisplay({ questions, answer }: {
                   );
                 })()}
               </div>
-              {/* Description of the chosen option(s) — surfaces the rationale text
-                  that the inline chip layout couldn't fit. */}
-              {chosenWithDescription.map(opt => (
-                <div
-                  key={opt.label}
-                  style={{
-                    marginTop: 4,
-                    fontSize: 11,
-                    color: "var(--text-muted)",
-                    lineHeight: 1.5,
-                    paddingLeft: 4,
-                    borderLeft: "2px solid var(--accent-blue)",
-                    marginLeft: 2,
-                  }}
-                >
-                  <span style={{ color: "var(--accent-blue)", fontWeight: 600, marginRight: 4 }}>{opt.label}:</span>
-                  {opt.description}
-                </div>
-              ))}
-              {/* Preview of the chosen option(s), so the historical decision keeps its context */}
-              {chosenWithPreview.map(opt => (
-                <pre
-                  key={opt.label}
-                  style={{
-                    marginTop: 6, marginBottom: 0,
-                    padding: "6px 8px",
-                    background: "var(--bg-deep)",
-                    border: "1px solid var(--border-subtle)",
-                    borderRadius: 4,
-                    fontSize: 10.5, lineHeight: 1.35,
-                    color: "var(--text-secondary)",
-                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                    overflow: "auto",
-                    whiteSpace: "pre",
-                  }}
-                >{opt.preview}</pre>
-              ))}
+              {/* Descriptions for every option — chosen ones in accent blue,
+                  others muted, so re-reading the history shows the full picture. */}
+              {optionsWithDescription.map(opt => {
+                const chosen = answeredLabels[qi]?.has(opt.label);
+                return (
+                  <div
+                    key={opt.label}
+                    style={{
+                      marginTop: 4,
+                      fontSize: 11,
+                      color: chosen ? "var(--text-muted)" : "var(--text-faint)",
+                      lineHeight: 1.5,
+                      paddingLeft: 4,
+                      borderLeft: `2px solid ${chosen ? "var(--accent-blue)" : "var(--border-subtle)"}`,
+                      marginLeft: 2,
+                    }}
+                  >
+                    <span style={{ color: chosen ? "var(--accent-blue)" : "var(--text-muted)", fontWeight: 600, marginRight: 4 }}>{opt.label}:</span>
+                    {opt.description}
+                  </div>
+                );
+              })}
+              {/* Previews for every option — kept full-fidelity so unicode box art
+                  / mockups stay legible in history. */}
+              {optionsWithPreview.map(opt => {
+                const chosen = answeredLabels[qi]?.has(opt.label);
+                return (
+                  <pre
+                    key={opt.label}
+                    style={{
+                      marginTop: 6, marginBottom: 0,
+                      padding: "6px 8px",
+                      background: "var(--bg-deep)",
+                      border: `1px solid ${chosen ? "var(--accent-blue)" : "var(--border-subtle)"}`,
+                      borderRadius: 4,
+                      fontSize: 10.5, lineHeight: 1.35,
+                      color: chosen ? "var(--text-secondary)" : "var(--text-faint)",
+                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                      overflow: "auto",
+                      whiteSpace: "pre",
+                      opacity: chosen ? 1 : 0.75,
+                    }}
+                  >{opt.preview}</pre>
+                );
+              })}
             </div>
           );
         })}
