@@ -32,10 +32,7 @@ from app.services.claude_pid import format_tui_hint, get_pid_waiting_state, pars
 from app.services.claude_session_reader import enrich_session, find_newest_claude_session_id, get_latest_turn_info, get_conversation, search_conversation, list_project_session_ids, list_subagents, get_subagent_lines, list_all_claude_sessions_global, get_todo_plans
 from app.services.claude_goals import read_goals
 from app.services.claude_auqs import list_auqs
-from app.services.cursor_session_reader import (
-    enrich_cursor_session, find_newest_cursor_session_id, get_cursor_conversation, list_cursor_sessions,
-    list_all_cursor_sessions_global,
-)
+from app.services.cursor_session_reader import list_all_cursor_sessions_global
 from app.services.git_service import (
     git_add_commit, git_checkout_branch, git_checkout_remote_branch, git_clone,
     git_conflict_file_versions, git_file_diff, git_file_log, git_file_show,
@@ -1721,19 +1718,11 @@ def get_session_conversation(
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    chat_sid = session.claude_session_id
-    if session.tool == "cursor":
-        if not chat_sid:
-            chat_sid = find_newest_cursor_session_id(session.cwd)
-        if not chat_sid:
-            return []
-        turns = get_cursor_conversation(chat_sid, session.cwd, from_ts=from_ts)
-    else:
-        if not chat_sid:
-            chat_sid = find_newest_claude_session_id(session.cwd)
-        if not chat_sid:
-            return []
-        turns = get_conversation(chat_sid, session.cwd, from_ts=from_ts)
+    adapter = get_adapter(session.tool)
+    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    if not chat_sid:
+        return []
+    turns = adapter.get_conversation(chat_sid, session.cwd, from_ts=from_ts)
     if tail is not None and tail > 0 and from_ts == 0.0:
         confirmed = [t for t in turns if not t.get("pending") and not t.get("streaming")]
         rest = [t for t in turns if t.get("pending") or t.get("streaming")]
@@ -1757,21 +1746,11 @@ def get_conversation_jsonl_raw(
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    if session.tool == "cursor":
-        from app.services.cursor_session_reader import _find_jsonl as _find_cursor_jsonl
-        chat_sid = session.claude_session_id
-        if not chat_sid:
-            chat_sid = find_newest_cursor_session_id(session.cwd)
-        if not chat_sid:
-            raise HTTPException(status_code=404, detail="no cursor session")
-        jsonl_path = _find_cursor_jsonl(chat_sid, session.cwd)
-    else:
-        chat_sid = session.claude_session_id
-        if not chat_sid:
-            chat_sid = find_newest_claude_session_id(session.cwd)
-        if not chat_sid:
-            raise HTTPException(status_code=404, detail="no claude session")
-        jsonl_path = _find_session_jsonl(chat_sid, session.cwd)
+    adapter = get_adapter(session.tool)
+    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    if not chat_sid:
+        raise HTTPException(status_code=404, detail=f"no {session.tool} session")
+    jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd)
     if jsonl_path is None:
         raise HTTPException(status_code=404, detail="jsonl file not found")
     try:
@@ -1821,11 +1800,7 @@ def list_available_claude_sessions(session_id: str, user_id: CurrentUser) -> lis
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
-    if session.tool == "cursor":
-        raw = list_cursor_sessions(session.cwd)
-        all_sessions = [{"claude_session_id": s["cursor_session_id"], "title": s.get("title"), "mtime": s.get("mtime")} for s in raw]
-    else:
-        all_sessions = list_project_session_ids(session.cwd)
+    all_sessions = get_adapter(session.tool).list_local_sessions(session.cwd)
 
     # Collect occupied IDs: any session (other than this one) with a claude_session_id
     occupied = store.get_all_claude_session_ids(exclude_session_id=session_id)
@@ -1903,13 +1878,9 @@ def get_raw_messages(
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
-    if session.tool == "cursor":
-        from app.services.cursor_session_reader import _find_jsonl as _find_cursor_jsonl
-        chat_sid = session.claude_session_id or find_newest_cursor_session_id(session.cwd)
-        jsonl_path = _find_cursor_jsonl(chat_sid, session.cwd) if chat_sid else None
-    else:
-        chat_sid = session.claude_session_id or find_newest_claude_session_id(session.cwd)
-        jsonl_path = _find_session_jsonl(chat_sid, session.cwd) if chat_sid else None
+    adapter = get_adapter(session.tool)
+    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd) if chat_sid else None
 
     if jsonl_path is None:
         return {"messages": [], "total": 0}
@@ -2128,13 +2099,9 @@ def get_raw_messages_all(
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
-    if session.tool == "cursor":
-        from app.services.cursor_session_reader import _find_jsonl as _find_cursor_jsonl
-        chat_sid = session.claude_session_id or find_newest_cursor_session_id(session.cwd)
-        jsonl_path = _find_cursor_jsonl(chat_sid, session.cwd) if chat_sid else None
-    else:
-        chat_sid = session.claude_session_id or find_newest_claude_session_id(session.cwd)
-        jsonl_path = _find_session_jsonl(chat_sid, session.cwd) if chat_sid else None
+    adapter = get_adapter(session.tool)
+    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd) if chat_sid else None
 
     if jsonl_path is None:
         return {"messages": [], "total": 0}

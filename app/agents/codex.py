@@ -7,6 +7,7 @@ app-server JSON-RPC integration (live AUQ/plan/approval state) is Phase 3.
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 from typing import Any, Optional
 
 from app.agents.base import AgentAdapter, AgentKind, EnrichResult, WaitingState
@@ -75,8 +76,12 @@ class CodexAdapter:
             search_text=None,
         )
 
-    def get_conversation(self, agent_session_id: str, cwd: str) -> list[dict]:
-        return codex_session_reader.get_codex_conversation(agent_session_id, cwd)
+    def get_conversation(
+        self, agent_session_id: str, cwd: str, from_ts: float = 0.0
+    ) -> list[dict]:
+        return codex_session_reader.get_codex_conversation(
+            agent_session_id, cwd, from_ts=from_ts
+        )
 
     def search_conversation(self, agent_session_id: str, cwd: str, query: str) -> bool:
         return codex_session_reader.search_codex_conversation(agent_session_id, cwd, query)
@@ -85,6 +90,20 @@ class CodexAdapter:
         if cwd_filter:
             return codex_session_reader.list_codex_sessions(cwd_filter)
         return codex_session_reader.list_all_codex_sessions_global(set())
+
+    def get_jsonl_path(self, agent_session_id: str, cwd: str) -> Optional[Path]:
+        return codex_session_reader._find_rollout(agent_session_id, cwd)
+
+    def list_local_sessions(self, cwd: str) -> list[dict]:
+        raw = codex_session_reader.list_codex_sessions(cwd)
+        return [
+            {
+                "claude_session_id": s.get("codex_session_id") or s.get("session_id"),
+                "title": s.get("title"),
+                "mtime": s.get("mtime"),
+            }
+            for s in raw
+        ]
 
     def get_waiting_state(
         self,

@@ -157,3 +157,46 @@ def test_claude_models_have_known_ids():
     ids = {m["id"] for m in models}
     assert "claude-opus-4-7" in ids
     assert "claude-sonnet-4-6" in ids
+
+
+def test_all_adapters_expose_get_jsonl_path_and_list_local_sessions():
+    """Regression: api/sessions.py endpoints dispatch via these methods.
+    Missing them on any adapter would break /conversation, /jsonl, or
+    /available-claude-sessions for that tool.
+    """
+    from app.agents.codex import CodexAdapter
+    for adapter in (ClaudeAdapter(), CursorAdapter(), CodexAdapter()):
+        assert callable(getattr(adapter, "get_jsonl_path", None)), (
+            f"{adapter.kind} missing get_jsonl_path"
+        )
+        assert callable(getattr(adapter, "list_local_sessions", None)), (
+            f"{adapter.kind} missing list_local_sessions"
+        )
+
+
+def test_get_conversation_accepts_from_ts():
+    """The migrated /conversation endpoint passes from_ts. All three adapters
+    must accept it (Protocol-widened in app/agents/base.py)."""
+    from app.agents.codex import CodexAdapter
+    import inspect
+    for adapter in (ClaudeAdapter(), CursorAdapter(), CodexAdapter()):
+        sig = inspect.signature(adapter.get_conversation)
+        assert "from_ts" in sig.parameters, f"{adapter.kind}.get_conversation missing from_ts"
+
+
+def test_codex_get_jsonl_path_returns_none_for_unknown_id():
+    """Smoke: get_jsonl_path tolerates unknown session ids without raising."""
+    from app.agents.codex import CodexAdapter
+    assert CodexAdapter().get_jsonl_path("not-a-real-uuid", "/tmp") is None
+
+
+def test_codex_list_local_sessions_returns_normalized_shape():
+    """The /available-claude-sessions endpoint expects each entry to have
+    claude_session_id / title / mtime keys (frontend renders these directly)."""
+    from app.agents.codex import CodexAdapter
+    rows = CodexAdapter().list_local_sessions("/nonexistent-cwd-xyz")
+    # Either empty or has the expected keys
+    for r in rows:
+        assert "claude_session_id" in r
+        assert "title" in r
+        assert "mtime" in r

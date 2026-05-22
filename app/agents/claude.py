@@ -7,6 +7,7 @@ branches in api/sessions.py and tmux_service.py — this is purely an extraction
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 from typing import Any, Optional
 
 from app.agents.base import AgentAdapter, AgentKind, EnrichResult, WaitingState
@@ -66,8 +67,10 @@ class ClaudeAdapter:
             search_text=data.get("search_text"),
         )
 
-    def get_conversation(self, agent_session_id: str, cwd: str) -> list[dict]:
-        return claude_session_reader.get_conversation(agent_session_id, cwd)
+    def get_conversation(
+        self, agent_session_id: str, cwd: str, from_ts: float = 0.0
+    ) -> list[dict]:
+        return claude_session_reader.get_conversation(agent_session_id, cwd, from_ts=from_ts)
 
     def search_conversation(self, agent_session_id: str, cwd: str, query: str) -> bool:
         return claude_session_reader.search_conversation(agent_session_id, cwd, query)
@@ -76,6 +79,12 @@ class ClaudeAdapter:
         if cwd_filter:
             return claude_session_reader.list_project_session_ids(cwd_filter)
         return claude_session_reader.list_all_claude_sessions_global()
+
+    def get_jsonl_path(self, agent_session_id: str, cwd: str) -> Optional[Path]:
+        return claude_session_reader._find_session_jsonl(agent_session_id, cwd)
+
+    def list_local_sessions(self, cwd: str) -> list[dict]:
+        return claude_session_reader.list_project_session_ids(cwd)
 
     def get_waiting_state(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any, Optional
 
 from app.agents.base import AgentAdapter, AgentKind, EnrichResult, WaitingState
@@ -73,8 +74,12 @@ class CursorAdapter:
             search_text=data.get("search_text"),
         )
 
-    def get_conversation(self, agent_session_id: str, cwd: str) -> list[dict]:
-        return cursor_session_reader.get_cursor_conversation(agent_session_id, cwd)
+    def get_conversation(
+        self, agent_session_id: str, cwd: str, from_ts: float = 0.0
+    ) -> list[dict]:
+        return cursor_session_reader.get_cursor_conversation(
+            agent_session_id, cwd, from_ts=from_ts
+        )
 
     def search_conversation(self, agent_session_id: str, cwd: str, query: str) -> bool:
         # Cursor reader has no dedicated search helper; conservative: always False.
@@ -85,7 +90,21 @@ class CursorAdapter:
     def list_external_sessions(self, cwd_filter: Optional[str] = None) -> list[dict]:
         if cwd_filter:
             return cursor_session_reader.list_cursor_sessions(cwd_filter)
-        return cursor_session_reader.list_all_cursor_sessions_global()
+        return cursor_session_reader.list_all_cursor_sessions_global(set())
+
+    def get_jsonl_path(self, agent_session_id: str, cwd: str) -> Optional[Path]:
+        return cursor_session_reader._find_jsonl(agent_session_id, cwd)
+
+    def list_local_sessions(self, cwd: str) -> list[dict]:
+        raw = cursor_session_reader.list_cursor_sessions(cwd)
+        return [
+            {
+                "claude_session_id": s["cursor_session_id"],
+                "title": s.get("title"),
+                "mtime": s.get("mtime"),
+            }
+            for s in raw
+        ]
 
     def get_waiting_state(
         self,

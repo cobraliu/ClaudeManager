@@ -19,6 +19,7 @@ Method semantics:
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal, Optional, Protocol, TypedDict, runtime_checkable
 
 AgentKind = Literal["claude", "cursor", "codex"]
@@ -70,11 +71,28 @@ class AgentAdapter(Protocol):
     # ── Conversation reading ────────────────────────────────────────────────
     def enrich(self, agent_session_id: str, cwd: str) -> EnrichResult: ...
 
-    def get_conversation(self, agent_session_id: str, cwd: str) -> list[dict]: ...
+    def get_conversation(
+        self, agent_session_id: str, cwd: str, from_ts: float = 0.0
+    ) -> list[dict]: ...
 
     def search_conversation(self, agent_session_id: str, cwd: str, query: str) -> bool: ...
 
     def list_external_sessions(self, cwd_filter: Optional[str] = None) -> list[dict]: ...
+
+    def get_jsonl_path(self, agent_session_id: str, cwd: str) -> Optional[Path]:
+        """Absolute path to the session's transcript JSONL, or None if not found.
+
+        Used by raw-JSONL viewer endpoints. Each adapter resolves to its own
+        on-disk format (Claude: ~/.claude/projects/, Cursor: ~/.cursor/...,
+        Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
+        """
+
+    def list_local_sessions(self, cwd: str) -> list[dict]:
+        """Sessions for this cwd, shaped as {claude_session_id, title, mtime}.
+
+        Used by the session-switcher dropdown. Distinct from
+        list_external_sessions (which groups globally for the browse panel).
+        """
 
     # ── Live state polling ──────────────────────────────────────────────────
     def get_waiting_state(
