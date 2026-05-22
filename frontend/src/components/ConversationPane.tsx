@@ -1130,6 +1130,12 @@ interface AskQuestion { header?: string; question: string; multiSelect?: boolean
 
 // Persist dismissed block IDs in sessionStorage so page refreshes don't re-show
 // answered questions while Claude Code is still processing the response.
+//
+// Both stores below are MODULE-LEVEL (shared by every ConversationPane mount).
+// Without namespacing by sessionId, dismissing "Continue?" in session A would
+// suppress the same-text AUQ in session B. The pending blockId itself
+// ("__pending_auq__:" + question) also collides cross-session, so blockIds
+// are namespaced the same way.
 const _AUQ_SS_KEY = "cm_auq_dismissed";
 function _auqLoadDismissed(): Set<string> {
   try { return new Set(JSON.parse(sessionStorage.getItem(_AUQ_SS_KEY) || "[]")); }
@@ -1139,23 +1145,35 @@ function _auqPersist(set: Set<string>) {
   try { sessionStorage.setItem(_AUQ_SS_KEY, JSON.stringify([...set])); } catch {}
 }
 const _dismissedAUQ = _auqLoadDismissed();
-// Tracks question text of recently dismissed AUQs so the JSONL widget and the
-// hook-based pendingAuqData widget cross-suppress each other while the two
-// signals settle. Cleared after a short window to avoid suppressing a future
-// re-ask of the same question.
-const _recentlyDismissedAuqQ = new Map<string, number>(); // question → timestamp
+// Tracks recently dismissed AUQs so the JSONL widget and the hook-based
+// pendingAuqData widget cross-suppress each other while the two signals
+// settle. Cleared after a short window to avoid suppressing a future re-ask.
+const _recentlyDismissedAuqQ = new Map<string, number>(); // nsKey → timestamp
 const _AUQ_SUPPRESS_MS = 15000;
-function _markAuqDismissed(question: string) {
-  _recentlyDismissedAuqQ.set(question, Date.now());
+// U+0001 (SOH) is a control char that cannot appear in user-typed questions
+// or tool_use ids. sessionStorage round-trips it as the JSON escape \u0001.
+function _nsKey(sessionId: string, key: string): string {
+  return sessionId + "" + key;
 }
-function _isAuqRecentlyDismissed(question: string): boolean {
-  const t = _recentlyDismissedAuqQ.get(question);
+function _markAuqDismissed(sessionId: string, question: string) {
+  _recentlyDismissedAuqQ.set(_nsKey(sessionId, question), Date.now());
+}
+function _isAuqRecentlyDismissed(sessionId: string, question: string): boolean {
+  const k = _nsKey(sessionId, question);
+  const t = _recentlyDismissedAuqQ.get(k);
   if (!t) return false;
   if (Date.now() - t > _AUQ_SUPPRESS_MS) {
-    _recentlyDismissedAuqQ.delete(question);
+    _recentlyDismissedAuqQ.delete(k);
     return false;
   }
   return true;
+}
+function _isAuqBlockDismissed(sessionId: string, blockId: string): boolean {
+  return _dismissedAUQ.has(_nsKey(sessionId, blockId));
+}
+function _markAuqBlockDismissed(sessionId: string, blockId: string) {
+  _dismissedAUQ.add(_nsKey(sessionId, blockId));
+  _auqPersist(_dismissedAUQ);
 }
 
 // ── TodoWrite / TodoRead ──────────────────────────────────────────────────────
@@ -1698,7 +1716,8 @@ function PlanApprovalBlock({ blockId, planText, onSubmit }: {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
+function AskUserQuestionBlock({ sessionId, blockId, questions, onSubmitAnswers }: {
+  sessionId: string;
   blockId: string;
   questions: AskQuestion[];
   onSubmitAnswers: (answers: unknown[]) => void;
@@ -1732,7 +1751,7 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
   // tool_result arrives in JSONL refresh (so hasUnansweredAuq flips false) before
   // the 3s tui status poll clears pendingAuqData → pending widget renders fresh.
   const _qText = questions[0]?.question ?? "";
-  if (dismissed || _dismissedAUQ.has(blockId) || _isAuqRecentlyDismissed(_qText)) return null;
+  if (dismissed || _isAuqBlockDismissed(sessionId, blockId) || _isAuqRecentlyDismissed(sessionId, _qText)) return null;
 
   const toggleOption = (label: string) => {
     setSelections(prev => {
@@ -1772,9 +1791,8 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
   };
 
   const _dismiss = () => {
-    _dismissedAUQ.add(blockId);
-    _auqPersist(_dismissedAUQ);
-    _markAuqDismissed(_qText);
+    _markAuqBlockDismissed(sessionId, blockId);
+    _markAuqDismissed(sessionId, _qText);
     setDismissed(true);
   };
 
@@ -3134,7 +3152,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
   // is the whole point: survive compacting-induced source flickers.
   useEffect(() => {
     if (!currentAuq) return;
-    if (_dismissedAUQ.has(currentAuq.blockId) || _isAuqRecentlyDismissed(currentAuq.key)) return;
+    if (_isAuqBlockDismissed(sessionId, currentAuq.blockId) || _isAuqRecentlyDismissed(sessionId, currentAuq.key)) return;
     setStickyAuq(prev => {
       if (!prev) return currentAuq;
       // Same question → keep, but upgrade pending-blockId to JSONL-blockId
@@ -3156,7 +3174,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
   // got recently dismissed).
   useEffect(() => {
     if (!stickyAuq) return;
-    if (_dismissedAUQ.has(stickyAuq.blockId) || _isAuqRecentlyDismissed(stickyAuq.key)) {
+    if (_isAuqBlockDismissed(sessionId, stickyAuq.blockId) || _isAuqRecentlyDismissed(sessionId, stickyAuq.key)) {
       setStickyAuq(null);
     }
   }, [stickyAuq, messages, pendingAuqData]);
@@ -3886,6 +3904,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
       {stickyAuq && (
         <div style={{ flexShrink: 0, borderTop: "1px solid var(--border)", background: "var(--bg-surface)" }}>
           <AskUserQuestionBlock
+            sessionId={sessionId}
             blockId={stickyAuq.blockId}
             questions={stickyAuq.questions}
             onSubmitAnswers={(answers) => {

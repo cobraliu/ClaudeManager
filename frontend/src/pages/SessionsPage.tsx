@@ -1199,6 +1199,10 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [tuiApproveData, setTuiApproveData] = useState<TuiApproveData | null>(null);
   const [isCompacting, setIsCompacting] = useState(false);
   const [compactingProgress, setCompactingProgress] = useState<string | null>(null);
+  // Which session the above tui* states belong to. Used to gate the values at
+  // render time so a remounting ConversationPane never observes data fetched
+  // for a different session (the poll effect can only clear *after* commit).
+  const [tuiOwnerSessionId, setTuiOwnerSessionId] = useState<string | null>(null);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [modelList, setModelList] = useState<ModelInfo[]>([]);
   const [settingModel, setSettingModel] = useState(false);
@@ -1403,7 +1407,16 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
 
   // Poll hint status for active session (triggers JSONL refresh when AUQ/approval appears)
   useEffect(() => {
-    if (!activeSessionId) { setTuiHint(null); return; }
+    // Clear stale per-session TUI state synchronously on session switch so the
+    // remounted ConversationPane doesn't observe the previous session's AUQ /
+    // approval / hint before the first poll for the new session returns.
+    setTuiAuqData(null);
+    setTuiApproveData(null);
+    setTuiHint(null);
+    setIsCompacting(false);
+    setCompactingProgress(null);
+
+    if (!activeSessionId) return;
     let cancelled = false;
     const poll = async () => {
       try {
@@ -1420,12 +1433,14 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
           setTuiApproveData(st.tui_approve_data ?? null);
           setIsCompacting(!!st.is_compacting);
           setCompactingProgress(st.compacting_progress ?? null);
+          setTuiOwnerSessionId(activeSessionId);
         } else {
           setTuiHint(null);
           setTuiAuqData(null);
           setTuiApproveData(null);
           setIsCompacting(false);
           setCompactingProgress(null);
+          setTuiOwnerSessionId(activeSessionId);
         }
       } catch { /* ignore */ }
     };
@@ -2183,7 +2198,30 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               </div>
             )}
             <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "bubble" ? "flex" : "none", flexDirection: "column" }}>
-              <ConversationPane key={active.session_id + active.ws_token} sessionId={active.session_id} tool={activeSessionMeta?.tool} isStreaming={activeSessionMeta?.is_streaming} isCompacting={isCompacting} compactingProgress={compactingProgress} chatOnly={chatOnlyMode} isWaitingForAuq={!!tuiHint?.includes("asking a question")} pendingAuqData={tuiAuqData} pendingApproveData={tuiApproveData} refreshRef={convRefreshRef} />
+              {(() => {
+                // Gate every tui-derived prop on the freshness check: the
+                // value must have been polled for THIS session id, otherwise
+                // we pass nulls. Without this gate a newly-mounted
+                // ConversationPane (key changes on session switch) would
+                // observe the previous session's AUQ for one render and
+                // pin it into its stickyAuq.
+                const fresh = tuiOwnerSessionId === active.session_id;
+                return (
+                  <ConversationPane
+                    key={active.session_id + active.ws_token}
+                    sessionId={active.session_id}
+                    tool={activeSessionMeta?.tool}
+                    isStreaming={activeSessionMeta?.is_streaming}
+                    isCompacting={fresh ? isCompacting : false}
+                    compactingProgress={fresh ? compactingProgress : null}
+                    chatOnly={chatOnlyMode}
+                    isWaitingForAuq={fresh && !!tuiHint?.includes("asking a question")}
+                    pendingAuqData={fresh ? tuiAuqData : null}
+                    pendingApproveData={fresh ? tuiApproveData : null}
+                    refreshRef={convRefreshRef}
+                  />
+                );
+              })()}
             </div>
             {codeFileView && (
               <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
