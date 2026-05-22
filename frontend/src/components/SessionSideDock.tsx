@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import {
   listSessionAuqs,
   type AuqEntry,
@@ -83,6 +83,18 @@ export function SessionSideDock({
       return next;
     });
   };
+
+  // Auto-expand a section the moment it transitions from closed → open.
+  const prevOpen = useRef(open);
+  useEffect(() => {
+    const prev = prevOpen.current;
+    prevOpen.current = open;
+    (Object.keys(open) as SectionKey[]).forEach((key) => {
+      if (open[key] && !prev[key]) {
+        setSectionCollapsed(key, false);
+      }
+    });
+  }, [open]);
 
   const anyOpen = open.auqs || open.tasks || open.goals;
   if (!anyOpen) return null;

@@ -901,8 +901,11 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     return { auqs: false, tasks: false, goals: false };
   });
   const setDockSection = (key: "auqs" | "tasks" | "goals", value: boolean) => {
-    setDockOpen((prev) => {
-      const next = { ...prev, [key]: value };
+    setDockOpen(() => {
+      // Exclusive: opening one section closes all others.
+      const next = value
+        ? { auqs: false, tasks: false, goals: false, [key]: true }
+        : { auqs: false, tasks: false, goals: false };
       try { localStorage.setItem("dockOpen", JSON.stringify(next)); } catch { /* ignore */ }
       return next;
     });
