@@ -584,6 +584,164 @@ function CodeViewer({ data, scrollToFirst, diffOnly, noDiff }: { data: FileData;
   );
 }
 
+// ── Git history viewers (used by the per-file history modal) ─────────────
+
+// Map a file path's extension to an hljs language name. We deliberately keep
+// this list small — anything else falls through to "plaintext", which renders
+// safely-escaped text with no highlighting.
+function langForPath(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  const map: Record<string, string> = {
+    ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
+    py: "python", go: "go", rs: "rust", java: "java",
+    c: "c", h: "c", cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp",
+    rb: "ruby", php: "php", sh: "bash", bash: "bash", zsh: "bash",
+    md: "markdown", json: "json", jsonc: "json",
+    yaml: "yaml", yml: "yaml", toml: "ini", ini: "ini", cfg: "ini",
+    html: "xml", htm: "xml", xml: "xml",
+    css: "css", scss: "scss", less: "css",
+    sql: "sql", graphql: "graphql", gql: "graphql",
+  };
+  return map[ext] || "plaintext";
+}
+
+// Unified-diff renderer with syntax highlighting. Each line is colored by its
+// role (+/-/context/hunk) and its code content is hljs-highlighted using the
+// file's language. Mirrors the visual style of CodeViewer's per-line diff so
+// the history modal feels consistent with the main viewer.
+function HistoryDiffViewer({ diff, lang }: { diff: string; lang: string }) {
+  const safeLang = hljs.getLanguage(lang) ? lang : "plaintext";
+  const hl = (code: string) => {
+    try { return hljs.highlight(code || " ", { language: safeLang, ignoreIllegals: true }).value; }
+    catch { return (code || " ").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  };
+
+  if (!diff.trim()) {
+    return (
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 13 }}>
+        No diff available
+      </div>
+    );
+  }
+
+  const lines = diff.split("\n");
+  // Track old/new line numbers as we walk the hunks so each row gets a gutter
+  // number matching what the unified diff would show.
+  let oldLn = 0;
+  let newLn = 0;
+  const rows: Array<{
+    kind: "header" | "hunk" | "add" | "del" | "context" | "noNewline";
+    text: string;
+    oldLn: number | null;
+    newLn: number | null;
+  }> = [];
+
+  for (const raw of lines) {
+    if (raw.startsWith("@@")) {
+      const m = raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) { oldLn = parseInt(m[1]) - 1; newLn = parseInt(m[2]) - 1; }
+      rows.push({ kind: "hunk", text: raw, oldLn: null, newLn: null });
+    } else if (raw.startsWith("+++") || raw.startsWith("---") || raw.startsWith("diff --git") || raw.startsWith("index ")) {
+      rows.push({ kind: "header", text: raw, oldLn: null, newLn: null });
+    } else if (raw.startsWith("+")) {
+      newLn++;
+      rows.push({ kind: "add", text: raw.slice(1), oldLn: null, newLn });
+    } else if (raw.startsWith("-")) {
+      oldLn++;
+      rows.push({ kind: "del", text: raw.slice(1), oldLn, newLn: null });
+    } else if (raw.startsWith("\\")) {
+      rows.push({ kind: "noNewline", text: raw, oldLn: null, newLn: null });
+    } else if (raw.startsWith(" ")) {
+      oldLn++; newLn++;
+      rows.push({ kind: "context", text: raw.slice(1), oldLn, newLn });
+    }
+    // skip silently: pre-hunk garbage, blank lines
+  }
+
+  return (
+    <div style={{
+      flex: 1, overflowY: "auto", overflowX: "auto", background: "var(--bg-base)",
+      fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,"Courier New",monospace',
+      fontSize: 12, lineHeight: `${LINE_H}px`,
+    }}>
+      <table style={{ borderCollapse: "collapse", minWidth: "100%" }}>
+        <colgroup>
+          <col style={{ width: 44 }} />
+          <col style={{ width: 44 }} />
+          <col />
+        </colgroup>
+        <tbody>
+          {rows.map((row, i) => {
+            if (row.kind === "header") {
+              return (
+                <tr key={i}>
+                  <td colSpan={3} style={{
+                    padding: "1px 12px", color: "var(--text-faint)", fontSize: 11,
+                    background: "var(--bg-surface)", borderBottom: "1px solid var(--bg-hover)",
+                    whiteSpace: "pre-wrap", wordBreak: "break-all", userSelect: "none",
+                  }}>{row.text}</td>
+                </tr>
+              );
+            }
+            if (row.kind === "hunk") {
+              return (
+                <tr key={i}>
+                  <td colSpan={3} style={{
+                    padding: "2px 12px", color: "var(--accent-blue)", fontSize: 11,
+                    background: "color-mix(in srgb, var(--accent-blue) 10%, var(--bg-surface))",
+                    borderTop: "1px solid var(--bg-hover)", borderBottom: "1px solid var(--bg-hover)",
+                    whiteSpace: "pre-wrap", wordBreak: "break-all", userSelect: "none",
+                  }}>{row.text}</td>
+                </tr>
+              );
+            }
+            if (row.kind === "noNewline") {
+              return (
+                <tr key={i}>
+                  <td colSpan={3} style={{
+                    padding: "0 12px", color: "var(--text-faint)", fontSize: 11,
+                    whiteSpace: "pre-wrap", userSelect: "none",
+                  }}>{row.text}</td>
+                </tr>
+              );
+            }
+            const isAdd = row.kind === "add";
+            const isDel = row.kind === "del";
+            const bg = isAdd ? "var(--diff-add-bg)" : isDel ? "var(--diff-del-bg)" : "transparent";
+            const numColor = isAdd ? "var(--accent-green)" : isDel ? "var(--accent-red)" : "var(--text-faint)";
+            const borderLeft = isAdd
+              ? "2px solid var(--diff-add-prefix)"
+              : isDel
+                ? "2px solid var(--diff-del-prefix)"
+                : "2px solid transparent";
+            return (
+              <tr key={i} style={{ background: bg }}>
+                <td style={{
+                  textAlign: "right", paddingRight: 6, paddingLeft: 8,
+                  color: numColor, userSelect: "none", whiteSpace: "nowrap",
+                  verticalAlign: "top", fontSize: 11,
+                }}>{row.oldLn ?? ""}</td>
+                <td style={{
+                  textAlign: "right", paddingRight: 8, paddingLeft: 4,
+                  color: numColor, userSelect: "none", whiteSpace: "nowrap",
+                  verticalAlign: "top", fontSize: 11,
+                }}>{row.newLn ?? ""}</td>
+                <td style={{
+                  paddingRight: 24, paddingLeft: 8,
+                  whiteSpace: "pre-wrap", wordBreak: "break-all", verticalAlign: "top",
+                  borderLeft,
+                }}
+                  dangerouslySetInnerHTML={{ __html: hl(row.text) }}
+                />
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ── Status colors ─────────────────────────────────────────────────────────
 
 const STATUS_COLORS: Record<string, string> = {
@@ -2541,14 +2699,40 @@ export function CodePane({
                   );
                 })}
               </div>
-              {historyTarget.selected && (
-                <div style={{ flex: 1, overflow: "auto", background: "var(--bg-base)", padding: 0 }}>
-                  {historyTarget.selected.viewMode === "diff"
-                    ? <pre style={{ margin: 0, padding: 12, fontSize: 11, fontFamily: "monospace", color: "var(--text-primary)", whiteSpace: "pre", overflow: "visible" }}>{historyTarget.selected.diff || "(loading)"}</pre>
-                    : <pre style={{ margin: 0, padding: 12, fontSize: 11, fontFamily: "monospace", color: "var(--text-primary)", whiteSpace: "pre", overflow: "visible" }}>{historyTarget.selected.full || "(loading)"}</pre>
-                  }
-                </div>
-              )}
+              {historyTarget.selected && (() => {
+                const sel = historyTarget.selected;
+                const lang = langForPath(historyTarget.path);
+                const isLoading = !sel.diff && !sel.full;
+                if (isLoading) {
+                  return (
+                    <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 12 }}>
+                      Loading…
+                    </div>
+                  );
+                }
+                if (sel.viewMode === "diff") {
+                  return (
+                    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, background: "var(--bg-base)" }}>
+                      <HistoryDiffViewer diff={sel.diff} lang={lang} />
+                    </div>
+                  );
+                }
+                // Full mode: reuse the standard CodeViewer so we get
+                // line numbers + hljs highlighting identical to the file viewer.
+                const fileData: FileData = {
+                  path: historyTarget.path,
+                  content: sel.full,
+                  language: lang,
+                  added_lines: [],
+                  removed_lines: [],
+                  truncated: false,
+                };
+                return (
+                  <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, background: "var(--bg-base)" }}>
+                    <CodeViewer data={fileData} scrollToFirst={false} noDiff />
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>
