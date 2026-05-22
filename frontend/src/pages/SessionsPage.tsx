@@ -133,6 +133,14 @@ function FileCentricViewerColumn(props: {
     return "(JSONL)";
   };
 
+  const requestSingleClose = (id: string) => {
+    if (dirtyMap[id]) {
+      setPendingClose({ ids: [id], dirtyPaths: [pathFor(id)] });
+    } else {
+      onClose(id);
+    }
+  };
+
   const requestClose = (scope: "saved" | "others" | "right" | "all", anchorId: string) => {
     const anchorIdx = tabs.findIndex(t => t.id === anchorId);
     let candidates: string[];
@@ -222,8 +230,8 @@ function FileCentricViewerColumn(props: {
               </span>
               <span>{labelFor(t)}{isDirty ? " ●" : ""}</span>
               <span
-                onClick={(e) => { e.stopPropagation(); onClose(t.id); }}
-                title="Close tab"
+                onClick={(e) => { e.stopPropagation(); requestSingleClose(t.id); }}
+                title={isDirty ? "Close tab (unsaved changes — will prompt)" : "Close tab"}
                 style={{
                   marginLeft: 4, padding: "0 4px", fontSize: 12, lineHeight: 1,
                   color: "var(--text-faint)", borderRadius: 3,
