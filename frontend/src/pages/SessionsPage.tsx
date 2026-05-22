@@ -50,6 +50,8 @@ import { downloadConversationHtml } from "../lib/exportChat";
 import { SessionSideDock } from "../components/SessionSideDock";
 import { UserConfigModal } from "../components/UserConfigModal";
 import { EmbeddedTerminalPanel } from "../components/EmbeddedTerminalPanel";
+import { TextSelectionMenu } from "../components/TextSelectionMenu";
+import { AsciiflowModal } from "../components/AsciiflowModal";
 import { useUserConfig, type LayoutScheme } from "../hooks/useUserConfig";
 import { useSessionTabs, type TabEntry } from "../hooks/useSessionTabs";
 
@@ -1174,6 +1176,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [restarting, setRestarting] = useState(false);
   const [showBrowse, setShowBrowse] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
+  const [showAsciiflow, setShowAsciiflow] = useState(false);
   const { config: userConfig, patch: patchUserConfig } = useUserConfig();
   const layout = userConfig.layout;
   const isChatCentric = layout === "chat-centric";
@@ -1834,6 +1837,13 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 style={{ background: "var(--bg-hover)", color: "var(--text-secondary)", fontSize: compact ? 14 : 11, padding: compact ? "3px 7px" : "4px 8px", border: "1px solid var(--border)", borderRadius: 4, lineHeight: 1 }}
               >
                 {compact ? "⚙" : "⚙ Config"}
+              </button>
+              <button
+                onClick={() => setShowAsciiflow(true)}
+                title="ASCII diagram editor (asciiflow.com)"
+                style={{ background: "var(--bg-hover)", color: "var(--text-secondary)", fontSize: compact ? 14 : 11, padding: compact ? "3px 7px" : "4px 8px", border: "1px solid var(--border)", borderRadius: 4, lineHeight: 1 }}
+              >
+                {compact ? "▦" : "▦ ASCII"}
               </button>
             </div>
           );
@@ -2499,6 +2509,10 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         terminalFont={terminalFont}
         onTerminalFontApplied={(f) => setTerminalFont(f)}
       />
+
+      {showAsciiflow && <AsciiflowModal onClose={() => setShowAsciiflow(false)} />}
+
+      <TextSelectionMenu />
 
     </div>
   );
