@@ -5,7 +5,7 @@ import {
   getCodeChangedFiles, getCodeFile,
   listFiles, fetchRawFileBlob,
   getGitInfo,
-  searchFiles, createDir, uploadFile, renameEntry, moveEntry, deleteEntry, writeFile,
+  searchFiles, createDir, uploadFile, renameEntry, moveEntry, deleteEntry, writeFile, FileWriteConflictError,
   downloadFile,
   getFileGitLog, getFileGitShow, getFileGitDiff,
   type ChangedFile, type FileData, type FileEntry,
@@ -25,6 +25,14 @@ const MAX_TRANSFER_MB = 16;
 const MAX_TRANSFER_BYTES = MAX_TRANSFER_MB * 1024 * 1024;
 
 const POLL_MS = 8000;
+
+function humanBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
 
 // ── useResizeWidth: tracks the clientWidth of an element via ResizeObserver ──
 function useResizeWidth<T extends HTMLElement>() {
@@ -913,6 +921,13 @@ function ViewerHeader({
   onCancelEdit?: () => void;
 }) {
   const name = path.split("/").pop() ?? path;
+  const sizeText = fileData?.size != null ? humanBytes(fileData.size) : null;
+  const isTextFile = !!fileData && !fileData.is_binary && !showImage && !showSqlite;
+  const linesText = isTextFile && fileData?.total_lines != null
+    ? (fileData.truncated
+        ? `${fileData.total_lines.toLocaleString()} lines (showing first 3000)`
+        : `${fileData.total_lines.toLocaleString()} lines`)
+    : null;
   return (
     <div style={{
       padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0,
@@ -921,6 +936,13 @@ function ViewerHeader({
       <FileIcon name={name} />
       <span style={{ color: "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {path}
+        {(sizeText || linesText) && (
+          <span style={{ marginLeft: 8, color: "var(--text-faint)", fontSize: 11 }}>
+            {sizeText}
+            {sizeText && linesText ? " · " : ""}
+            {linesText}
+          </span>
+        )}
       </span>
       {selectedChanged && (
         <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 3, background: "var(--bg-hover)", color: STATUS_COLORS[selectedChanged.status] ?? "var(--text-secondary)", flexShrink: 0 }}>
@@ -1146,6 +1168,10 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const [editBuffer, setEditBuffer] = useState<string>("");
   const [saving, setSaving] = useState(false);
   const [columnMode, setColumnMode] = useState(false);
+  // mtime captured the moment the user clicked EDIT; sent on save so the
+  // backend can return 409 if the file was modified externally meanwhile.
+  const [editStartMtime, setEditStartMtime] = useState<number | null>(null);
+  const [conflict, setConflict] = useState<{ currentMtime: number | null } | null>(null);
   const editingRef = useRef(false);
   const cmRef = useRef<CodeMirrorEditorHandle | null>(null);
   const name = path.split("/").pop() ?? path;
@@ -1161,6 +1187,8 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
     setMdPreview(isMdFile(n) || isCsvFile(n));
     setEditing(false);
     setEditBuffer("");
+    setEditStartMtime(null);
+    setConflict(null);
   }, [path]);
 
   useEffect(() => {
@@ -1242,30 +1270,58 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const beginEdit = () => {
     if (!fileData || saving) return;
     setEditBuffer(fileData.content);
+    setEditStartMtime(fileData.mtime ?? null);
     setEditing(true);
     setTimeout(() => cmRef.current?.focus(), 30);
   };
 
-  const handleSave = async () => {
-    if (!fileData || saving || !isModified) return;
+  const doSave = async (force: boolean) => {
+    if (!fileData) return;
     setSaving(true);
     try {
-      await writeFile(sessionId, path, editBuffer);
+      const out = await writeFile(sessionId, path, editBuffer, {
+        expectedMtime: editStartMtime,
+        force,
+      });
       const fresh = await getCodeFile(sessionId, path).catch(() => null);
       if (fresh) setFileData(fresh);
+      else if (out.mtime != null) setEditStartMtime(out.mtime);
       setEditing(false);
       setEditBuffer("");
+      setEditStartMtime(null);
+      setConflict(null);
     } catch (e) {
-      alert(String(e));
+      if (e instanceof FileWriteConflictError) {
+        setConflict({ currentMtime: e.current_mtime });
+      } else {
+        alert(String(e));
+      }
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSave = () => {
+    if (!fileData || saving || !isModified) return;
+    void doSave(false);
+  };
+
+  const reloadFromDisk = async () => {
+    const fresh = await getCodeFile(sessionId, path).catch(() => null);
+    if (fresh) {
+      setFileData(fresh);
+      setEditBuffer(fresh.content);
+      setEditStartMtime(fresh.mtime ?? null);
+    }
+    setConflict(null);
   };
 
   const cancelEdit = () => {
     if (saving) return;
     setEditing(false);
     setEditBuffer("");
+    setEditStartMtime(null);
+    setConflict(null);
   };
 
   return (
@@ -1354,6 +1410,77 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
           mdPreview={mdPreview}
           noDiff={noDiff}
         />
+      )}
+      {conflict && (
+        <div
+          onClick={() => setConflict(null)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 110,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              minWidth: 380, maxWidth: 560,
+              background: "var(--bg-modal)", border: "1px solid var(--border)",
+              borderRadius: 6, padding: "14px 16px",
+              boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+              display: "flex", flexDirection: "column", gap: 10,
+              fontSize: 12, color: "var(--text-body)",
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-orange, #d59f00)" }}>
+              File modified externally
+            </div>
+            <div style={{ color: "var(--text-secondary)" }}>
+              <code style={{ color: "var(--text-body)" }}>{path}</code> changed on disk after you started editing.
+              Saving now would overwrite those changes.
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
+              <button
+                onClick={() => setConflict(null)}
+                disabled={saving}
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: saving ? "default" : "pointer",
+                  background: "var(--bg-surface)", color: "var(--text-body)",
+                  border: "1px solid var(--border)", borderRadius: 3,
+                  opacity: saving ? 0.6 : 1,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { void reloadFromDisk(); }}
+                disabled={saving}
+                title="Discard your edits and reload the on-disk version"
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: saving ? "default" : "pointer",
+                  background: "var(--bg-surface)", color: "var(--text-body)",
+                  border: "1px solid var(--border)", borderRadius: 3,
+                  opacity: saving ? 0.6 : 1,
+                }}
+              >
+                Reload from disk
+              </button>
+              <button
+                onClick={() => { void doSave(true); }}
+                disabled={saving}
+                title="Overwrite the on-disk file with your edits"
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: saving ? "default" : "pointer",
+                  background: "var(--accent-orange, #d59f00)", color: "#1c2128",
+                  border: "1px solid var(--accent-orange, #d59f00)", borderRadius: 3,
+                  fontWeight: 600,
+                  opacity: saving ? 0.6 : 1,
+                }}
+              >
+                {saving ? "Saving…" : "Force overwrite"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

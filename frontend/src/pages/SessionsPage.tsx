@@ -100,7 +100,10 @@ function FileCentricViewerColumn(props: {
   }, [tabs]);
 
   // Open dropdown menu (per-tab); pendingClose drives the dirty-confirm modal.
+  // Menu is position:fixed because the tab bar uses overflow:hidden — an
+  // absolute child would be clipped. Coords are captured from the trigger.
   const [menuTabId, setMenuTabId] = useState<string | null>(null);
+  const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null);
   const [pendingClose, setPendingClose] = useState<{ ids: string[]; dirtyPaths: string[] } | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -108,9 +111,12 @@ function FileCentricViewerColumn(props: {
     const onDown = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuTabId(null);
+        setMenuPos(null);
       }
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setMenuTabId(null); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { setMenuTabId(null); setMenuPos(null); }
+    };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
     return () => {
@@ -141,6 +147,7 @@ function FileCentricViewerColumn(props: {
       candidates = tabs.map(t => t.id);
     }
     setMenuTabId(null);
+    setMenuPos(null);
     if (candidates.length === 0) return;
     if (scope === "saved") {
       onCloseMany(candidates);
@@ -225,7 +232,13 @@ function FileCentricViewerColumn(props: {
                 onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-faint)"; }}
               >×</span>
               <span
-                onClick={(e) => { e.stopPropagation(); setMenuTabId(menuOpen ? null : t.id); }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (menuOpen) { setMenuTabId(null); setMenuPos(null); return; }
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setMenuPos({ top: r.bottom + 2, right: Math.max(4, window.innerWidth - r.right) });
+                  setMenuTabId(t.id);
+                }}
                 title="Close options"
                 style={{
                   marginLeft: 1, padding: "0 4px", fontSize: 10, lineHeight: 1,
@@ -235,37 +248,6 @@ function FileCentricViewerColumn(props: {
                 onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--accent-orange, #d59f00) 22%, transparent)"; }}
                 onMouseLeave={(e) => { if (!menuOpen) e.currentTarget.style.background = "transparent"; }}
               >▾</span>
-              {menuOpen && (
-                <div
-                  ref={menuRef}
-                  onClick={(e) => e.stopPropagation()}
-                  style={{
-                    position: "absolute", top: "100%", right: 0, marginTop: 2,
-                    minWidth: 180, zIndex: 50,
-                    background: "var(--bg-modal)", border: "1px solid var(--border)",
-                    borderRadius: 4, padding: 4,
-                    boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
-                    fontSize: 11, color: "var(--text-body)",
-                  }}
-                >
-                  {([
-                    { key: "saved", label: "Close Saved" },
-                    { key: "others", label: "Close Others" },
-                    { key: "right", label: "Close to the Right" },
-                    { key: "all", label: "Close All" },
-                  ] as const).map(item => (
-                    <div
-                      key={item.key}
-                      onClick={() => requestClose(item.key, t.id)}
-                      style={{ padding: "5px 10px", cursor: "pointer", borderRadius: 3 }}
-                      onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
-                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
-                    >
-                      {item.label}
-                    </div>
-                  ))}
-                </div>
-              )}
             </div>
           );
         })}
@@ -316,6 +298,37 @@ function FileCentricViewerColumn(props: {
           );
         })}
       </div>
+      {menuTabId && menuPos && (
+        <div
+          ref={menuRef}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed", top: menuPos.top, right: menuPos.right,
+            minWidth: 180, zIndex: 90,
+            background: "var(--bg-modal)", border: "1px solid var(--border)",
+            borderRadius: 4, padding: 4,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+            fontSize: 11, color: "var(--text-body)",
+          }}
+        >
+          {([
+            { key: "saved", label: "Close Saved" },
+            { key: "others", label: "Close Others" },
+            { key: "right", label: "Close to the Right" },
+            { key: "all", label: "Close All" },
+          ] as const).map(item => (
+            <div
+              key={item.key}
+              onClick={() => requestClose(item.key, menuTabId)}
+              style={{ padding: "5px 10px", cursor: "pointer", borderRadius: 3 }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+            >
+              {item.label}
+            </div>
+          ))}
+        </div>
+      )}
       {pendingClose && (
         <div
           onClick={() => setPendingClose(null)}

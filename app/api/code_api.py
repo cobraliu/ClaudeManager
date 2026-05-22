@@ -221,6 +221,7 @@ def get_file(
         raise HTTPException(status_code=400, detail="Not a file")
 
     try:
+        st = target.stat()
         raw_head = target.read_bytes()[:8192]
     except OSError as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -230,7 +231,8 @@ def get_file(
         return {
             "path": path,
             "is_binary": True,
-            "size": target.stat().st_size,
+            "size": st.st_size,
+            "mtime": st.st_mtime,
             "content": "",
             "language": "binary",
             "added_lines": [],
@@ -243,11 +245,12 @@ def get_file(
     except OSError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Limit to 3000 lines to avoid huge payloads
-    lines = content.splitlines()
-    truncated = len(lines) > 3000
+    # Total line count BEFORE truncation — caller may show "1234 lines (showing first 3000)".
+    all_lines = content.splitlines()
+    total_lines = len(all_lines)
+    truncated = total_lines > 3000
     if truncated:
-        lines = lines[:3000]
+        lines = all_lines[:3000]
         content = "\n".join(lines)
 
     language = _EXT_LANG.get(target.suffix.lower(), "plaintext")
@@ -278,6 +281,9 @@ def get_file(
         "removed_lines": sorted(removed),
         "truncated": truncated,
         "diff_raw": diff_out,
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+        "total_lines": total_lines,
     }
 
 

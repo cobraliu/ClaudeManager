@@ -135,6 +135,12 @@ class FileContent(BaseModel):
 class FileWriteRequest(BaseModel):
     path: str
     content: str
+    # Optional optimistic-lock token captured when the client started editing.
+    # If present and the on-disk mtime differs, the server returns 409 so the
+    # client can warn the user before clobbering an external change. Pass
+    # force=true to skip the check and overwrite anyway.
+    expected_mtime: float | None = None
+    force: bool = False
 
 
 class SqliteResponse(BaseModel):
@@ -490,12 +496,12 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.put("/{session_id}/fs/write", status_code=status.HTTP_204_NO_CONTENT)
+@router.put("/{session_id}/fs/write")
 def write_file(
     session_id: str,
     body: FileWriteRequest,
     user_id: CurrentUser = None,  # type: ignore[assignment]
-) -> None:
+) -> dict:
     store = _get_store()
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
@@ -509,11 +515,30 @@ def write_file(
     if len(body.content.encode("utf-8")) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="content too large (>1MB)")
 
+    if body.expected_mtime is not None and not body.force and target.exists():
+        try:
+            current_mtime = target.stat().st_mtime
+        except OSError:
+            current_mtime = None
+        # 1 ms tolerance — some filesystems round mtime; floating-point equality
+        # would false-positive a "conflict" that isn't one.
+        if current_mtime is not None and abs(current_mtime - body.expected_mtime) > 0.001:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "file was modified externally since editing began",
+                    "current_mtime": current_mtime,
+                    "expected_mtime": body.expected_mtime,
+                },
+            )
+
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body.content, encoding="utf-8")
+        new_mtime = target.stat().st_mtime
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"mtime": new_mtime}
 
 
 SQLITE_ROW_LIMIT = 500

@@ -704,15 +704,57 @@ export async function extractToDir(targetDir: string, file: File): Promise<{ pat
   return resp.json();
 }
 
-export function writeFile(
+export class FileWriteConflictError extends Error {
+  current_mtime: number | null;
+  expected_mtime: number | null;
+  constructor(currentMtime: number | null, expectedMtime: number | null, message?: string) {
+    super(message || "file was modified externally since editing began");
+    this.current_mtime = currentMtime;
+    this.expected_mtime = expectedMtime;
+  }
+}
+
+export async function writeFile(
   sessionId: string,
   path: string,
-  content: string
-): Promise<void> {
-  return request(`/api/sessions/${sessionId}/fs/write`, {
+  content: string,
+  opts?: { expectedMtime?: number | null; force?: boolean },
+): Promise<{ mtime: number | null }> {
+  const token = getToken();
+  const resp = await fetch(`/api/sessions/${sessionId}/fs/write`, {
     method: "PUT",
-    body: JSON.stringify({ path, content }),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      path,
+      content,
+      expected_mtime: opts?.expectedMtime ?? null,
+      force: !!opts?.force,
+    }),
   });
+  if (resp.status === 401) {
+    localStorage.removeItem("token");
+    window.location.reload();
+    throw new Error("unauthorized");
+  }
+  if (resp.status === 409) {
+    const body = await resp.json().catch(() => ({}));
+    const d = body?.detail;
+    if (d && typeof d === "object") {
+      throw new FileWriteConflictError(d.current_mtime ?? null, d.expected_mtime ?? null, d.message);
+    }
+    throw new FileWriteConflictError(null, null);
+  }
+  if (!resp.ok) {
+    const text = await resp.text();
+    let msg = text;
+    try {
+      const j = JSON.parse(text);
+      if (typeof j?.detail === "string") msg = j.detail;
+    } catch { /* */ }
+    throw new Error(msg || `HTTP ${resp.status}`);
+  }
+  const out = await resp.json().catch(() => ({}));
+  return { mtime: out?.mtime ?? null };
 }
 
 // Scheduled Tasks
@@ -1230,6 +1272,8 @@ export interface FileData {
   diff_raw?: string;
   is_binary?: boolean;
   size?: number;
+  mtime?: number;
+  total_lines?: number;
 }
 
 export interface TreeNode {
