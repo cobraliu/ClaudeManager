@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.agents.base import AgentAdapter, AgentKind
 from app.agents.claude import get as _claude
+from app.agents.codex import get as _codex
 from app.agents.cursor import get as _cursor
 
 
@@ -14,12 +15,13 @@ def get_adapter(tool: str) -> AgentAdapter:
     """
     if tool == "cursor":
         return _cursor()
-    # claude (or anything else for now — Codex slot will hook in via #170+1)
+    if tool == "codex":
+        return _codex()
     return _claude()
 
 
 def list_supported_tools() -> list[AgentKind]:
-    return ["claude", "cursor"]
+    return ["claude", "cursor", "codex"]
 
 
 __all__ = ["AgentAdapter", "AgentKind", "get_adapter", "list_supported_tools"]

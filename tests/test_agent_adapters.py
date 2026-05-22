@@ -25,7 +25,11 @@ def test_registry_returns_correct_kinds():
 
 
 def test_registry_lists_supported_tools():
-    assert set(list_supported_tools()) == {"claude", "cursor"}
+    assert set(list_supported_tools()) == {"claude", "cursor", "codex"}
+
+
+def test_registry_routes_codex():
+    assert get_adapter("codex").kind == "codex"
 
 
 def test_claude_adapter_protocol_conformance():

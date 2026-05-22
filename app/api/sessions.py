@@ -374,8 +374,8 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
     store.transition(session.id, SessionStatus.RUNNING)
     audit_event(user_id, "create", session.id, {"project": body.project, "tool": body.tool})
 
-    # For cursor sessions, resume_session_id IS the cursor chat ID — store it immediately.
-    if body.tool == "cursor" and body.resume_session_id:
+    # For cursor/codex sessions, resume_session_id IS the agent session UUID — store immediately.
+    if body.tool in ("cursor", "codex") and body.resume_session_id:
         store.update_claude_session_id(session.id, body.resume_session_id)
 
     if body.tool == "claude":
@@ -390,6 +390,21 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
                 store.update_claude_session_id(session.id, claude_sid)
 
         threading.Thread(target=_resolve, daemon=True).start()
+    elif body.tool == "codex" and is_new:
+        # Fresh Codex session: poll for the newest rollout file in cwd to pick up
+        # the session UUID once the CLI has written its session_meta line.
+        def _resolve_codex():
+            from app.agents import get_adapter
+            adapter = get_adapter("codex")
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                sid = adapter.find_newest_session_id(cwd)
+                if sid:
+                    store.update_claude_session_id(session.id, sid)
+                    return
+                time.sleep(1.0)
+
+        threading.Thread(target=_resolve_codex, daemon=True).start()
 
     return session
 
@@ -511,6 +526,15 @@ def browse_cursor_sessions(user_id: CurrentUser) -> list[dict]:
     store = _get_store()
     occupied = store.get_all_claude_session_ids()
     return list_all_cursor_sessions_global(occupied)
+
+
+@router.get("/external-codex")
+def browse_codex_sessions(user_id: CurrentUser) -> list[dict]:
+    """Return all Codex sessions from ~/.codex/sessions/ not already in ClaudeManager."""
+    from app.services.codex_session_reader import list_all_codex_sessions_global as _list_codex
+    store = _get_store()
+    occupied = store.get_all_claude_session_ids()
+    return _list_codex(occupied)
 
 
 @router.get("/external-preview")
