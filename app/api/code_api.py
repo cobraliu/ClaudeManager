@@ -272,8 +272,11 @@ def get_file(
     all_lines = content.splitlines()
     total_lines = len(all_lines)
     truncated = total_lines > 3000
+    # `lines` is the slice we actually render — same as `all_lines` for small
+    # files, capped at 3000 for huge ones. The untracked-file branch below
+    # references it unconditionally, so we must assign in both cases.
+    lines = all_lines[:3000] if truncated else all_lines
     if truncated:
-        lines = all_lines[:3000]
         content = "\n".join(lines)
 
     language = _EXT_LANG.get(target.suffix.lower(), "plaintext")
