@@ -3097,6 +3097,70 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
     return false;
   }, [messages, toolResults]);
 
+  // ── Pinned (sticky) AUQ ──────────────────────────────────────────────────
+  // Compaction rewrites JSONL and can briefly empty both AUQ sources
+  // (pendingAuqData → null, unanswered tool_use → gone or moved). If we only
+  // render based on the live signal, the widget unmounts mid-flight and the
+  // user cannot answer → deadlock. So we capture whichever question surfaces
+  // first into stickyAuq and hold onto it across signal flickers. We render
+  // it in a dedicated pinned container above the status banner so other
+  // chat-area content can't push it off-screen or supersede it.
+  const currentAuq = useMemo<{ blockId: string; questions: AskQuestion[]; key: string } | null>(() => {
+    for (const m of messages) {
+      if (m.type !== "assistant" || !m.message) continue;
+      const blocks = getBlocks(m.message.content as RawContentBlock[] | string);
+      for (const b of blocks) {
+        if (b.type === "tool_use" && b.name === "AskUserQuestion" && b.id && !toolResults.has(b.id)) {
+          const inp = b.input as Record<string, unknown>;
+          const qs = Array.isArray(inp?.questions) ? inp.questions as AskQuestion[] : [];
+          if (qs.length > 0 && qs[0].question) {
+            return { blockId: b.id, questions: qs, key: qs[0].question };
+          }
+        }
+      }
+    }
+    if (pendingAuqData) {
+      const qs = _normalizePendingAuq(pendingAuqData);
+      if (qs.length > 0 && qs[0].question) {
+        return { blockId: "__pending_auq__:" + qs[0].question, questions: qs, key: qs[0].question };
+      }
+    }
+    return null;
+  }, [messages, toolResults, pendingAuqData]);
+
+  const [stickyAuq, setStickyAuq] = useState<{ blockId: string; questions: AskQuestion[]; key: string } | null>(null);
+
+  // Capture / replace stickyAuq from live sources. Never clear on null — that
+  // is the whole point: survive compacting-induced source flickers.
+  useEffect(() => {
+    if (!currentAuq) return;
+    if (_dismissedAUQ.has(currentAuq.blockId) || _isAuqRecentlyDismissed(currentAuq.key)) return;
+    setStickyAuq(prev => {
+      if (!prev) return currentAuq;
+      // Same question → keep, but upgrade pending-blockId to JSONL-blockId
+      // once JSONL catches up (real blockId is needed for dedup against the
+      // inline render path).
+      if (prev.key === currentAuq.key) {
+        if (prev.blockId.startsWith("__pending_auq__:") && !currentAuq.blockId.startsWith("__pending_auq__:")) {
+          return { ...prev, blockId: currentAuq.blockId };
+        }
+        return prev;
+      }
+      // Different question — supersede.
+      return currentAuq;
+    });
+  }, [currentAuq]);
+
+  // Drop stickyAuq once it's marked dismissed elsewhere (e.g., another tab
+  // answered, or the question is no longer surfacing from any source and
+  // got recently dismissed).
+  useEffect(() => {
+    if (!stickyAuq) return;
+    if (_dismissedAUQ.has(stickyAuq.blockId) || _isAuqRecentlyDismissed(stickyAuq.key)) {
+      setStickyAuq(null);
+    }
+  }, [stickyAuq, messages, pendingAuqData]);
+
   // Build map: compact_boundary uuid → compact summary text
   const compactSummaries = useMemo(() => {
     const map = new Map<string, string>();
@@ -3684,35 +3748,28 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                   requestAnimationFrame(() => scrollToBottom(true));
                 };
 
-                // AskUserQuestion tool_use block (unanswered) — shown in all modes
+                // AskUserQuestion tool_use block (unanswered) — render the
+                // surrounding message text only; the interactive widget is
+                // pinned above the status banner so it survives compaction.
                 const auqBlock = blocks.find(b => b.type === "tool_use" && b.name === "AskUserQuestion" && !toolResults.has(b.id!));
                 if (auqBlock) {
                   const inp = auqBlock.input as Record<string, unknown>;
                   const rawQs = Array.isArray(inp?.questions) ? inp.questions as AskQuestion[] : [];
                   if (rawQs.length > 0) {
                     return (
-                      <React.Fragment key={uid}>
-                        {/* hideAuqDisplay=true: interactive block below already shows the question */}
-                        <MessageEntry
-                          entry={entry}
-                          toolResults={toolResults}
-                          compactSummaries={compactSummaries}
-                          isActiveThinking={isActiveThinking}
-                          isNewCompact={newCompactUuids.has(entry.uuid || "")}
-                          sessionId={sessionId}
-                          subagentsByDesc={subagentsByDesc}
-                          chatOnly={chatOnly}
-                          hideAuqDisplay
-                          onRewindMessage={handleRewindMessage}
-                        />
-                        <AskUserQuestionBlock
-                          blockId={auqBlock.id!}
-                          questions={rawQs}
-                          onSubmitAnswers={(answers) => {
-                            submitAuqAnswers(sessionId, answers, rawQs);
-                          }}
-                        />
-                      </React.Fragment>
+                      <MessageEntry
+                        key={uid}
+                        entry={entry}
+                        toolResults={toolResults}
+                        compactSummaries={compactSummaries}
+                        isActiveThinking={isActiveThinking}
+                        isNewCompact={newCompactUuids.has(entry.uuid || "")}
+                        sessionId={sessionId}
+                        subagentsByDesc={subagentsByDesc}
+                        chatOnly={chatOnly}
+                        hideAuqDisplay
+                        onRewindMessage={handleRewindMessage}
+                      />
                     );
                   }
                 }
@@ -3802,18 +3859,6 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                 <span style={{ fontSize: 10, color: "var(--text-faintest)", marginTop: 2, paddingRight: 2 }}>sending…</span>
               </div>
             ))}
-            {/* Pending AUQ from hook/screen — shown when JSONL hasn't been written yet */}
-            {pendingAuqData && !hasUnansweredAuq && optimisticMsgs.length === 0 && (() => {
-              const qs = _normalizePendingAuq(pendingAuqData);
-              if (qs.length === 0 || !qs[0].question) return null;
-              return (
-                <AskUserQuestionBlock
-                  blockId={"__pending_auq__:" + qs[0].question}
-                  questions={qs}
-                  onSubmitAnswers={(answers) => submitAuqAnswers(sessionId, answers, qs)}
-                />
-              );
-            })()}
             {/* Pending tool approval from hooks — shown when Claude is waiting for permission */}
             {pendingApproveData && optimisticMsgs.length === 0 && (
               <ToolApprovalBlock
@@ -3833,6 +3878,23 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
           </div>
         )}
       </div>
+
+      {/* Pinned AUQ — sits between the scrolling chat and the status banner.
+          Sources can flicker during compaction; stickyAuq holds the question
+          across those flickers so the user can always answer. flexShrink:0
+          guarantees nothing else can squeeze it out of the column. */}
+      {stickyAuq && (
+        <div style={{ flexShrink: 0, borderTop: "1px solid var(--border)", background: "var(--bg-surface)" }}>
+          <AskUserQuestionBlock
+            blockId={stickyAuq.blockId}
+            questions={stickyAuq.questions}
+            onSubmitAnswers={(answers) => {
+              submitAuqAnswers(sessionId, answers, stickyAuq.questions);
+              setStickyAuq(null);
+            }}
+          />
+        </div>
+      )}
 
       {/* Status banner – three states: compacting (orange + progress) / responding (stop button) / idle (faint). */}
       {!chatOnly && wsStatus === "connected" && (() => {
