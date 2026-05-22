@@ -68,8 +68,91 @@ function FileCentricViewerColumn(props: {
   activeTabId: string | null;
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
+  onCloseMany: (ids: string[]) => void;
 }) {
-  const { sessionId, sessionMeta, tabs, activeTabId, onActivate, onClose } = props;
+  const { sessionId, sessionMeta, tabs, activeTabId, onActivate, onClose, onCloseMany } = props;
+
+  // Per-tab dirty flag, reported up by FileViewerPane via onDirtyChange.
+  // Git/JSONL tabs are never dirty (absent from the map = treated as clean).
+  const [dirtyMap, setDirtyMap] = useState<Record<string, boolean>>({});
+  const setTabDirty = useCallback((tabId: string, dirty: boolean) => {
+    setDirtyMap(prev => {
+      const cur = !!prev[tabId];
+      if (cur === dirty) return prev;
+      const next = { ...prev };
+      if (dirty) next[tabId] = true;
+      else delete next[tabId];
+      return next;
+    });
+  }, []);
+  // Prune dirty entries for tabs that no longer exist.
+  useEffect(() => {
+    setDirtyMap(prev => {
+      const alive = new Set(tabs.map(t => t.id));
+      let changed = false;
+      const next: Record<string, boolean> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        if (alive.has(k)) next[k] = v;
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [tabs]);
+
+  // Open dropdown menu (per-tab); pendingClose drives the dirty-confirm modal.
+  const [menuTabId, setMenuTabId] = useState<string | null>(null);
+  const [pendingClose, setPendingClose] = useState<{ ids: string[]; dirtyPaths: string[] } | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!menuTabId) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuTabId(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setMenuTabId(null); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menuTabId]);
+
+  const pathFor = (id: string): string => {
+    const t = tabs.find(x => x.id === id);
+    if (!t) return id;
+    if (t.kind === "file") return t.path;
+    if (t.kind === "git") return "(Git)";
+    return "(JSONL)";
+  };
+
+  const requestClose = (scope: "saved" | "others" | "right" | "all", anchorId: string) => {
+    const anchorIdx = tabs.findIndex(t => t.id === anchorId);
+    let candidates: string[];
+    if (scope === "saved") {
+      // Always safe: skip every dirty file tab.
+      candidates = tabs.filter(t => !dirtyMap[t.id]).map(t => t.id);
+    } else if (scope === "others") {
+      candidates = tabs.filter(t => t.id !== anchorId).map(t => t.id);
+    } else if (scope === "right") {
+      candidates = anchorIdx < 0 ? [] : tabs.slice(anchorIdx + 1).map(t => t.id);
+    } else {
+      candidates = tabs.map(t => t.id);
+    }
+    setMenuTabId(null);
+    if (candidates.length === 0) return;
+    if (scope === "saved") {
+      onCloseMany(candidates);
+      return;
+    }
+    const dirtyIds = candidates.filter(id => dirtyMap[id]);
+    if (dirtyIds.length === 0) {
+      onCloseMany(candidates);
+      return;
+    }
+    setPendingClose({ ids: candidates, dirtyPaths: dirtyIds.map(pathFor) });
+  };
 
   const labelFor = (t: TabEntry): string => {
     if (t.kind === "file") {
@@ -107,12 +190,15 @@ function FileCentricViewerColumn(props: {
         )}
         {tabs.map(t => {
           const isActive = t.id === activeTabId;
+          const isDirty = !!dirtyMap[t.id];
+          const menuOpen = menuTabId === t.id;
           return (
             <div
               key={t.id}
               onClick={() => onActivate(t.id)}
               title={titleFor(t)}
               style={{
+                position: "relative",
                 display: "flex", alignItems: "center", gap: 4,
                 padding: "4px 8px 4px 10px", cursor: "pointer",
                 fontSize: 11, color: isActive ? "var(--text-body)" : "var(--text-faint)",
@@ -127,7 +213,7 @@ function FileCentricViewerColumn(props: {
               <span style={{ fontSize: 9, opacity: 0.7 }}>
                 {t.kind === "file" ? "📄" : t.kind === "git" ? "⎇" : "📋"}
               </span>
-              <span>{labelFor(t)}</span>
+              <span>{labelFor(t)}{isDirty ? " ●" : ""}</span>
               <span
                 onClick={(e) => { e.stopPropagation(); onClose(t.id); }}
                 title="Close tab"
@@ -138,6 +224,48 @@ function FileCentricViewerColumn(props: {
                 onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text-body)"; }}
                 onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-faint)"; }}
               >×</span>
+              <span
+                onClick={(e) => { e.stopPropagation(); setMenuTabId(menuOpen ? null : t.id); }}
+                title="Close options"
+                style={{
+                  marginLeft: 1, padding: "0 4px", fontSize: 10, lineHeight: 1,
+                  color: "var(--accent-orange, #d59f00)", borderRadius: 3,
+                  background: menuOpen ? "color-mix(in srgb, var(--accent-orange, #d59f00) 18%, transparent)" : "transparent",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--accent-orange, #d59f00) 22%, transparent)"; }}
+                onMouseLeave={(e) => { if (!menuOpen) e.currentTarget.style.background = "transparent"; }}
+              >▾</span>
+              {menuOpen && (
+                <div
+                  ref={menuRef}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    position: "absolute", top: "100%", right: 0, marginTop: 2,
+                    minWidth: 180, zIndex: 50,
+                    background: "var(--bg-modal)", border: "1px solid var(--border)",
+                    borderRadius: 4, padding: 4,
+                    boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+                    fontSize: 11, color: "var(--text-body)",
+                  }}
+                >
+                  {([
+                    { key: "saved", label: "Close Saved" },
+                    { key: "others", label: "Close Others" },
+                    { key: "right", label: "Close to the Right" },
+                    { key: "all", label: "Close All" },
+                  ] as const).map(item => (
+                    <div
+                      key={item.key}
+                      onClick={() => requestClose(item.key, t.id)}
+                      style={{ padding: "5px 10px", cursor: "pointer", borderRadius: 3 }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                    >
+                      {item.label}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           );
         })}
@@ -170,6 +298,7 @@ function FileCentricViewerColumn(props: {
                   path={t.path}
                   viewMode={t.viewMode}
                   noDiff={t.noDiff}
+                  onDirtyChange={(d) => setTabDirty(t.id, d)}
                 />
               )}
               {t.kind === "git" && (
@@ -187,6 +316,68 @@ function FileCentricViewerColumn(props: {
           );
         })}
       </div>
+      {pendingClose && (
+        <div
+          onClick={() => setPendingClose(null)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 100,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              minWidth: 380, maxWidth: 560, maxHeight: "70vh",
+              background: "var(--bg-modal)", border: "1px solid var(--border)",
+              borderRadius: 6, padding: "14px 16px",
+              boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+              display: "flex", flexDirection: "column", gap: 10,
+              fontSize: 12, color: "var(--text-body)",
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-orange, #d59f00)" }}>
+              Unsaved changes will be lost
+            </div>
+            <div style={{ color: "var(--text-secondary)" }}>
+              The following {pendingClose.dirtyPaths.length === 1 ? "file has" : "files have"} unsaved edits:
+            </div>
+            <div style={{
+              overflow: "auto", maxHeight: "40vh",
+              background: "var(--bg-base)", border: "1px solid var(--border-subtle)",
+              borderRadius: 4, padding: "6px 8px",
+              fontFamily: "var(--font-mono, monospace)", fontSize: 11,
+            }}>
+              {pendingClose.dirtyPaths.map((p, i) => (
+                <div key={i} style={{ padding: "2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={p}>{p}</div>
+              ))}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4 }}>
+              <button
+                onClick={() => setPendingClose(null)}
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                  background: "var(--bg-surface)", color: "var(--text-body)",
+                  border: "1px solid var(--border)", borderRadius: 3,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { const ids = pendingClose.ids; setPendingClose(null); onCloseMany(ids); }}
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                  background: "var(--accent-orange, #d59f00)", color: "#1c2128",
+                  border: "1px solid var(--accent-orange, #d59f00)", borderRadius: 3,
+                  fontWeight: 600,
+                }}
+              >
+                Discard &amp; Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1780,6 +1971,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   activeTabId={sessionTabs.activeId}
                   onActivate={sessionTabs.activate}
                   onClose={sessionTabs.closeTab}
+                  onCloseMany={sessionTabs.closeTabs}
                 />
                 <div
                   onMouseDown={startFcChatDrag}

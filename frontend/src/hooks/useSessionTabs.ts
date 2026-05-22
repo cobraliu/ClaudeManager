@@ -124,6 +124,34 @@ export function useSessionTabs(sessionId: string | null) {
     });
   }, []);
 
+  const closeTabs = useCallback((ids: string[]) => {
+    if (ids.length === 0) return;
+    setState(prev => {
+      const closing = new Set(ids);
+      const next = prev.tabs.filter(t => !closing.has(t.id));
+      let activeId = prev.activeId;
+      if (activeId && closing.has(activeId)) {
+        if (next.length === 0) {
+          activeId = null;
+        } else {
+          // Pick the closest surviving tab to the original active position.
+          const origIdx = prev.tabs.findIndex(t => t.id === activeId);
+          let pick: string | null = null;
+          for (let i = origIdx + 1; i < prev.tabs.length; i++) {
+            if (!closing.has(prev.tabs[i].id)) { pick = prev.tabs[i].id; break; }
+          }
+          if (!pick) {
+            for (let i = origIdx - 1; i >= 0; i--) {
+              if (!closing.has(prev.tabs[i].id)) { pick = prev.tabs[i].id; break; }
+            }
+          }
+          activeId = pick ?? next[0].id;
+        }
+      }
+      return { tabs: next, activeId };
+    });
+  }, []);
+
   const activate = useCallback((id: string) => {
     setState(prev => prev.activeId === id ? prev : { ...prev, activeId: id });
   }, []);
@@ -138,6 +166,7 @@ export function useSessionTabs(sessionId: string | null) {
     openGitTab,
     openJsonlTab,
     closeTab,
+    closeTabs,
     activate,
   };
 }

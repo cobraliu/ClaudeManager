@@ -1131,11 +1131,12 @@ function ViewerContent({
 
 // ── FileViewerPane — standalone file viewer (used in main layout) ─────────
 
-export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full", noDiff }: {
+export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full", noDiff, onDirtyChange }: {
   sessionId: string;
   path: string;
   viewMode?: "full" | "diff" | "split";
   noDiff?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [fileData, setFileData] = useState<FileData | null>(null);
   const [fileLoading, setFileLoading] = useState(true);
@@ -1221,6 +1222,14 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
 
   const canEdit = !!fileData && !fileData.is_binary && !showSqlite && !showArchive && !showPdf && !showImage;
   const isModified = editing && !!fileData && editBuffer !== fileData.content;
+
+  useEffect(() => {
+    onDirtyChange?.(isModified);
+  }, [isModified, onDirtyChange]);
+  useEffect(() => {
+    return () => { onDirtyChange?.(false); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const onDownload = async () => {
     if (fileData?.size != null && fileData.size > MAX_TRANSFER_BYTES) {
