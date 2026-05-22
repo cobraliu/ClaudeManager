@@ -1710,40 +1710,41 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         </div>
       )}
 
-      {/* ── File-centric: Viewer column with tabs + content (always visible, flex 1) ── */}
-      {isFileCentric && active && activeSessionMeta && (
-        <>
-          <FileCentricViewerColumn
-            sessionId={active.session_id}
-            sessionMeta={activeSessionMeta}
-            tabs={sessionTabs.tabs}
-            activeTabId={sessionTabs.activeId}
-            onActivate={sessionTabs.activate}
-            onClose={sessionTabs.closeTab}
-          />
-          <div
-            onMouseDown={startFcChatDrag}
-            title="Drag to resize chat column"
-            style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
-            onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
-            onMouseLeave={(e) => { if (!fcChatDragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
-          />
-        </>
-      )}
-
-      {/* ── Right: File viewer (when file selected) ── */}
-      {/* ── Right: Conversation / TUI ── */}
+      {/* ── Right side: viewer column (file-centric only) + chat + bottom bar ── */}
       <div style={{
-        ...(isFileCentric
-          ? { width: userConfig.fileCentricChatWidth, flexShrink: 0, minWidth: 320 }
-          : { flex: "1 1 0%", minWidth: 0 }),
+        flex: "1 1 0%", minWidth: 0,
         minHeight: 0, overflow: "hidden", background: "var(--bg-base)",
         display: "flex", flexDirection: "column",
         order: isChatCentric ? 2 : 0,
       }}>
         {active ? (
+          <>
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "row", overflow: "hidden" }}>
-            <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            {isFileCentric && activeSessionMeta && (
+              <>
+                <FileCentricViewerColumn
+                  sessionId={active.session_id}
+                  sessionMeta={activeSessionMeta}
+                  tabs={sessionTabs.tabs}
+                  activeTabId={sessionTabs.activeId}
+                  onActivate={sessionTabs.activate}
+                  onClose={sessionTabs.closeTab}
+                />
+                <div
+                  onMouseDown={startFcChatDrag}
+                  title="Drag to resize chat column"
+                  style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
+                  onMouseLeave={(e) => { if (!fcChatDragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                />
+              </>
+            )}
+            <div style={{
+              ...(isFileCentric
+                ? { width: userConfig.fileCentricChatWidth, flexShrink: 0, minWidth: 320 }
+                : { flex: 1, minWidth: 0 }),
+              minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden",
+            }}>
             {!chatOnlyMode && (
               <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "terminal" ? "flex" : "none", flexDirection: "column" }}>
                 <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -1790,7 +1791,23 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 />
               </div>
             )}
-            {/* Bottom toolbar — three groups: Functional | Views | Term */}
+            </div>
+            {activeSessionMeta && (
+              <SessionSideDock
+                sessionId={activeSessionMeta.id}
+                sessionName={activeSessionMeta.name || activeSessionMeta.project}
+                isCursor={isCursorSession}
+                open={dockOpen}
+                onClose={(key) => setDockSection(key, false)}
+                todos={dockTodos}
+                todoHistory={dockTodoHistory}
+                activeGoal={dockActiveGoal}
+                goalHistory={dockGoalHistory}
+                onTodosChanged={refreshDockTodos}
+              />
+            )}
+          </div>
+          {/* Bottom toolbar — three groups: Functional | Views | Term */}
             <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, padding: "3px 8px", background: "var(--bg-base)", borderTop: "1px solid var(--bg-page)" }}>
               {!isCursorSession && <UsageBar />}
               {/* Group 1: Functional — Auqs / Tasks / Goals / Model */}
@@ -1991,22 +2008,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               onHeightChange={(h) => patchUserConfig({ terminalHeight: h })}
               resizeFrom="top"
             />
-            </div>
-            {activeSessionMeta && (
-              <SessionSideDock
-                sessionId={activeSessionMeta.id}
-                sessionName={activeSessionMeta.name || activeSessionMeta.project}
-                isCursor={isCursorSession}
-                open={dockOpen}
-                onClose={(key) => setDockSection(key, false)}
-                todos={dockTodos}
-                todoHistory={dockTodoHistory}
-                activeGoal={dockActiveGoal}
-                goalHistory={dockGoalHistory}
-                onTodosChanged={refreshDockTodos}
-              />
-            )}
-          </div>
+          </>
         ) : (
           <UsageCenter />
         )}
