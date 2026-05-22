@@ -1019,12 +1019,11 @@ function AskUserQuestionDisplay({ questions, answer }: {
       {/* Questions */}
       <div style={{ padding: "8px 10px 10px", display: "flex", flexDirection: "column", gap: 10 }}>
         {questions.map((q, qi) => {
-          const chosenWithPreview = q.options.filter(
-            o => answeredLabels[qi]?.has(o.label) && o.preview,
-          );
-          const chosenWithDescription = q.options.filter(
-            o => answeredLabels[qi]?.has(o.label) && o.description,
-          );
+          // For answered AUQs we keep every option's description + preview visible
+          // so the historical decision can be re-read in full context. Chosen options
+          // get accent styling, others get muted styling to preserve the hierarchy.
+          const optionsWithDescription = q.options.filter(o => o.description);
+          const optionsWithPreview = q.options.filter(o => o.preview);
           return (
             <div key={qi}>
               {questions.length > 1 && q.header && (
@@ -1071,43 +1070,51 @@ function AskUserQuestionDisplay({ questions, answer }: {
                   );
                 })()}
               </div>
-              {/* Description of the chosen option(s) — surfaces the rationale text
-                  that the inline chip layout couldn't fit. */}
-              {chosenWithDescription.map(opt => (
-                <div
-                  key={opt.label}
-                  style={{
-                    marginTop: 4,
-                    fontSize: 11,
-                    color: "var(--text-muted)",
-                    lineHeight: 1.5,
-                    paddingLeft: 4,
-                    borderLeft: "2px solid var(--accent-blue)",
-                    marginLeft: 2,
-                  }}
-                >
-                  <span style={{ color: "var(--accent-blue)", fontWeight: 600, marginRight: 4 }}>{opt.label}:</span>
-                  {opt.description}
-                </div>
-              ))}
-              {/* Preview of the chosen option(s), so the historical decision keeps its context */}
-              {chosenWithPreview.map(opt => (
-                <pre
-                  key={opt.label}
-                  style={{
-                    marginTop: 6, marginBottom: 0,
-                    padding: "6px 8px",
-                    background: "var(--bg-deep)",
-                    border: "1px solid var(--border-subtle)",
-                    borderRadius: 4,
-                    fontSize: 10.5, lineHeight: 1.35,
-                    color: "var(--text-secondary)",
-                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                    overflow: "auto",
-                    whiteSpace: "pre",
-                  }}
-                >{opt.preview}</pre>
-              ))}
+              {/* Descriptions for every option — chosen ones in accent blue,
+                  others muted, so re-reading the history shows the full picture. */}
+              {optionsWithDescription.map(opt => {
+                const chosen = answeredLabels[qi]?.has(opt.label);
+                return (
+                  <div
+                    key={opt.label}
+                    style={{
+                      marginTop: 4,
+                      fontSize: 11,
+                      color: chosen ? "var(--text-muted)" : "var(--text-faint)",
+                      lineHeight: 1.5,
+                      paddingLeft: 4,
+                      borderLeft: `2px solid ${chosen ? "var(--accent-blue)" : "var(--border-subtle)"}`,
+                      marginLeft: 2,
+                    }}
+                  >
+                    <span style={{ color: chosen ? "var(--accent-blue)" : "var(--text-muted)", fontWeight: 600, marginRight: 4 }}>{opt.label}:</span>
+                    {opt.description}
+                  </div>
+                );
+              })}
+              {/* Previews for every option — kept full-fidelity so unicode box art
+                  / mockups stay legible in history. */}
+              {optionsWithPreview.map(opt => {
+                const chosen = answeredLabels[qi]?.has(opt.label);
+                return (
+                  <pre
+                    key={opt.label}
+                    style={{
+                      marginTop: 6, marginBottom: 0,
+                      padding: "6px 8px",
+                      background: "var(--bg-deep)",
+                      border: `1px solid ${chosen ? "var(--accent-blue)" : "var(--border-subtle)"}`,
+                      borderRadius: 4,
+                      fontSize: 10.5, lineHeight: 1.35,
+                      color: chosen ? "var(--text-secondary)" : "var(--text-faint)",
+                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                      overflow: "auto",
+                      whiteSpace: "pre",
+                      opacity: chosen ? 1 : 0.75,
+                    }}
+                  >{opt.preview}</pre>
+                );
+              })}
             </div>
           );
         })}
@@ -1123,6 +1130,12 @@ interface AskQuestion { header?: string; question: string; multiSelect?: boolean
 
 // Persist dismissed block IDs in sessionStorage so page refreshes don't re-show
 // answered questions while Claude Code is still processing the response.
+//
+// Both stores below are MODULE-LEVEL (shared by every ConversationPane mount).
+// Without namespacing by sessionId, dismissing "Continue?" in session A would
+// suppress the same-text AUQ in session B. The pending blockId itself
+// ("__pending_auq__:" + question) also collides cross-session, so blockIds
+// are namespaced the same way.
 const _AUQ_SS_KEY = "cm_auq_dismissed";
 function _auqLoadDismissed(): Set<string> {
   try { return new Set(JSON.parse(sessionStorage.getItem(_AUQ_SS_KEY) || "[]")); }
@@ -1132,23 +1145,35 @@ function _auqPersist(set: Set<string>) {
   try { sessionStorage.setItem(_AUQ_SS_KEY, JSON.stringify([...set])); } catch {}
 }
 const _dismissedAUQ = _auqLoadDismissed();
-// Tracks question text of recently dismissed AUQs so the JSONL widget and the
-// hook-based pendingAuqData widget cross-suppress each other while the two
-// signals settle. Cleared after a short window to avoid suppressing a future
-// re-ask of the same question.
-const _recentlyDismissedAuqQ = new Map<string, number>(); // question → timestamp
+// Tracks recently dismissed AUQs so the JSONL widget and the hook-based
+// pendingAuqData widget cross-suppress each other while the two signals
+// settle. Cleared after a short window to avoid suppressing a future re-ask.
+const _recentlyDismissedAuqQ = new Map<string, number>(); // nsKey → timestamp
 const _AUQ_SUPPRESS_MS = 15000;
-function _markAuqDismissed(question: string) {
-  _recentlyDismissedAuqQ.set(question, Date.now());
+// U+0001 (SOH) is a control char that cannot appear in user-typed questions
+// or tool_use ids. sessionStorage round-trips it as the JSON escape \u0001.
+function _nsKey(sessionId: string, key: string): string {
+  return sessionId + "" + key;
 }
-function _isAuqRecentlyDismissed(question: string): boolean {
-  const t = _recentlyDismissedAuqQ.get(question);
+function _markAuqDismissed(sessionId: string, question: string) {
+  _recentlyDismissedAuqQ.set(_nsKey(sessionId, question), Date.now());
+}
+function _isAuqRecentlyDismissed(sessionId: string, question: string): boolean {
+  const k = _nsKey(sessionId, question);
+  const t = _recentlyDismissedAuqQ.get(k);
   if (!t) return false;
   if (Date.now() - t > _AUQ_SUPPRESS_MS) {
-    _recentlyDismissedAuqQ.delete(question);
+    _recentlyDismissedAuqQ.delete(k);
     return false;
   }
   return true;
+}
+function _isAuqBlockDismissed(sessionId: string, blockId: string): boolean {
+  return _dismissedAUQ.has(_nsKey(sessionId, blockId));
+}
+function _markAuqBlockDismissed(sessionId: string, blockId: string) {
+  _dismissedAUQ.add(_nsKey(sessionId, blockId));
+  _auqPersist(_dismissedAUQ);
 }
 
 // ── TodoWrite / TodoRead ──────────────────────────────────────────────────────
@@ -1691,7 +1716,8 @@ function PlanApprovalBlock({ blockId, planText, onSubmit }: {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
+function AskUserQuestionBlock({ sessionId, blockId, questions, onSubmitAnswers }: {
+  sessionId: string;
   blockId: string;
   questions: AskQuestion[];
   onSubmitAnswers: (answers: unknown[]) => void;
@@ -1725,7 +1751,7 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
   // tool_result arrives in JSONL refresh (so hasUnansweredAuq flips false) before
   // the 3s tui status poll clears pendingAuqData → pending widget renders fresh.
   const _qText = questions[0]?.question ?? "";
-  if (dismissed || _dismissedAUQ.has(blockId) || _isAuqRecentlyDismissed(_qText)) return null;
+  if (dismissed || _isAuqBlockDismissed(sessionId, blockId) || _isAuqRecentlyDismissed(sessionId, _qText)) return null;
 
   const toggleOption = (label: string) => {
     setSelections(prev => {
@@ -1765,9 +1791,8 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
   };
 
   const _dismiss = () => {
-    _dismissedAUQ.add(blockId);
-    _auqPersist(_dismissedAUQ);
-    _markAuqDismissed(_qText);
+    _markAuqBlockDismissed(sessionId, blockId);
+    _markAuqDismissed(sessionId, _qText);
     setDismissed(true);
   };
 
@@ -3090,6 +3115,70 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
     return false;
   }, [messages, toolResults]);
 
+  // ── Pinned (sticky) AUQ ──────────────────────────────────────────────────
+  // Compaction rewrites JSONL and can briefly empty both AUQ sources
+  // (pendingAuqData → null, unanswered tool_use → gone or moved). If we only
+  // render based on the live signal, the widget unmounts mid-flight and the
+  // user cannot answer → deadlock. So we capture whichever question surfaces
+  // first into stickyAuq and hold onto it across signal flickers. We render
+  // it in a dedicated pinned container above the status banner so other
+  // chat-area content can't push it off-screen or supersede it.
+  const currentAuq = useMemo<{ blockId: string; questions: AskQuestion[]; key: string } | null>(() => {
+    for (const m of messages) {
+      if (m.type !== "assistant" || !m.message) continue;
+      const blocks = getBlocks(m.message.content as RawContentBlock[] | string);
+      for (const b of blocks) {
+        if (b.type === "tool_use" && b.name === "AskUserQuestion" && b.id && !toolResults.has(b.id)) {
+          const inp = b.input as Record<string, unknown>;
+          const qs = Array.isArray(inp?.questions) ? inp.questions as AskQuestion[] : [];
+          if (qs.length > 0 && qs[0].question) {
+            return { blockId: b.id, questions: qs, key: qs[0].question };
+          }
+        }
+      }
+    }
+    if (pendingAuqData) {
+      const qs = _normalizePendingAuq(pendingAuqData);
+      if (qs.length > 0 && qs[0].question) {
+        return { blockId: "__pending_auq__:" + qs[0].question, questions: qs, key: qs[0].question };
+      }
+    }
+    return null;
+  }, [messages, toolResults, pendingAuqData]);
+
+  const [stickyAuq, setStickyAuq] = useState<{ blockId: string; questions: AskQuestion[]; key: string } | null>(null);
+
+  // Capture / replace stickyAuq from live sources. Never clear on null — that
+  // is the whole point: survive compacting-induced source flickers.
+  useEffect(() => {
+    if (!currentAuq) return;
+    if (_isAuqBlockDismissed(sessionId, currentAuq.blockId) || _isAuqRecentlyDismissed(sessionId, currentAuq.key)) return;
+    setStickyAuq(prev => {
+      if (!prev) return currentAuq;
+      // Same question → keep, but upgrade pending-blockId to JSONL-blockId
+      // once JSONL catches up (real blockId is needed for dedup against the
+      // inline render path).
+      if (prev.key === currentAuq.key) {
+        if (prev.blockId.startsWith("__pending_auq__:") && !currentAuq.blockId.startsWith("__pending_auq__:")) {
+          return { ...prev, blockId: currentAuq.blockId };
+        }
+        return prev;
+      }
+      // Different question — supersede.
+      return currentAuq;
+    });
+  }, [currentAuq]);
+
+  // Drop stickyAuq once it's marked dismissed elsewhere (e.g., another tab
+  // answered, or the question is no longer surfacing from any source and
+  // got recently dismissed).
+  useEffect(() => {
+    if (!stickyAuq) return;
+    if (_isAuqBlockDismissed(sessionId, stickyAuq.blockId) || _isAuqRecentlyDismissed(sessionId, stickyAuq.key)) {
+      setStickyAuq(null);
+    }
+  }, [stickyAuq, messages, pendingAuqData]);
+
   // Build map: compact_boundary uuid → compact summary text
   const compactSummaries = useMemo(() => {
     const map = new Map<string, string>();
@@ -3677,35 +3766,28 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                   requestAnimationFrame(() => scrollToBottom(true));
                 };
 
-                // AskUserQuestion tool_use block (unanswered) — shown in all modes
+                // AskUserQuestion tool_use block (unanswered) — render the
+                // surrounding message text only; the interactive widget is
+                // pinned above the status banner so it survives compaction.
                 const auqBlock = blocks.find(b => b.type === "tool_use" && b.name === "AskUserQuestion" && !toolResults.has(b.id!));
                 if (auqBlock) {
                   const inp = auqBlock.input as Record<string, unknown>;
                   const rawQs = Array.isArray(inp?.questions) ? inp.questions as AskQuestion[] : [];
                   if (rawQs.length > 0) {
                     return (
-                      <React.Fragment key={uid}>
-                        {/* hideAuqDisplay=true: interactive block below already shows the question */}
-                        <MessageEntry
-                          entry={entry}
-                          toolResults={toolResults}
-                          compactSummaries={compactSummaries}
-                          isActiveThinking={isActiveThinking}
-                          isNewCompact={newCompactUuids.has(entry.uuid || "")}
-                          sessionId={sessionId}
-                          subagentsByDesc={subagentsByDesc}
-                          chatOnly={chatOnly}
-                          hideAuqDisplay
-                          onRewindMessage={handleRewindMessage}
-                        />
-                        <AskUserQuestionBlock
-                          blockId={auqBlock.id!}
-                          questions={rawQs}
-                          onSubmitAnswers={(answers) => {
-                            submitAuqAnswers(sessionId, answers, rawQs);
-                          }}
-                        />
-                      </React.Fragment>
+                      <MessageEntry
+                        key={uid}
+                        entry={entry}
+                        toolResults={toolResults}
+                        compactSummaries={compactSummaries}
+                        isActiveThinking={isActiveThinking}
+                        isNewCompact={newCompactUuids.has(entry.uuid || "")}
+                        sessionId={sessionId}
+                        subagentsByDesc={subagentsByDesc}
+                        chatOnly={chatOnly}
+                        hideAuqDisplay
+                        onRewindMessage={handleRewindMessage}
+                      />
                     );
                   }
                 }
@@ -3795,18 +3877,6 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                 <span style={{ fontSize: 10, color: "var(--text-faintest)", marginTop: 2, paddingRight: 2 }}>sending…</span>
               </div>
             ))}
-            {/* Pending AUQ from hook/screen — shown when JSONL hasn't been written yet */}
-            {pendingAuqData && !hasUnansweredAuq && optimisticMsgs.length === 0 && (() => {
-              const qs = _normalizePendingAuq(pendingAuqData);
-              if (qs.length === 0 || !qs[0].question) return null;
-              return (
-                <AskUserQuestionBlock
-                  blockId={"__pending_auq__:" + qs[0].question}
-                  questions={qs}
-                  onSubmitAnswers={(answers) => submitAuqAnswers(sessionId, answers, qs)}
-                />
-              );
-            })()}
             {/* Pending tool approval from hooks — shown when Claude is waiting for permission */}
             {pendingApproveData && optimisticMsgs.length === 0 && (
               <ToolApprovalBlock
@@ -3826,6 +3896,24 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
           </div>
         )}
       </div>
+
+      {/* Pinned AUQ — sits between the scrolling chat and the status banner.
+          Sources can flicker during compaction; stickyAuq holds the question
+          across those flickers so the user can always answer. flexShrink:0
+          guarantees nothing else can squeeze it out of the column. */}
+      {stickyAuq && (
+        <div style={{ flexShrink: 0, borderTop: "1px solid var(--border)", background: "var(--bg-surface)" }}>
+          <AskUserQuestionBlock
+            sessionId={sessionId}
+            blockId={stickyAuq.blockId}
+            questions={stickyAuq.questions}
+            onSubmitAnswers={(answers) => {
+              submitAuqAnswers(sessionId, answers, stickyAuq.questions);
+              setStickyAuq(null);
+            }}
+          />
+        </div>
+      )}
 
       {/* Status banner – three states: compacting (orange + progress) / responding (stop button) / idle (faint). */}
       {!chatOnly && wsStatus === "connected" && (() => {
@@ -3851,6 +3939,19 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
           );
         }
         if (isStreaming) {
+          // A queue-operation:enqueue that hasn't been promoted to a real user
+          // message is a user prompt waiting behind the active response.
+          const hasQueuedPrompt = displayEntries.some((e) => {
+            if (e.type !== "queue-operation") return false;
+            const r = e as unknown as Record<string, unknown>;
+            if (r.operation !== "enqueue") return false;
+            const content = String(r.content ?? "").trim();
+            return (
+              content.length > 0 &&
+              !content.startsWith("<task-notification>") &&
+              !content.startsWith("<system-reminder>")
+            );
+          });
           return (
             <div style={{
               flexShrink: 0, borderTop: "1px solid var(--border)",
@@ -3867,9 +3968,9 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                   padding: "3px 12px", fontSize: 11.5, cursor: "pointer",
                   display: "flex", alignItems: "center", gap: 5,
                 }}
-                title="Stop (Ctrl+C)"
+                title={hasQueuedPrompt ? "Skip current response; queued prompt becomes active (Ctrl+C)" : "Stop (Ctrl+C)"}
               >
-                <span style={{ fontSize: 10 }}>■</span> Stop
+                <span style={{ fontSize: 10 }}>■</span> {hasQueuedPrompt ? "Stop / Skip" : "Stop"}
               </button>
             </div>
           );

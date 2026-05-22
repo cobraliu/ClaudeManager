@@ -13,6 +13,7 @@ import {
   restartServer,
   type UserInfo,
   type SessionMeta,
+  type ProxyMode,
 } from "../api/sessionApi";
 import { SessionCard } from "../components/SessionCard";
 
@@ -41,6 +42,8 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
   const [claudeBinInput, setClaudeBinInput] = useState("");
   const [proxy, setProxyVal] = useState("");
   const [proxyInput, setProxyInput] = useState("");
+  const [proxyMode, setProxyModeVal] = useState<ProxyMode>("tap_upstream");
+  const [proxyModeInput, setProxyModeInput] = useState<ProxyMode>("tap_upstream");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
   const [restarting, setRestarting] = useState(false);
@@ -70,6 +73,8 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
       setClaudeBinInput(c.claude_bin);
       setProxyVal(c.proxy);
       setProxyInput(c.proxy);
+      setProxyModeVal(c.proxy_mode);
+      setProxyModeInput(c.proxy_mode);
     } catch {}
   }, []);
 
@@ -344,22 +349,33 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
             <div style={cardStyle}>
               <h3 style={{ marginBottom: 12, fontSize: 15 }}>Proxy Settings</h3>
               <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
-                Proxy for all sessions (applied as http_proxy &amp; https_proxy). Leave blank to disable.
+                One upstream proxy address used by all sessions (http_proxy &amp; https_proxy). Leave blank for direct.
+                The <b>type</b> decides whether requests route through our local Anthropic recording proxy first.
               </p>
-              <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
                 <input
                   value={proxyInput}
                   onChange={(e) => setProxyInput(e.target.value)}
                   placeholder="http://proxy:port"
                   style={{ ...inputStyle, flex: 1 }}
                 />
+                <select
+                  value={proxyModeInput}
+                  onChange={(e) => setProxyModeInput(e.target.value as ProxyMode)}
+                  style={{ ...inputStyle, width: 200, cursor: "pointer" }}
+                  title="tap_upstream: tap proxy uses this as its internet hop (recording ON). real: Claude CLI uses this as HTTPS_PROXY directly (recording OFF)."
+                >
+                  <option value="tap_upstream">Type: Tap upstream (recording ON)</option>
+                  <option value="real">Type: Real proxy (recording OFF)</option>
+                </select>
                 <button
-                  disabled={proxyInput === proxy}
+                  disabled={proxyInput === proxy && proxyModeInput === proxyMode}
                   onClick={async () => {
                     try {
-                      const c = await setProxy(proxyInput.trim());
+                      const c = await setProxy(proxyInput.trim(), proxyModeInput);
                       setProxyVal(c.proxy);
-                      setMsg("Proxy settings updated.");
+                      setProxyModeVal(c.proxy_mode);
+                      setMsg("Proxy settings updated. New Claude sessions will use the new mode.");
                     } catch (e) { setMsg(String(e)); }
                   }}
                   style={{ background: "#58a6ff", color: "#fff" }}
@@ -367,6 +383,10 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
                   Save
                 </button>
               </div>
+              <p style={{ fontSize: 11, color: "var(--text-muted)", margin: 0 }}>
+                <b>Tap upstream</b>: Claude CLI → local 19098 → this proxy → api.anthropic.com. SSE snapshots recorded.<br />
+                <b>Real proxy</b>: Claude CLI → this proxy → api.anthropic.com. 19098 is bypassed; no recording.
+              </p>
             </div>
 
           </div>

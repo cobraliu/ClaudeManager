@@ -40,7 +40,7 @@ import {
 import { TuiPane } from "../components/TuiPane";
 import { BubblePane } from "../components/BubblePane";
 import { ConversationPane } from "../components/ConversationPane";
-import { CodePane, FileViewerPane, FileSidePanel } from "../components/CodePane";
+import { CodePane, FileViewerPane, FileSidePanel, ScratchEditorPane } from "../components/CodePane";
 import { SessionCard, PromptText } from "../components/SessionCard";
 import { UsageBar, UsageCenter } from "../components/UsageBar";
 import { FileEditorModal } from "../components/FileEditorModal";
@@ -50,6 +50,8 @@ import { downloadConversationHtml } from "../lib/exportChat";
 import { SessionSideDock } from "../components/SessionSideDock";
 import { UserConfigModal } from "../components/UserConfigModal";
 import { EmbeddedTerminalPanel } from "../components/EmbeddedTerminalPanel";
+import { TextSelectionMenu } from "../components/TextSelectionMenu";
+import { AsciiflowModal } from "../components/AsciiflowModal";
 import { useUserConfig, type LayoutScheme } from "../hooks/useUserConfig";
 import { useSessionTabs, type TabEntry } from "../hooks/useSessionTabs";
 
@@ -68,8 +70,142 @@ function FileCentricViewerColumn(props: {
   activeTabId: string | null;
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
+  onCloseMany: (ids: string[]) => void;
+  onCreateScratch: () => string;
+  onUpdateScratch: (id: string, content: string) => void;
+  onPromoteScratch: (id: string, path: string) => void;
 }) {
-  const { sessionId, sessionMeta, tabs, activeTabId, onActivate, onClose } = props;
+  const {
+    sessionId, sessionMeta, tabs, activeTabId,
+    onActivate, onClose, onCloseMany,
+    onCreateScratch, onUpdateScratch, onPromoteScratch,
+  } = props;
+
+  // Per-tab dirty flag, reported up by FileViewerPane via onDirtyChange.
+  // Git/JSONL tabs are never dirty (absent from the map = treated as clean).
+  const [dirtyMap, setDirtyMap] = useState<Record<string, boolean>>({});
+  const setTabDirty = useCallback((tabId: string, dirty: boolean) => {
+    setDirtyMap(prev => {
+      const cur = !!prev[tabId];
+      if (cur === dirty) return prev;
+      const next = { ...prev };
+      if (dirty) next[tabId] = true;
+      else delete next[tabId];
+      return next;
+    });
+  }, []);
+  // Prune dirty entries for tabs that no longer exist.
+  useEffect(() => {
+    setDirtyMap(prev => {
+      const alive = new Set(tabs.map(t => t.id));
+      let changed = false;
+      const next: Record<string, boolean> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        if (alive.has(k)) next[k] = v;
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [tabs]);
+
+  // Open dropdown menu (per-tab); pendingClose drives the dirty-confirm modal.
+  // Menu is position:fixed because the tab bar uses overflow:hidden — an
+  // absolute child would be clipped. Coords are captured from the trigger.
+  const [menuTabId, setMenuTabId] = useState<string | null>(null);
+  const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null);
+  const [pendingClose, setPendingClose] = useState<{ ids: string[]; dirtyPaths: string[] } | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!menuTabId) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuTabId(null);
+        setMenuPos(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { setMenuTabId(null); setMenuPos(null); }
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menuTabId]);
+
+  const pathFor = (id: string): string => {
+    const t = tabs.find(x => x.id === id);
+    if (!t) return id;
+    if (t.kind === "file") return t.path;
+    if (t.kind === "git") return "(Git)";
+    return t.title;
+  };
+
+  // Tab-list dropdown (⌄ N) — clicking a row jumps + scrolls active into view.
+  const [tabListOpen, setTabListOpen] = useState(false);
+  const [tabListPos, setTabListPos] = useState<{ top: number; right: number } | null>(null);
+  const tabListRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!tabListOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (tabListRef.current && !tabListRef.current.contains(e.target as Node)) {
+        setTabListOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setTabListOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [tabListOpen]);
+
+  // Scroll the active tab into view (used after activate-from-dropdown or
+  // after openScratchTab appends to the end). The ref is keyed by tab id.
+  const tabElRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  useEffect(() => {
+    if (!activeTabId) return;
+    const el = tabElRefs.current[activeTabId];
+    if (el) el.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }, [activeTabId]);
+
+  const requestSingleClose = (id: string) => {
+    if (dirtyMap[id]) {
+      setPendingClose({ ids: [id], dirtyPaths: [pathFor(id)] });
+    } else {
+      onClose(id);
+    }
+  };
+
+  const requestClose = (scope: "saved" | "others" | "right" | "all", anchorId: string) => {
+    const anchorIdx = tabs.findIndex(t => t.id === anchorId);
+    let candidates: string[];
+    if (scope === "saved") {
+      // Always safe: skip every dirty file tab.
+      candidates = tabs.filter(t => !dirtyMap[t.id]).map(t => t.id);
+    } else if (scope === "others") {
+      candidates = tabs.filter(t => t.id !== anchorId).map(t => t.id);
+    } else if (scope === "right") {
+      candidates = anchorIdx < 0 ? [] : tabs.slice(anchorIdx + 1).map(t => t.id);
+    } else {
+      candidates = tabs.map(t => t.id);
+    }
+    setMenuTabId(null);
+    setMenuPos(null);
+    if (candidates.length === 0) return;
+    if (scope === "saved") {
+      onCloseMany(candidates);
+      return;
+    }
+    const dirtyIds = candidates.filter(id => dirtyMap[id]);
+    if (dirtyIds.length === 0) {
+      onCloseMany(candidates);
+      return;
+    }
+    setPendingClose({ ids: candidates, dirtyPaths: dirtyIds.map(pathFor) });
+  };
 
   const labelFor = (t: TabEntry): string => {
     if (t.kind === "file") {
@@ -77,12 +213,22 @@ function FileCentricViewerColumn(props: {
       return base;
     }
     if (t.kind === "git") return "Git";
-    return "JSONL";
+    return t.title;
   };
   const titleFor = (t: TabEntry): string => {
     if (t.kind === "file") return t.path;
     if (t.kind === "git") return "Git status, diff, history, branches";
-    return "Conversation JSONL preview";
+    return `${t.title} (unsaved scratch)`;
+  };
+  const iconFor = (t: TabEntry): string => {
+    if (t.kind === "file") return "📄";
+    if (t.kind === "git") return "⎇";
+    return "📝";
+  };
+
+  const handleCreateScratch = () => {
+    setTabListOpen(false);
+    onCreateScratch();
   };
 
   return (
@@ -92,55 +238,121 @@ function FileCentricViewerColumn(props: {
       display: "flex", flexDirection: "column",
       borderRight: "1px solid var(--border)",
     }}>
-      {/* Tab bar */}
+      {/* Tab bar: scrollable tabs + filler (inside scroll), then ⌄ N dropdown
+          and a right blank strip (outside scroll, always visible). Double-
+          clicking either the inside filler or the right strip creates a new
+          scratch tab. */}
       <div style={{
         flexShrink: 0, display: "flex", alignItems: "stretch",
         background: "var(--bg-surface)",
         borderBottom: "1px solid var(--border)",
-        overflowX: "auto", overflowY: "hidden",
         minHeight: 28,
       }}>
-        {tabs.length === 0 && (
-          <div style={{ padding: "6px 12px", fontSize: 11, color: "var(--text-faint)" }}>
-            Click a file in the tree, or use Git / JSONL buttons to open a tab.
+        <div style={{
+          flex: "1 1 0%", minWidth: 0,
+          display: "flex", alignItems: "stretch",
+          overflowX: "auto", overflowY: "hidden",
+        }}>
+          {tabs.length === 0 && (
+            <div style={{ padding: "6px 12px", fontSize: 11, color: "var(--text-faint)" }}>
+              Click a file in the tree, double-click the blank strip to create a scratch file.
+            </div>
+          )}
+          {tabs.map(t => {
+            const isActive = t.id === activeTabId;
+            const isDirty = !!dirtyMap[t.id];
+            const menuOpen = menuTabId === t.id;
+            return (
+              <div
+                key={t.id}
+                ref={(el) => { tabElRefs.current[t.id] = el; }}
+                onClick={() => onActivate(t.id)}
+                title={titleFor(t)}
+                style={{
+                  position: "relative",
+                  display: "flex", alignItems: "center", gap: 4,
+                  padding: "4px 8px 4px 10px", cursor: "pointer",
+                  fontSize: 11, color: isActive ? "var(--text-body)" : "var(--text-faint)",
+                  background: isActive ? "var(--bg-base)" : "transparent",
+                  borderRight: "1px solid var(--border)",
+                  borderTop: isActive ? "1px solid var(--accent-blue)" : "1px solid transparent",
+                  userSelect: "none", whiteSpace: "nowrap", flexShrink: 0,
+                }}
+                onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
+              >
+                <span style={{ fontSize: 9, opacity: 0.7 }}>{iconFor(t)}</span>
+                <span>{labelFor(t)}{isDirty ? " ●" : ""}</span>
+                <span
+                  onClick={(e) => { e.stopPropagation(); requestSingleClose(t.id); }}
+                  title={isDirty ? "Close tab (unsaved changes — will prompt)" : "Close tab"}
+                  style={{
+                    marginLeft: 4, padding: "0 4px", fontSize: 12, lineHeight: 1,
+                    color: "var(--text-faint)", borderRadius: 3,
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text-body)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-faint)"; }}
+                >×</span>
+                <span
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (menuOpen) { setMenuTabId(null); setMenuPos(null); return; }
+                    const r = e.currentTarget.getBoundingClientRect();
+                    setMenuPos({ top: r.bottom + 2, right: Math.max(4, window.innerWidth - r.right) });
+                    setMenuTabId(t.id);
+                  }}
+                  title="Close options"
+                  style={{
+                    marginLeft: 1, padding: "0 4px", fontSize: 10, lineHeight: 1,
+                    color: "var(--accent-orange, #d59f00)", borderRadius: 3,
+                    background: menuOpen ? "color-mix(in srgb, var(--accent-orange, #d59f00) 18%, transparent)" : "transparent",
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--accent-orange, #d59f00) 22%, transparent)"; }}
+                  onMouseLeave={(e) => { if (!menuOpen) e.currentTarget.style.background = "transparent"; }}
+                >▾</span>
+              </div>
+            );
+          })}
+          {/* Filler inside scroll — double-click empty area to create scratch */}
+          <div
+            onDoubleClick={handleCreateScratch}
+            title="Double-click to create a new scratch file"
+            style={{ flex: "1 1 60px", minWidth: 60, cursor: "default" }}
+          />
+        </div>
+        {tabs.length > 0 && (
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+              if (tabListOpen) { setTabListOpen(false); return; }
+              const r = e.currentTarget.getBoundingClientRect();
+              setTabListPos({ top: r.bottom + 2, right: Math.max(4, window.innerWidth - r.right) });
+              setTabListOpen(true);
+            }}
+            title="All open tabs"
+            style={{
+              flexShrink: 0, padding: "0 10px",
+              display: "flex", alignItems: "center", gap: 4, cursor: "pointer",
+              fontSize: 11, color: "var(--text-secondary)",
+              borderLeft: "1px solid var(--border)",
+              background: tabListOpen ? "var(--bg-hover)" : "transparent",
+              userSelect: "none",
+            }}
+            onMouseEnter={(e) => { if (!tabListOpen) e.currentTarget.style.background = "var(--bg-hover)"; }}
+            onMouseLeave={(e) => { if (!tabListOpen) e.currentTarget.style.background = "transparent"; }}
+          >
+            <span style={{ fontSize: 12 }}>⌄</span>
+            <span>{tabs.length}</span>
           </div>
         )}
-        {tabs.map(t => {
-          const isActive = t.id === activeTabId;
-          return (
-            <div
-              key={t.id}
-              onClick={() => onActivate(t.id)}
-              title={titleFor(t)}
-              style={{
-                display: "flex", alignItems: "center", gap: 4,
-                padding: "4px 8px 4px 10px", cursor: "pointer",
-                fontSize: 11, color: isActive ? "var(--text-body)" : "var(--text-faint)",
-                background: isActive ? "var(--bg-base)" : "transparent",
-                borderRight: "1px solid var(--border)",
-                borderTop: isActive ? "1px solid var(--accent-blue)" : "1px solid transparent",
-                userSelect: "none", whiteSpace: "nowrap", flexShrink: 0,
-              }}
-              onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
-              onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
-            >
-              <span style={{ fontSize: 9, opacity: 0.7 }}>
-                {t.kind === "file" ? "📄" : t.kind === "git" ? "⎇" : "📋"}
-              </span>
-              <span>{labelFor(t)}</span>
-              <span
-                onClick={(e) => { e.stopPropagation(); onClose(t.id); }}
-                title="Close tab"
-                style={{
-                  marginLeft: 4, padding: "0 4px", fontSize: 12, lineHeight: 1,
-                  color: "var(--text-faint)", borderRadius: 3,
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text-body)"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-faint)"; }}
-              >×</span>
-            </div>
-          );
-        })}
+        <div
+          onDoubleClick={handleCreateScratch}
+          title="Double-click to create a new scratch file"
+          style={{
+            flexShrink: 0, width: 80, cursor: "default",
+            borderLeft: "1px solid var(--border)",
+          }}
+        />
       </div>
       {/* Tab content: mount all, display:none for inactive */}
       <div style={{ flex: 1, minHeight: 0, position: "relative", overflow: "hidden" }}>
@@ -170,23 +382,168 @@ function FileCentricViewerColumn(props: {
                   path={t.path}
                   viewMode={t.viewMode}
                   noDiff={t.noDiff}
+                  onDirtyChange={(d) => setTabDirty(t.id, d)}
                 />
               )}
               {t.kind === "git" && (
                 <GitPanel inline sessionId={sessionId} onClose={() => onClose(t.id)} />
               )}
-              {t.kind === "jsonl" && (
-                <JsonlPreviewModal
-                  inline
+              {t.kind === "scratch" && (
+                <ScratchEditorPane
                   sessionId={sessionId}
-                  sessionTitle={sessionMeta.name || sessionMeta.project}
-                  onClose={() => onClose(t.id)}
+                  title={t.title}
+                  content={t.content}
+                  onContentChange={(c) => onUpdateScratch(t.id, c)}
+                  onDirtyChange={(d) => setTabDirty(t.id, d)}
+                  onSaved={(savedPath) => onPromoteScratch(t.id, savedPath)}
                 />
               )}
             </div>
           );
         })}
       </div>
+      {tabListOpen && tabListPos && (
+        <div
+          ref={tabListRef}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed", top: tabListPos.top, right: tabListPos.right,
+            minWidth: 260, maxWidth: 460, maxHeight: "60vh", overflowY: "auto",
+            zIndex: 90,
+            background: "var(--bg-modal)", border: "1px solid var(--border)",
+            borderRadius: 4, padding: 4,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+            fontSize: 11, color: "var(--text-body)",
+          }}
+        >
+          {tabs.map(t => {
+            const isActive = t.id === activeTabId;
+            const isDirty = !!dirtyMap[t.id];
+            const sub = t.kind === "file" ? t.path : (t.kind === "scratch" ? "(unsaved)" : "");
+            return (
+              <div
+                key={t.id}
+                onClick={() => { onActivate(t.id); setTabListOpen(false); }}
+                title={titleFor(t)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 6,
+                  padding: "5px 8px", cursor: "pointer", borderRadius: 3,
+                  background: isActive ? "var(--bg-hover)" : "transparent",
+                  borderLeft: isActive ? "2px solid var(--accent-blue)" : "2px solid transparent",
+                }}
+                onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
+              >
+                <span style={{ fontSize: 10, opacity: 0.7 }}>{iconFor(t)}</span>
+                <span style={{ fontWeight: isActive ? 600 : 400, whiteSpace: "nowrap" }}>
+                  {labelFor(t)}{isDirty ? " ●" : ""}
+                </span>
+                {sub && (
+                  <span style={{
+                    flex: 1, minWidth: 0,
+                    fontSize: 10, color: "var(--text-faint)",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    fontFamily: "var(--font-mono, monospace)",
+                  }}>{sub}</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {menuTabId && menuPos && (
+        <div
+          ref={menuRef}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed", top: menuPos.top, right: menuPos.right,
+            minWidth: 180, zIndex: 90,
+            background: "var(--bg-modal)", border: "1px solid var(--border)",
+            borderRadius: 4, padding: 4,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+            fontSize: 11, color: "var(--text-body)",
+          }}
+        >
+          {([
+            { key: "saved", label: "Close Saved" },
+            { key: "others", label: "Close Others" },
+            { key: "right", label: "Close to the Right" },
+            { key: "all", label: "Close All" },
+          ] as const).map(item => (
+            <div
+              key={item.key}
+              onClick={() => requestClose(item.key, menuTabId)}
+              style={{ padding: "5px 10px", cursor: "pointer", borderRadius: 3 }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+            >
+              {item.label}
+            </div>
+          ))}
+        </div>
+      )}
+      {pendingClose && (
+        <div
+          onClick={() => setPendingClose(null)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 100,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              minWidth: 380, maxWidth: 560, maxHeight: "70vh",
+              background: "var(--bg-modal)", border: "1px solid var(--border)",
+              borderRadius: 6, padding: "14px 16px",
+              boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+              display: "flex", flexDirection: "column", gap: 10,
+              fontSize: 12, color: "var(--text-body)",
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-orange, #d59f00)" }}>
+              Unsaved changes will be lost
+            </div>
+            <div style={{ color: "var(--text-secondary)" }}>
+              The following {pendingClose.dirtyPaths.length === 1 ? "file has" : "files have"} unsaved edits:
+            </div>
+            <div style={{
+              overflow: "auto", maxHeight: "40vh",
+              background: "var(--bg-base)", border: "1px solid var(--border-subtle)",
+              borderRadius: 4, padding: "6px 8px",
+              fontFamily: "var(--font-mono, monospace)", fontSize: 11,
+            }}>
+              {pendingClose.dirtyPaths.map((p, i) => (
+                <div key={i} style={{ padding: "2px 0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={p}>{p}</div>
+              ))}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4 }}>
+              <button
+                onClick={() => setPendingClose(null)}
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                  background: "var(--bg-surface)", color: "var(--text-body)",
+                  border: "1px solid var(--border)", borderRadius: 3,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { const ids = pendingClose.ids; setPendingClose(null); onCloseMany(ids); }}
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                  background: "var(--accent-orange, #d59f00)", color: "#1c2128",
+                  border: "1px solid var(--accent-orange, #d59f00)", borderRadius: 3,
+                  fontWeight: 600,
+                }}
+              >
+                Discard &amp; Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -819,6 +1176,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [restarting, setRestarting] = useState(false);
   const [showBrowse, setShowBrowse] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
+  const [showAsciiflow, setShowAsciiflow] = useState(false);
   const { config: userConfig, patch: patchUserConfig } = useUserConfig();
   const layout = userConfig.layout;
   const isChatCentric = layout === "chat-centric";
@@ -841,6 +1199,10 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [tuiApproveData, setTuiApproveData] = useState<TuiApproveData | null>(null);
   const [isCompacting, setIsCompacting] = useState(false);
   const [compactingProgress, setCompactingProgress] = useState<string | null>(null);
+  // Which session the above tui* states belong to. Used to gate the values at
+  // render time so a remounting ConversationPane never observes data fetched
+  // for a different session (the poll effect can only clear *after* commit).
+  const [tuiOwnerSessionId, setTuiOwnerSessionId] = useState<string | null>(null);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [modelList, setModelList] = useState<ModelInfo[]>([]);
   const [settingModel, setSettingModel] = useState(false);
@@ -901,12 +1263,16 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     return { auqs: false, tasks: false, goals: false };
   });
   const setDockSection = (key: "auqs" | "tasks" | "goals", value: boolean) => {
-    setDockOpen((prev) => {
-      const next = { ...prev, [key]: value };
+    setDockOpen(() => {
+      // Exclusive: opening one section closes all others.
+      const next = value
+        ? { auqs: false, tasks: false, goals: false, [key]: true }
+        : { auqs: false, tasks: false, goals: false };
       try { localStorage.setItem("dockOpen", JSON.stringify(next)); } catch { /* ignore */ }
       return next;
     });
   };
+  const anyDockOpen = dockOpen.auqs || dockOpen.tasks || dockOpen.goals;
   // Goals + tasks polled at page level so bottom buttons can reflect active state
   // even when the dock section is collapsed or hidden.
   const [dockTodos, setDockTodos] = useState<TodoItem[]>([]);
@@ -1041,7 +1407,16 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
 
   // Poll hint status for active session (triggers JSONL refresh when AUQ/approval appears)
   useEffect(() => {
-    if (!activeSessionId) { setTuiHint(null); return; }
+    // Clear stale per-session TUI state synchronously on session switch so the
+    // remounted ConversationPane doesn't observe the previous session's AUQ /
+    // approval / hint before the first poll for the new session returns.
+    setTuiAuqData(null);
+    setTuiApproveData(null);
+    setTuiHint(null);
+    setIsCompacting(false);
+    setCompactingProgress(null);
+
+    if (!activeSessionId) return;
     let cancelled = false;
     const poll = async () => {
       try {
@@ -1058,12 +1433,14 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
           setTuiApproveData(st.tui_approve_data ?? null);
           setIsCompacting(!!st.is_compacting);
           setCompactingProgress(st.compacting_progress ?? null);
+          setTuiOwnerSessionId(activeSessionId);
         } else {
           setTuiHint(null);
           setTuiAuqData(null);
           setTuiApproveData(null);
           setIsCompacting(false);
           setCompactingProgress(null);
+          setTuiOwnerSessionId(activeSessionId);
         }
       } catch { /* ignore */ }
     };
@@ -1193,13 +1570,14 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     if (!isFileCentric) return;
     const onMove = (e: MouseEvent) => {
       if (!fcChatDragging.current) return;
-      // Chat width = window right edge - mouse X. Clamp to leave viewer ≥ 240.
-      const minChat = 320;
+      // Zone width = window right edge − mouse X (zone is right-flush).
+      // Clamp so viewer never drops below 240 px.
+      const minZone = 320;
       const minViewer = 240;
       const sidebar = sidebarCollapsed ? 0 : leftWidth + 5;
       const tree = userConfig.fileCentricTreeWidth + 5;
-      const maxChat = Math.max(minChat, window.innerWidth - sidebar - tree - minViewer);
-      const w = Math.max(minChat, Math.min(window.innerWidth - e.clientX, maxChat));
+      const maxZone = Math.max(minZone, window.innerWidth - sidebar - tree - minViewer);
+      const w = Math.max(minZone, Math.min(window.innerWidth - e.clientX, maxZone));
       patchUserConfig({ fileCentricChatWidth: w });
     };
     const onUp = () => {
@@ -1216,6 +1594,52 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       window.removeEventListener("mouseup", onUp);
     };
   }, [isFileCentric, sidebarCollapsed, leftWidth, userConfig.fileCentricTreeWidth, patchUserConfig]);
+
+  // Drag bar between chat and SideDock — only active when the user is actually dragging.
+  // Live ref of "any dock section open" so the chat-drag clamp can read it without
+  // re-binding listeners every time dockOpen flips.
+  const sideDockOpenRef = useRef(false);
+  useEffect(() => { sideDockOpenRef.current = anyDockOpen; }, [anyDockOpen]);
+  const sideDockDragging = useRef(false);
+  // Total (chat + dock) width captured at the moment the user starts dragging.
+  // Holding this constant in file-centric mode keeps the viewer width unchanged.
+  const sideDockDragTotal = useRef(0);
+  const startSideDockDrag = useCallback(() => {
+    sideDockDragging.current = true;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!sideDockDragging.current) return;
+      const minDock = 240;
+      const minChat = 320;
+      if (isFileCentric) {
+        // Dock is inside the zone — only sideDockWidth changes.
+        // InnerCol (flex:1) auto-absorbs the leftover; zone width is unchanged.
+        const maxDock = Math.max(minDock, userConfig.fileCentricChatWidth - 5 - minChat);
+        const w = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
+        patchUserConfig({ sideDockWidth: w });
+      } else {
+        const maxDock = Math.max(minDock, Math.floor(window.innerWidth * 0.6));
+        const w = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
+        patchUserConfig({ sideDockWidth: w });
+      }
+    };
+    const onUp = () => {
+      if (sideDockDragging.current) {
+        sideDockDragging.current = false;
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [isFileCentric, userConfig.fileCentricChatWidth, patchUserConfig]);
 
   useEffect(() => {
     if (!showModelPicker) return;
@@ -1428,6 +1852,13 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 style={{ background: "var(--bg-hover)", color: "var(--text-secondary)", fontSize: compact ? 14 : 11, padding: compact ? "3px 7px" : "4px 8px", border: "1px solid var(--border)", borderRadius: 4, lineHeight: 1 }}
               >
                 {compact ? "⚙" : "⚙ Config"}
+              </button>
+              <button
+                onClick={() => setShowAsciiflow(true)}
+                title="ASCII diagram editor (asciiflow.com)"
+                style={{ background: "var(--bg-hover)", color: "var(--text-secondary)", fontSize: compact ? 14 : 11, padding: compact ? "3px 7px" : "4px 8px", border: "1px solid var(--border)", borderRadius: 4, lineHeight: 1 }}
+              >
+                {compact ? "▦" : "▦ ASCII"}
               </button>
             </div>
           );
@@ -1710,40 +2141,49 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         </div>
       )}
 
-      {/* ── File-centric: Viewer column with tabs + content (always visible, flex 1) ── */}
-      {isFileCentric && active && activeSessionMeta && (
-        <>
-          <FileCentricViewerColumn
-            sessionId={active.session_id}
-            sessionMeta={activeSessionMeta}
-            tabs={sessionTabs.tabs}
-            activeTabId={sessionTabs.activeId}
-            onActivate={sessionTabs.activate}
-            onClose={sessionTabs.closeTab}
-          />
-          <div
-            onMouseDown={startFcChatDrag}
-            title="Drag to resize chat column"
-            style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
-            onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
-            onMouseLeave={(e) => { if (!fcChatDragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
-          />
-        </>
-      )}
-
-      {/* ── Right: File viewer (when file selected) ── */}
-      {/* ── Right: Conversation / TUI ── */}
+      {/* ── Right side: viewer column (file-centric only) + chat + bottom bar ── */}
       <div style={{
-        ...(isFileCentric
-          ? { width: userConfig.fileCentricChatWidth, flexShrink: 0, minWidth: 320 }
-          : { flex: "1 1 0%", minWidth: 0 }),
+        flex: "1 1 0%", minWidth: 0,
         minHeight: 0, overflow: "hidden", background: "var(--bg-base)",
         display: "flex", flexDirection: "column",
         order: isChatCentric ? 2 : 0,
       }}>
         {active ? (
+          <>
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "row", overflow: "hidden" }}>
-            <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            {isFileCentric && activeSessionMeta && (
+              <>
+                <FileCentricViewerColumn
+                  sessionId={active.session_id}
+                  sessionMeta={activeSessionMeta}
+                  tabs={sessionTabs.tabs}
+                  activeTabId={sessionTabs.activeId}
+                  onActivate={sessionTabs.activate}
+                  onClose={sessionTabs.closeTab}
+                  onCloseMany={sessionTabs.closeTabs}
+                  onCreateScratch={sessionTabs.openScratchTab}
+                  onUpdateScratch={sessionTabs.updateScratchContent}
+                  onPromoteScratch={sessionTabs.promoteScratchToFile}
+                />
+                <div
+                  onMouseDown={startFcChatDrag}
+                  title="Drag to resize chat column"
+                  style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
+                  onMouseLeave={(e) => { if (!fcChatDragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                />
+              </>
+            )}
+            {/* Chat+Dock zone — fixed width in file-centric so viewer is never affected
+                by opening/resizing the side dock. Dock and chat redistribute WITHIN this
+                zone; only the bar1 drag (viewer ↔ zone) changes zone width. */}
+            <div style={{
+              ...(isFileCentric
+                ? { width: userConfig.fileCentricChatWidth, flexShrink: 0 }
+                : { flex: 1, minWidth: 0 }),
+              minHeight: 0, display: "flex", flexDirection: "row", overflow: "clip",
+            }}>
+            <div style={{ flex: 1, minWidth: isFileCentric ? 320 : 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
             {!chatOnlyMode && (
               <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "terminal" ? "flex" : "none", flexDirection: "column" }}>
                 <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -1758,7 +2198,30 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               </div>
             )}
             <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "bubble" ? "flex" : "none", flexDirection: "column" }}>
-              <ConversationPane key={active.session_id + active.ws_token} sessionId={active.session_id} tool={activeSessionMeta?.tool} isStreaming={activeSessionMeta?.is_streaming} isCompacting={isCompacting} compactingProgress={compactingProgress} chatOnly={chatOnlyMode} isWaitingForAuq={!!tuiHint?.includes("asking a question")} pendingAuqData={tuiAuqData} pendingApproveData={tuiApproveData} refreshRef={convRefreshRef} />
+              {(() => {
+                // Gate every tui-derived prop on the freshness check: the
+                // value must have been polled for THIS session id, otherwise
+                // we pass nulls. Without this gate a newly-mounted
+                // ConversationPane (key changes on session switch) would
+                // observe the previous session's AUQ for one render and
+                // pin it into its stickyAuq.
+                const fresh = tuiOwnerSessionId === active.session_id;
+                return (
+                  <ConversationPane
+                    key={active.session_id + active.ws_token}
+                    sessionId={active.session_id}
+                    tool={activeSessionMeta?.tool}
+                    isStreaming={activeSessionMeta?.is_streaming}
+                    isCompacting={fresh ? isCompacting : false}
+                    compactingProgress={fresh ? compactingProgress : null}
+                    chatOnly={chatOnlyMode}
+                    isWaitingForAuq={fresh && !!tuiHint?.includes("asking a question")}
+                    pendingAuqData={fresh ? tuiAuqData : null}
+                    pendingApproveData={fresh ? tuiApproveData : null}
+                    refreshRef={convRefreshRef}
+                  />
+                );
+              })()}
             </div>
             {codeFileView && (
               <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -1790,9 +2253,49 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 />
               </div>
             )}
-            {/* Bottom toolbar — three groups: Functional | Views | Term */}
+            </div>
+            {/* ↑ close InnerCol column */}
+            {activeSessionMeta && anyDockOpen && (
+              <div
+                onMouseDown={startSideDockDrag}
+                title="Drag to resize side dock"
+                style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
+                onMouseLeave={(e) => { if (!sideDockDragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
+              />
+            )}
+            {activeSessionMeta && (
+              <SessionSideDock
+                sessionId={activeSessionMeta.id}
+                sessionName={activeSessionMeta.name || activeSessionMeta.project}
+                isCursor={isCursorSession}
+                open={dockOpen}
+                onClose={(key) => setDockSection(key, false)}
+                todos={dockTodos}
+                todoHistory={dockTodoHistory}
+                activeGoal={dockActiveGoal}
+                goalHistory={dockGoalHistory}
+                onTodosChanged={refreshDockTodos}
+                width={userConfig.sideDockWidth}
+              />
+            )}
+            </div>
+            {/* ↑ close Chat+Dock zone */}
+          </div>
+          {/* Bottom toolbar — three groups: Functional | Views | Term */}
             <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, padding: "3px 8px", background: "var(--bg-base)", borderTop: "1px solid var(--bg-page)" }}>
               {!isCursorSession && <UsageBar />}
+              {/* In file-centric, push the button cluster rightward so it sits below
+                  the chat column. The cluster gets a fixed width = chat + dock so
+                  its left edge hits chat col's left edge exactly. */}
+              {isFileCentric && <div style={{ flex: 1, minWidth: 0 }} />}
+              <div style={{
+                display: "flex", alignItems: "center", gap: 4,
+                ...(isFileCentric ? {
+                  width: userConfig.fileCentricChatWidth - 8,
+                  justifyContent: "flex-start",
+                } : null),
+              }}>
               {/* Group 1: Functional — Auqs / Tasks / Goals / Model */}
               <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               {activeSessionMeta && activeSessionMeta.tool !== "cursor" && (
@@ -1920,9 +2423,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               {activeSessionMeta && activeSessionMeta.claude_session_id && (
                 <button
                   onClick={() => {
-                    if (isFileCentric) {
-                      sessionTabs.openJsonlTab();
-                    } else if (inlineView === "jsonl") {
+                    if (inlineView === "jsonl") {
                       setInlineView(null);
                     } else {
                       setInlineView("jsonl");
@@ -1930,7 +2431,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                     }
                   }}
                   title="Preview conversation JSONL"
-                  style={{ fontSize: 11, padding: "2px 10px", background: (!isFileCentric && inlineView === "jsonl") ? "var(--bg-hover)" : "transparent", color: (!isFileCentric && inlineView === "jsonl") ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + ((!isFileCentric && inlineView === "jsonl") ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                  style={{ fontSize: 11, padding: "2px 10px", background: inlineView === "jsonl" ? "var(--bg-hover)" : "transparent", color: inlineView === "jsonl" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (inlineView === "jsonl" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
                 >
                   📄 JSONL
                 </button>
@@ -1979,6 +2480,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   &gt;_ Term
                 </button>
               </div>
+              </div>
             </div>
             <EmbeddedTerminalPanel
               sessionId={active?.session_id ?? null}
@@ -1991,22 +2493,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               onHeightChange={(h) => patchUserConfig({ terminalHeight: h })}
               resizeFrom="top"
             />
-            </div>
-            {activeSessionMeta && (
-              <SessionSideDock
-                sessionId={activeSessionMeta.id}
-                sessionName={activeSessionMeta.name || activeSessionMeta.project}
-                isCursor={isCursorSession}
-                open={dockOpen}
-                onClose={(key) => setDockSection(key, false)}
-                todos={dockTodos}
-                todoHistory={dockTodoHistory}
-                activeGoal={dockActiveGoal}
-                goalHistory={dockGoalHistory}
-                onTodosChanged={refreshDockTodos}
-              />
-            )}
-          </div>
+          </>
         ) : (
           <UsageCenter />
         )}
@@ -2060,6 +2547,10 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         terminalFont={terminalFont}
         onTerminalFontApplied={(f) => setTerminalFont(f)}
       />
+
+      {showAsciiflow && <AsciiflowModal onClose={() => setShowAsciiflow(false)} />}
+
+      <TextSelectionMenu />
 
     </div>
   );

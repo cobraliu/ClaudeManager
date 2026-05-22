@@ -203,11 +203,14 @@ export function setUserIsAdmin(username: string, is_admin: boolean): Promise<Use
 }
 
 // Config
+export type ProxyMode = "tap_upstream" | "real";
+
 export interface ConfigView {
   workspace: string;
   claude_bin: string;
   cursor_bin: string;
   proxy: string;
+  proxy_mode: ProxyMode;
   terminal_font: string;
   term_idle_grace_seconds: number;
   term_standby_grace_seconds: number;
@@ -254,10 +257,13 @@ export function setCursorBin(cursor_bin: string): Promise<ConfigView> {
   });
 }
 
-export function setProxy(proxy: string): Promise<ConfigView> {
+export function setProxy(
+  proxy: string,
+  proxy_mode: ProxyMode = "tap_upstream",
+): Promise<ConfigView> {
   return request("/api/config/proxy", {
     method: "PUT",
-    body: JSON.stringify({ proxy }),
+    body: JSON.stringify({ proxy, proxy_mode }),
   });
 }
 
@@ -698,15 +704,57 @@ export async function extractToDir(targetDir: string, file: File): Promise<{ pat
   return resp.json();
 }
 
-export function writeFile(
+export class FileWriteConflictError extends Error {
+  current_mtime: number | null;
+  expected_mtime: number | null;
+  constructor(currentMtime: number | null, expectedMtime: number | null, message?: string) {
+    super(message || "file was modified externally since editing began");
+    this.current_mtime = currentMtime;
+    this.expected_mtime = expectedMtime;
+  }
+}
+
+export async function writeFile(
   sessionId: string,
   path: string,
-  content: string
-): Promise<void> {
-  return request(`/api/sessions/${sessionId}/fs/write`, {
+  content: string,
+  opts?: { expectedMtime?: number | null; force?: boolean },
+): Promise<{ mtime: number | null }> {
+  const token = getToken();
+  const resp = await fetch(`/api/sessions/${sessionId}/fs/write`, {
     method: "PUT",
-    body: JSON.stringify({ path, content }),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      path,
+      content,
+      expected_mtime: opts?.expectedMtime ?? null,
+      force: !!opts?.force,
+    }),
   });
+  if (resp.status === 401) {
+    localStorage.removeItem("token");
+    window.location.reload();
+    throw new Error("unauthorized");
+  }
+  if (resp.status === 409) {
+    const body = await resp.json().catch(() => ({}));
+    const d = body?.detail;
+    if (d && typeof d === "object") {
+      throw new FileWriteConflictError(d.current_mtime ?? null, d.expected_mtime ?? null, d.message);
+    }
+    throw new FileWriteConflictError(null, null);
+  }
+  if (!resp.ok) {
+    const text = await resp.text();
+    let msg = text;
+    try {
+      const j = JSON.parse(text);
+      if (typeof j?.detail === "string") msg = j.detail;
+    } catch { /* */ }
+    throw new Error(msg || `HTTP ${resp.status}`);
+  }
+  const out = await resp.json().catch(() => ({}));
+  return { mtime: out?.mtime ?? null };
 }
 
 // Scheduled Tasks
@@ -753,7 +801,7 @@ export interface AuqQuestion {
   question: string;
   header?: string;
   multiSelect?: boolean;
-  options?: Array<{ label: string; description?: string }>;
+  options?: Array<{ label: string; description?: string; preview?: string }>;
 }
 export interface AuqEntry {
   tool_use_id: string;
@@ -1224,6 +1272,8 @@ export interface FileData {
   diff_raw?: string;
   is_binary?: boolean;
   size?: number;
+  mtime?: number;
+  total_lines?: number;
 }
 
 export interface TreeNode {
@@ -1238,14 +1288,28 @@ export function getCodeChangedFiles(sessionId: string): Promise<ChangedFile[]> {
   return request(`/api/sessions/${sessionId}/code/changed-files`);
 }
 
-export function getCodeFile(sessionId: string, path: string): Promise<FileData> {
-  return request(`/api/sessions/${sessionId}/code/file?path=${encodeURIComponent(path)}`);
+export function getCodeFile(
+  sessionId: string,
+  path: string,
+  opts?: { metaOnly?: boolean },
+): Promise<FileData> {
+  const qs = opts?.metaOnly ? "&meta_only=true" : "";
+  return request(`/api/sessions/${sessionId}/code/file?path=${encodeURIComponent(path)}${qs}`);
 }
 
 export function getCodeTree(sessionId: string, depth = 2, path = ""): Promise<TreeNode> {
   const params = new URLSearchParams({ depth: String(depth) });
   if (path) params.set("path", path);
   return request(`/api/sessions/${sessionId}/code/tree?${params}`);
+}
+
+export function getCodeSubdirs(sessionId: string, path = ""): Promise<{ path: string; dirs: string[] }> {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  return request(`/api/sessions/${sessionId}/code/dirs${qs}`);
+}
+
+export function checkCodePathExists(sessionId: string, path: string): Promise<{ exists: boolean; is_file: boolean }> {
+  return request(`/api/sessions/${sessionId}/code/exists?path=${encodeURIComponent(path)}`);
 }
 
 export interface UsageWindow {

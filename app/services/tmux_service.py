@@ -120,7 +120,6 @@ class TmuxService:
     def __init__(
         self,
         socket_name: str = "claude-web",
-        proxy: str = "",
         claude_bin: str = "claude",
         claude_shell: str = "",
         cursor_bin: str = "agent",
@@ -128,10 +127,6 @@ class TmuxService:
     ) -> None:
         self.socket_name = socket_name
         self._tmux = os.getenv("TMUX_BIN", "tmux")
-        self.proxy_env = (
-            {"http_proxy": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "HTTPS_PROXY": proxy}
-            if proxy else {}
-        )
         self.claude_bin = claude_bin or "claude"
         self.cursor_bin = cursor_bin or "agent"
         self.anthropic_proxy_port = anthropic_proxy_port
@@ -154,9 +149,22 @@ class TmuxService:
             quoted = " ".join(shlex.quote(part) for part in cmd)
             raise TmuxError(f"tmux failed: {quoted} ({stderr})") from exc
 
-    def _build_env_args(self, env: dict[str, str]) -> list[str]:
-        """Build tmux -e flags for proxy env + user env + PATH with claude_bin dir."""
-        merged = {**self.proxy_env, **env}
+    def _build_env_prefix(self, env: dict[str, str]) -> str:
+        """Build a shell `env K=V K=V ` prefix to inject vars at exec time.
+
+        Preferred over `tmux new-session -e ...`: tmux's `-e` writes into the
+        new session's env on top of the **server's global env**, and the tmux
+        server is a long-lived daemon whose global env is whatever it
+        inherited at server startup. If the server first started while
+        proxy_mode was tap_upstream, it captured ANTHROPIC_BASE_URL into its
+        global env and that variable leaks into every subsequent new-session
+        forever — `-e` can only override or add, not remove. Injecting at
+        exec time via the env(1) binary bypasses tmux's environment machinery
+        entirely; the spawned process sees exactly what we specify regardless
+        of server state.
+        """
+        from app.config import get_proxy_env
+        merged = {**get_proxy_env(), **env}
         # Always forward the current process PATH so the tmux session can find
         # binaries installed via nvm/pyenv/etc even when uvicorn was started
         # without a login shell (common in WSL).
@@ -167,12 +175,12 @@ class TmuxService:
             bin_dir = str(Path(self.claude_bin).parent)
             if bin_dir not in merged["PATH"].split(os.pathsep):
                 merged["PATH"] = f"{bin_dir}{os.pathsep}{merged['PATH']}"
-        args: list[str] = []
+        parts: list[str] = ["env"]
         for k, v in merged.items():
             # Skip empty values — passing empty proxy strings can confuse some tools
             if v:
-                args.extend(["-e", f"{k}={v}"])
-        return args
+                parts.append(shlex.quote(f"{k}={v}"))
+        return " ".join(parts) + " "
 
     def create_session(
         self,
@@ -188,7 +196,16 @@ class TmuxService:
         # preview streaming content before the CLI flushes JSONL. NO_PROXY
         # makes the local hop bypass the system upstream proxy; the tap proxy
         # itself walks the upstream proxy to reach api.anthropic.com.
-        if tool == "claude" and self.anthropic_proxy_port:
+        # Tap is only active when proxy_mode == "tap_upstream"; if the admin
+        # flipped mode to "real", we skip BASE_URL injection so Claude CLI hits
+        # api.anthropic.com directly via HTTPS_PROXY (the db proxy value).
+        from app.config import PROXY_MODE_TAP_UPSTREAM, get_proxy_mode
+        tap_active = (
+            tool == "claude"
+            and self.anthropic_proxy_port
+            and get_proxy_mode() == PROXY_MODE_TAP_UPSTREAM
+        )
+        if tap_active:
             tap_url = f"http://127.0.0.1:{self.anthropic_proxy_port}"
             existing_no = env.get("NO_PROXY") or env.get("no_proxy") or ""
             no_proxy = ",".join(filter(None, [existing_no, "127.0.0.1", "localhost"]))
@@ -199,7 +216,7 @@ class TmuxService:
                 "no_proxy": no_proxy,
             }
 
-        env_args = self._build_env_args(env)
+        env_prefix = self._build_env_prefix(env)
 
         if tool == "cursor":
             cursor_bin = shlex.quote(self.cursor_bin)
@@ -231,7 +248,12 @@ class TmuxService:
             else:
                 command = claude_cmd
 
-        self._run("new-session", "-d", "-s", session_name, "-c", cwd, *env_args, command)
+        # Prefix `env K=V ...` so the spawned process gets exactly the env we
+        # specify, bypassing the tmux server's (potentially stale) global env.
+        # See _build_env_prefix for the rationale.
+        command = env_prefix + command
+
+        self._run("new-session", "-d", "-s", session_name, "-c", cwd, command)
         try:
             self._run("set-option", "-t", session_name, "mouse", "off")
             self._run("set-option", "-t", session_name, "history-limit", "50000")

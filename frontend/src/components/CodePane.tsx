@@ -5,9 +5,10 @@ import {
   getCodeChangedFiles, getCodeFile,
   listFiles, fetchRawFileBlob,
   getGitInfo,
-  searchFiles, createDir, uploadFile, renameEntry, moveEntry, deleteEntry, writeFile,
+  searchFiles, createDir, uploadFile, renameEntry, moveEntry, deleteEntry, writeFile, FileWriteConflictError,
   downloadFile,
   getFileGitLog, getFileGitShow, getFileGitDiff,
+  getCodeSubdirs, checkCodePathExists,
   type ChangedFile, type FileData, type FileEntry,
   type GitLogEntry,
 } from "../api/sessionApi";
@@ -25,6 +26,14 @@ const MAX_TRANSFER_MB = 16;
 const MAX_TRANSFER_BYTES = MAX_TRANSFER_MB * 1024 * 1024;
 
 const POLL_MS = 8000;
+
+function humanBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
 
 // ── useResizeWidth: tracks the clientWidth of an element via ResizeObserver ──
 function useResizeWidth<T extends HTMLElement>() {
@@ -575,6 +584,164 @@ function CodeViewer({ data, scrollToFirst, diffOnly, noDiff }: { data: FileData;
   );
 }
 
+// ── Git history viewers (used by the per-file history modal) ─────────────
+
+// Map a file path's extension to an hljs language name. We deliberately keep
+// this list small — anything else falls through to "plaintext", which renders
+// safely-escaped text with no highlighting.
+function langForPath(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  const map: Record<string, string> = {
+    ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
+    py: "python", go: "go", rs: "rust", java: "java",
+    c: "c", h: "c", cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp",
+    rb: "ruby", php: "php", sh: "bash", bash: "bash", zsh: "bash",
+    md: "markdown", json: "json", jsonc: "json",
+    yaml: "yaml", yml: "yaml", toml: "ini", ini: "ini", cfg: "ini",
+    html: "xml", htm: "xml", xml: "xml",
+    css: "css", scss: "scss", less: "css",
+    sql: "sql", graphql: "graphql", gql: "graphql",
+  };
+  return map[ext] || "plaintext";
+}
+
+// Unified-diff renderer with syntax highlighting. Each line is colored by its
+// role (+/-/context/hunk) and its code content is hljs-highlighted using the
+// file's language. Mirrors the visual style of CodeViewer's per-line diff so
+// the history modal feels consistent with the main viewer.
+function HistoryDiffViewer({ diff, lang }: { diff: string; lang: string }) {
+  const safeLang = hljs.getLanguage(lang) ? lang : "plaintext";
+  const hl = (code: string) => {
+    try { return hljs.highlight(code || " ", { language: safeLang, ignoreIllegals: true }).value; }
+    catch { return (code || " ").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  };
+
+  if (!diff.trim()) {
+    return (
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 13 }}>
+        No diff available
+      </div>
+    );
+  }
+
+  const lines = diff.split("\n");
+  // Track old/new line numbers as we walk the hunks so each row gets a gutter
+  // number matching what the unified diff would show.
+  let oldLn = 0;
+  let newLn = 0;
+  const rows: Array<{
+    kind: "header" | "hunk" | "add" | "del" | "context" | "noNewline";
+    text: string;
+    oldLn: number | null;
+    newLn: number | null;
+  }> = [];
+
+  for (const raw of lines) {
+    if (raw.startsWith("@@")) {
+      const m = raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) { oldLn = parseInt(m[1]) - 1; newLn = parseInt(m[2]) - 1; }
+      rows.push({ kind: "hunk", text: raw, oldLn: null, newLn: null });
+    } else if (raw.startsWith("+++") || raw.startsWith("---") || raw.startsWith("diff --git") || raw.startsWith("index ")) {
+      rows.push({ kind: "header", text: raw, oldLn: null, newLn: null });
+    } else if (raw.startsWith("+")) {
+      newLn++;
+      rows.push({ kind: "add", text: raw.slice(1), oldLn: null, newLn });
+    } else if (raw.startsWith("-")) {
+      oldLn++;
+      rows.push({ kind: "del", text: raw.slice(1), oldLn, newLn: null });
+    } else if (raw.startsWith("\\")) {
+      rows.push({ kind: "noNewline", text: raw, oldLn: null, newLn: null });
+    } else if (raw.startsWith(" ")) {
+      oldLn++; newLn++;
+      rows.push({ kind: "context", text: raw.slice(1), oldLn, newLn });
+    }
+    // skip silently: pre-hunk garbage, blank lines
+  }
+
+  return (
+    <div style={{
+      flex: 1, overflowY: "auto", overflowX: "auto", background: "var(--bg-base)",
+      fontFamily: '"Cascadia Code","Fira Code",Menlo,Monaco,"Courier New",monospace',
+      fontSize: 12, lineHeight: `${LINE_H}px`,
+    }}>
+      <table style={{ borderCollapse: "collapse", minWidth: "100%" }}>
+        <colgroup>
+          <col style={{ width: 44 }} />
+          <col style={{ width: 44 }} />
+          <col />
+        </colgroup>
+        <tbody>
+          {rows.map((row, i) => {
+            if (row.kind === "header") {
+              return (
+                <tr key={i}>
+                  <td colSpan={3} style={{
+                    padding: "1px 12px", color: "var(--text-faint)", fontSize: 11,
+                    background: "var(--bg-surface)", borderBottom: "1px solid var(--bg-hover)",
+                    whiteSpace: "pre-wrap", wordBreak: "break-all", userSelect: "none",
+                  }}>{row.text}</td>
+                </tr>
+              );
+            }
+            if (row.kind === "hunk") {
+              return (
+                <tr key={i}>
+                  <td colSpan={3} style={{
+                    padding: "2px 12px", color: "var(--accent-blue)", fontSize: 11,
+                    background: "color-mix(in srgb, var(--accent-blue) 10%, var(--bg-surface))",
+                    borderTop: "1px solid var(--bg-hover)", borderBottom: "1px solid var(--bg-hover)",
+                    whiteSpace: "pre-wrap", wordBreak: "break-all", userSelect: "none",
+                  }}>{row.text}</td>
+                </tr>
+              );
+            }
+            if (row.kind === "noNewline") {
+              return (
+                <tr key={i}>
+                  <td colSpan={3} style={{
+                    padding: "0 12px", color: "var(--text-faint)", fontSize: 11,
+                    whiteSpace: "pre-wrap", userSelect: "none",
+                  }}>{row.text}</td>
+                </tr>
+              );
+            }
+            const isAdd = row.kind === "add";
+            const isDel = row.kind === "del";
+            const bg = isAdd ? "var(--diff-add-bg)" : isDel ? "var(--diff-del-bg)" : "transparent";
+            const numColor = isAdd ? "var(--accent-green)" : isDel ? "var(--accent-red)" : "var(--text-faint)";
+            const borderLeft = isAdd
+              ? "2px solid var(--diff-add-prefix)"
+              : isDel
+                ? "2px solid var(--diff-del-prefix)"
+                : "2px solid transparent";
+            return (
+              <tr key={i} style={{ background: bg }}>
+                <td style={{
+                  textAlign: "right", paddingRight: 6, paddingLeft: 8,
+                  color: numColor, userSelect: "none", whiteSpace: "nowrap",
+                  verticalAlign: "top", fontSize: 11,
+                }}>{row.oldLn ?? ""}</td>
+                <td style={{
+                  textAlign: "right", paddingRight: 8, paddingLeft: 4,
+                  color: numColor, userSelect: "none", whiteSpace: "nowrap",
+                  verticalAlign: "top", fontSize: 11,
+                }}>{row.newLn ?? ""}</td>
+                <td style={{
+                  paddingRight: 24, paddingLeft: 8,
+                  whiteSpace: "pre-wrap", wordBreak: "break-all", verticalAlign: "top",
+                  borderLeft,
+                }}
+                  dangerouslySetInnerHTML={{ __html: hl(row.text) }}
+                />
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ── Status colors ─────────────────────────────────────────────────────────
 
 const STATUS_COLORS: Record<string, string> = {
@@ -913,6 +1080,13 @@ function ViewerHeader({
   onCancelEdit?: () => void;
 }) {
   const name = path.split("/").pop() ?? path;
+  const sizeText = fileData?.size != null ? humanBytes(fileData.size) : null;
+  const isTextFile = !!fileData && !fileData.is_binary && !showImage && !showSqlite;
+  const linesText = isTextFile && fileData?.total_lines != null
+    ? (fileData.truncated
+        ? `${fileData.total_lines.toLocaleString()} lines (showing first 3000)`
+        : `${fileData.total_lines.toLocaleString()} lines`)
+    : null;
   return (
     <div style={{
       padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0,
@@ -921,6 +1095,13 @@ function ViewerHeader({
       <FileIcon name={name} />
       <span style={{ color: "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {path}
+        {(sizeText || linesText) && (
+          <span style={{ marginLeft: 8, color: "var(--text-faint)", fontSize: 11 }}>
+            {sizeText}
+            {sizeText && linesText ? " · " : ""}
+            {linesText}
+          </span>
+        )}
       </span>
       {selectedChanged && (
         <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 3, background: "var(--bg-hover)", color: STATUS_COLORS[selectedChanged.status] ?? "var(--text-secondary)", flexShrink: 0 }}>
@@ -1131,11 +1312,12 @@ function ViewerContent({
 
 // ── FileViewerPane — standalone file viewer (used in main layout) ─────────
 
-export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full", noDiff }: {
+export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full", noDiff, onDirtyChange }: {
   sessionId: string;
   path: string;
   viewMode?: "full" | "diff" | "split";
   noDiff?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [fileData, setFileData] = useState<FileData | null>(null);
   const [fileLoading, setFileLoading] = useState(true);
@@ -1145,6 +1327,10 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const [editBuffer, setEditBuffer] = useState<string>("");
   const [saving, setSaving] = useState(false);
   const [columnMode, setColumnMode] = useState(false);
+  // mtime captured the moment the user clicked EDIT; sent on save so the
+  // backend can return 409 if the file was modified externally meanwhile.
+  const [editStartMtime, setEditStartMtime] = useState<number | null>(null);
+  const [conflict, setConflict] = useState<{ currentMtime: number | null } | null>(null);
   const editingRef = useRef(false);
   const cmRef = useRef<CodeMirrorEditorHandle | null>(null);
   const name = path.split("/").pop() ?? path;
@@ -1160,20 +1346,26 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
     setMdPreview(isMdFile(n) || isCsvFile(n));
     setEditing(false);
     setEditBuffer("");
+    setEditStartMtime(null);
+    setConflict(null);
   }, [path]);
 
   useEffect(() => {
     const n = path.split("/").pop() ?? path;
-    if (isArchiveFile(n) || isSqliteFile(n) || isPdfFile(n) || isImage(n)) {
-      setFileData(null); setFileLoading(false); return;
-    }
+    const metaOnly = isArchiveFile(n) || isSqliteFile(n) || isPdfFile(n) || isImage(n);
     let mounted = true;
     setFileData(null);
     setFileLoading(true);
-    const fetch = () => getCodeFile(sessionId, path)
+    const fetch = (opts?: { metaOnly?: boolean }) => getCodeFile(sessionId, path, opts)
       .then(d => { if (mounted) { setFileData(d); setFileLoading(false); } })
       .catch(() => { if (mounted) setFileLoading(false); });
-    fetch();
+    fetch(metaOnly ? { metaOnly: true } : undefined);
+    if (metaOnly) {
+      // Specialized viewers (sqlite/archive/pdf/image) render content
+      // themselves; we only need a one-shot meta fetch so the header can
+      // show size. No polling.
+      return () => { mounted = false; };
+    }
     const id = setInterval(() => {
       if (!mounted || editingRef.current) return;
       getCodeFile(sessionId, path).then(d => { if (mounted && !editingRef.current) setFileData(d); }).catch(() => {});
@@ -1222,6 +1414,14 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const canEdit = !!fileData && !fileData.is_binary && !showSqlite && !showArchive && !showPdf && !showImage;
   const isModified = editing && !!fileData && editBuffer !== fileData.content;
 
+  useEffect(() => {
+    onDirtyChange?.(isModified);
+  }, [isModified, onDirtyChange]);
+  useEffect(() => {
+    return () => { onDirtyChange?.(false); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onDownload = async () => {
     if (fileData?.size != null && fileData.size > MAX_TRANSFER_BYTES) {
       alert(`File is too large to download (${(fileData.size / 1024 / 1024).toFixed(1)} MB). Limit is ${MAX_TRANSFER_MB} MB.`);
@@ -1233,30 +1433,58 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const beginEdit = () => {
     if (!fileData || saving) return;
     setEditBuffer(fileData.content);
+    setEditStartMtime(fileData.mtime ?? null);
     setEditing(true);
     setTimeout(() => cmRef.current?.focus(), 30);
   };
 
-  const handleSave = async () => {
-    if (!fileData || saving || !isModified) return;
+  const doSave = async (force: boolean) => {
+    if (!fileData) return;
     setSaving(true);
     try {
-      await writeFile(sessionId, path, editBuffer);
+      const out = await writeFile(sessionId, path, editBuffer, {
+        expectedMtime: editStartMtime,
+        force,
+      });
       const fresh = await getCodeFile(sessionId, path).catch(() => null);
       if (fresh) setFileData(fresh);
+      else if (out.mtime != null) setEditStartMtime(out.mtime);
       setEditing(false);
       setEditBuffer("");
+      setEditStartMtime(null);
+      setConflict(null);
     } catch (e) {
-      alert(String(e));
+      if (e instanceof FileWriteConflictError) {
+        setConflict({ currentMtime: e.current_mtime });
+      } else {
+        alert(String(e));
+      }
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSave = () => {
+    if (!fileData || saving || !isModified) return;
+    void doSave(false);
+  };
+
+  const reloadFromDisk = async () => {
+    const fresh = await getCodeFile(sessionId, path).catch(() => null);
+    if (fresh) {
+      setFileData(fresh);
+      setEditBuffer(fresh.content);
+      setEditStartMtime(fresh.mtime ?? null);
+    }
+    setConflict(null);
   };
 
   const cancelEdit = () => {
     if (saving) return;
     setEditing(false);
     setEditBuffer("");
+    setEditStartMtime(null);
+    setConflict(null);
   };
 
   return (
@@ -1344,6 +1572,422 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
           viewMode={viewMode}
           mdPreview={mdPreview}
           noDiff={noDiff}
+        />
+      )}
+      {conflict && (
+        <div
+          onClick={() => setConflict(null)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 110,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              minWidth: 380, maxWidth: 560,
+              background: "var(--bg-modal)", border: "1px solid var(--border)",
+              borderRadius: 6, padding: "14px 16px",
+              boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+              display: "flex", flexDirection: "column", gap: 10,
+              fontSize: 12, color: "var(--text-body)",
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-orange, #d59f00)" }}>
+              File modified externally
+            </div>
+            <div style={{ color: "var(--text-secondary)" }}>
+              <code style={{ color: "var(--text-body)" }}>{path}</code> changed on disk after you started editing.
+              Saving now would overwrite those changes.
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
+              <button
+                onClick={() => setConflict(null)}
+                disabled={saving}
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: saving ? "default" : "pointer",
+                  background: "var(--bg-surface)", color: "var(--text-body)",
+                  border: "1px solid var(--border)", borderRadius: 3,
+                  opacity: saving ? 0.6 : 1,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { void reloadFromDisk(); }}
+                disabled={saving}
+                title="Discard your edits and reload the on-disk version"
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: saving ? "default" : "pointer",
+                  background: "var(--bg-surface)", color: "var(--text-body)",
+                  border: "1px solid var(--border)", borderRadius: 3,
+                  opacity: saving ? 0.6 : 1,
+                }}
+              >
+                Reload from disk
+              </button>
+              <button
+                onClick={() => { void doSave(true); }}
+                disabled={saving}
+                title="Overwrite the on-disk file with your edits"
+                style={{
+                  padding: "5px 12px", fontSize: 12, cursor: saving ? "default" : "pointer",
+                  background: "var(--accent-orange, #d59f00)", color: "#1c2128",
+                  border: "1px solid var(--accent-orange, #d59f00)", borderRadius: 3,
+                  fontWeight: 600,
+                  opacity: saving ? 0.6 : 1,
+                }}
+              >
+                {saving ? "Saving…" : "Force overwrite"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Save-As modal (used by scratch tabs) ─────────────────────────────────
+// Cascading directory picker: each chosen segment loads the next level. The
+// final filename is a free-text input. Before saving, we hit /code/exists to
+// confirm overwrite when the target already exists.
+function SaveAsModal({
+  sessionId,
+  defaultName,
+  content,
+  onSaved,
+  onCancel,
+}: {
+  sessionId: string;
+  defaultName: string;
+  content: string;
+  onSaved: (path: string) => void;
+  onCancel: () => void;
+}) {
+  // segments[i] is the directory chosen at level i (relative to cwd).
+  // levels[i] is the list of subdirs at the prefix segments[0..i-1].
+  const [segments, setSegments] = useState<string[]>([]);
+  const [levels, setLevels] = useState<string[][]>([[]]);
+  const [filename, setFilename] = useState(defaultName);
+  const [saving, setSaving] = useState(false);
+  const [overwriteAsk, setOverwriteAsk] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Load level 0 on mount.
+  useEffect(() => {
+    let mounted = true;
+    getCodeSubdirs(sessionId, "")
+      .then(r => { if (mounted) setLevels([r.dirs]); })
+      .catch(() => { if (mounted) setLevels([[]]); });
+    return () => { mounted = false; };
+  }, [sessionId]);
+
+  // When user picks a subdir at level k, append/replace segment, load level k+1.
+  const pickAtLevel = async (k: number, name: string) => {
+    const nextSegments = name === "" ? segments.slice(0, k) : [...segments.slice(0, k), name];
+    setSegments(nextSegments);
+    if (name === "") {
+      // "(save here)" — truncate levels too
+      setLevels(prev => prev.slice(0, k + 1));
+      return;
+    }
+    const prefix = nextSegments.join("/");
+    try {
+      const r = await getCodeSubdirs(sessionId, prefix);
+      setLevels(prev => {
+        const next = prev.slice(0, k + 1);
+        next.push(r.dirs);
+        return next;
+      });
+    } catch {
+      setLevels(prev => prev.slice(0, k + 1));
+    }
+  };
+
+  const dirPath = segments.join("/");
+  const fullPath = dirPath ? `${dirPath}/${filename}` : filename;
+  const canSave = filename.trim().length > 0 && !saving;
+
+  const attemptSave = async () => {
+    setError(null);
+    if (!canSave) return;
+    try {
+      const r = await checkCodePathExists(sessionId, fullPath);
+      if (r.exists) {
+        setOverwriteAsk(true);
+        return;
+      }
+    } catch {
+      // Treat lookup failure as "not exists" — write call will surface real error.
+    }
+    void doWrite(false);
+  };
+
+  const doWrite = async (overwrite: boolean) => {
+    setOverwriteAsk(false);
+    setSaving(true);
+    try {
+      await writeFile(sessionId, fullPath, content, {
+        expectedMtime: overwrite ? null : null,
+        force: overwrite,
+      });
+      onSaved(fullPath);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      onClick={onCancel}
+      style={{
+        position: "fixed", inset: 0, zIndex: 120,
+        background: "rgba(0,0,0,0.45)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          minWidth: 460, maxWidth: 640,
+          background: "var(--bg-modal)", border: "1px solid var(--border)",
+          borderRadius: 6, padding: "14px 16px",
+          boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+          display: "flex", flexDirection: "column", gap: 10,
+          fontSize: 12, color: "var(--text-body)",
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Save scratch file</div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ color: "var(--text-secondary)" }}>Directory (relative to session cwd):</div>
+          <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ color: "var(--text-faint)", fontFamily: "var(--font-mono, monospace)" }}>./</span>
+            {levels.map((opts, k) => {
+              const selected = segments[k] ?? "";
+              return (
+                <div key={k} style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                  <select
+                    value={selected}
+                    onChange={(e) => { void pickAtLevel(k, e.target.value); }}
+                    style={{
+                      padding: "3px 6px", fontSize: 11,
+                      background: "var(--bg-surface)", color: "var(--text-body)",
+                      border: "1px solid var(--border)", borderRadius: 3,
+                      maxWidth: 200,
+                    }}
+                  >
+                    <option value="">(here)</option>
+                    {opts.map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                  {selected && <span style={{ color: "var(--text-faint)" }}>/</span>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ color: "var(--text-secondary)" }}>Filename:</div>
+          <input
+            value={filename}
+            onChange={(e) => setFilename(e.target.value)}
+            autoFocus
+            spellCheck={false}
+            style={{
+              padding: "5px 8px", fontSize: 12,
+              background: "var(--bg-surface)", color: "var(--text-body)",
+              border: "1px solid var(--border)", borderRadius: 3,
+              fontFamily: "var(--font-mono, monospace)",
+            }}
+          />
+        </div>
+
+        <div style={{
+          padding: "4px 8px", fontSize: 11,
+          background: "var(--bg-base)", border: "1px solid var(--border-subtle)",
+          borderRadius: 3, fontFamily: "var(--font-mono, monospace)",
+          color: "var(--text-faint)", wordBreak: "break-all",
+        }}>
+          → ./{fullPath}
+        </div>
+
+        {error && (
+          <div style={{ color: "var(--accent-red, #d57f7f)", fontSize: 11 }}>{error}</div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4 }}>
+          <button
+            onClick={onCancel}
+            disabled={saving}
+            style={{
+              padding: "5px 12px", fontSize: 12, cursor: saving ? "default" : "pointer",
+              background: "var(--bg-surface)", color: "var(--text-body)",
+              border: "1px solid var(--border)", borderRadius: 3,
+              opacity: saving ? 0.6 : 1,
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => { void attemptSave(); }}
+            disabled={!canSave}
+            style={{
+              padding: "5px 12px", fontSize: 12, cursor: !canSave ? "default" : "pointer",
+              background: "var(--accent-blue)", color: "#fff",
+              border: "1px solid var(--accent-blue)", borderRadius: 3,
+              fontWeight: 600,
+              opacity: !canSave ? 0.6 : 1,
+            }}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+
+        {overwriteAsk && (
+          <div
+            onClick={() => setOverwriteAsk(false)}
+            style={{
+              position: "fixed", inset: 0, zIndex: 130,
+              background: "rgba(0,0,0,0.55)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                minWidth: 360, maxWidth: 520,
+                background: "var(--bg-modal)", border: "1px solid var(--border)",
+                borderRadius: 6, padding: "14px 16px",
+                boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+                display: "flex", flexDirection: "column", gap: 10,
+                fontSize: 12, color: "var(--text-body)",
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-orange, #d59f00)" }}>
+                File already exists
+              </div>
+              <div style={{ color: "var(--text-secondary)" }}>
+                <code style={{ color: "var(--text-body)" }}>./{fullPath}</code> already exists.
+                Overwrite it?
+              </div>
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4 }}>
+                <button
+                  onClick={() => setOverwriteAsk(false)}
+                  style={{
+                    padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                    background: "var(--bg-surface)", color: "var(--text-body)",
+                    border: "1px solid var(--border)", borderRadius: 3,
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => { void doWrite(true); }}
+                  style={{
+                    padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                    background: "var(--accent-orange, #d59f00)", color: "#1c2128",
+                    border: "1px solid var(--accent-orange, #d59f00)", borderRadius: 3,
+                    fontWeight: 600,
+                  }}
+                >
+                  Overwrite
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── ScratchEditorPane — in-memory text buffer until first save ────────────
+// Content lives in the tab's state (passed in via `content`/`onContentChange`)
+// so it persists across tab switches and page reloads (localStorage). Once
+// saved, the parent promotes the scratch tab to a real FileTab; this pane
+// unmounts and FileViewerPane takes over.
+export function ScratchEditorPane({
+  sessionId,
+  title,
+  content,
+  onContentChange,
+  onDirtyChange,
+  onSaved,
+}: {
+  sessionId: string;
+  title: string;
+  content: string;
+  onContentChange: (c: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  onSaved: (path: string) => void;
+}) {
+  const cmRef = useRef<CodeMirrorEditorHandle | null>(null);
+  const [showSaveAs, setShowSaveAs] = useState(false);
+  const [columnMode, setColumnMode] = useState(false);
+
+  // Scratch is dirty whenever there's any content (it has never been saved).
+  const isDirty = content.length > 0;
+  useEffect(() => { onDirtyChange?.(isDirty); }, [isDirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+
+  useEffect(() => { setTimeout(() => cmRef.current?.focus(), 30); }, []);
+
+  return (
+    <div style={{ display: "flex", flex: 1, flexDirection: "column", minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
+      <div style={{
+        padding: "4px 14px", borderBottom: "1px solid var(--bg-hover)",
+        display: "flex", alignItems: "center", gap: 10, background: "var(--bg-base)", flexShrink: 0,
+      }}>
+        <span style={{ fontSize: 11, color: "var(--text-body)", fontWeight: 600 }}>{title}</span>
+        <span style={{ fontSize: 10, color: "var(--text-faint)" }}>
+          scratch · not yet saved {isDirty ? "· modified" : ""}
+        </span>
+        <div style={{ flex: 1 }} />
+        <button
+          onClick={() => setColumnMode(v => !v)}
+          title={columnMode ? "Column-select mode ON" : "Column-select mode OFF"}
+          style={{
+            padding: "2px 8px", fontSize: 11, fontFamily: "monospace",
+            background: columnMode ? "var(--accent-blue)" : "var(--bg-elevated)",
+            color: columnMode ? "#fff" : "var(--text-secondary)",
+            border: "1px solid var(--bg-hover)", borderRadius: 3, cursor: "pointer",
+          }}
+        >
+          COL {columnMode ? "ON" : "OFF"}
+        </button>
+        <button
+          onClick={() => setShowSaveAs(true)}
+          title="Save scratch file (choose path + filename)"
+          style={{
+            padding: "3px 12px", fontSize: 11,
+            background: "var(--accent-blue)", color: "#fff",
+            border: "1px solid var(--accent-blue)", borderRadius: 3,
+            cursor: "pointer", fontWeight: 600,
+          }}
+        >
+          Save As…
+        </button>
+      </div>
+      <CodeMirrorEditor
+        ref={cmRef}
+        content={content}
+        ext="txt"
+        onChange={onContentChange}
+        onSave={() => setShowSaveAs(true)}
+        columnMode={columnMode}
+      />
+      {showSaveAs && (
+        <SaveAsModal
+          sessionId={sessionId}
+          defaultName={`${title}.txt`}
+          content={content}
+          onSaved={(p) => { setShowSaveAs(false); onSaved(p); }}
+          onCancel={() => setShowSaveAs(false)}
         />
       )}
     </div>
@@ -2055,14 +2699,40 @@ export function CodePane({
                   );
                 })}
               </div>
-              {historyTarget.selected && (
-                <div style={{ flex: 1, overflow: "auto", background: "var(--bg-base)", padding: 0 }}>
-                  {historyTarget.selected.viewMode === "diff"
-                    ? <pre style={{ margin: 0, padding: 12, fontSize: 11, fontFamily: "monospace", color: "var(--text-primary)", whiteSpace: "pre", overflow: "visible" }}>{historyTarget.selected.diff || "(loading)"}</pre>
-                    : <pre style={{ margin: 0, padding: 12, fontSize: 11, fontFamily: "monospace", color: "var(--text-primary)", whiteSpace: "pre", overflow: "visible" }}>{historyTarget.selected.full || "(loading)"}</pre>
-                  }
-                </div>
-              )}
+              {historyTarget.selected && (() => {
+                const sel = historyTarget.selected;
+                const lang = langForPath(historyTarget.path);
+                const isLoading = !sel.diff && !sel.full;
+                if (isLoading) {
+                  return (
+                    <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 12 }}>
+                      Loading…
+                    </div>
+                  );
+                }
+                if (sel.viewMode === "diff") {
+                  return (
+                    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, background: "var(--bg-base)" }}>
+                      <HistoryDiffViewer diff={sel.diff} lang={lang} />
+                    </div>
+                  );
+                }
+                // Full mode: reuse the standard CodeViewer so we get
+                // line numbers + hljs highlighting identical to the file viewer.
+                const fileData: FileData = {
+                  path: historyTarget.path,
+                  content: sel.full,
+                  language: lang,
+                  added_lines: [],
+                  removed_lines: [],
+                  truncated: false,
+                };
+                return (
+                  <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, background: "var(--bg-base)" }}>
+                    <CodeViewer data={fileData} scrollToFirst={false} noDiff />
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>

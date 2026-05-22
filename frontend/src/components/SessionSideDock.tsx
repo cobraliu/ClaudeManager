@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import {
   listSessionAuqs,
   type AuqEntry,
@@ -31,6 +31,8 @@ interface Props {
   goalHistory: Goal[];
   /** Triggered if the dock wants to force a refresh of todos. */
   onTodosChanged: () => void;
+  /** Width in pixels; controlled by the parent via a drag handle. */
+  width?: number;
 }
 
 function loadCollapsed(): Record<SectionKey, boolean> {
@@ -70,6 +72,7 @@ export function SessionSideDock({
   sessionId, sessionName, isCursor,
   open, onClose,
   todos, todoHistory, activeGoal, goalHistory, onTodosChanged,
+  width = 380,
 }: Props) {
   const [collapsed, setCollapsed] = useState<Record<SectionKey, boolean>>(loadCollapsed);
 
@@ -81,13 +84,25 @@ export function SessionSideDock({
     });
   };
 
+  // Auto-expand a section the moment it transitions from closed → open.
+  const prevOpen = useRef(open);
+  useEffect(() => {
+    const prev = prevOpen.current;
+    prevOpen.current = open;
+    (Object.keys(open) as SectionKey[]).forEach((key) => {
+      if (open[key] && !prev[key]) {
+        setSectionCollapsed(key, false);
+      }
+    });
+  }, [open]);
+
   const anyOpen = open.auqs || open.tasks || open.goals;
   if (!anyOpen) return null;
 
   return (
     <div
       style={{
-        width: 380,
+        width,
         flexShrink: 0,
         borderLeft: "1px solid var(--border)",
         background: "var(--bg-surface)",
@@ -336,6 +351,23 @@ function AuqCard({ auq, indexLabel }: { auq: AuqEntry; indexLabel: number }) {
                         <span style={{ color: "var(--text-faint)", marginLeft: 6, fontWeight: 400 }}>
                           — {opt.description}
                         </span>
+                      )}
+                      {opt.preview && (
+                        <pre
+                          style={{
+                            margin: "4px 0 0",
+                            padding: "5px 7px",
+                            background: "var(--bg-deep)",
+                            border: "1px solid var(--border-subtle)",
+                            borderRadius: 3,
+                            fontSize: 10.5,
+                            lineHeight: 1.35,
+                            color: "var(--text-secondary)",
+                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                            overflow: "auto",
+                            whiteSpace: "pre",
+                          }}
+                        >{opt.preview}</pre>
                       )}
                     </div>
                   );

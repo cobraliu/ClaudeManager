@@ -9,6 +9,7 @@ export interface UserConfig {
   chatCentricRightWidth: number;
   fileCentricTreeWidth: number;
   fileCentricChatWidth: number;
+  sideDockWidth: number;
 }
 
 const STORAGE_KEY = "cm_user_config_v1";
@@ -20,6 +21,7 @@ const DEFAULT_CONFIG: UserConfig = {
   chatCentricRightWidth: 320,
   fileCentricTreeWidth: 200,
   fileCentricChatWidth: 460,
+  sideDockWidth: 380,
 };
 
 function loadConfig(): UserConfig {

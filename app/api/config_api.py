@@ -8,10 +8,13 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from app.config import (
+    PROXY_MODE_REAL,
+    PROXY_MODE_TAP_UPSTREAM,
     get_claude_bin,
     get_cursor_bin,
     get_default_workspace,
     get_proxy,
+    get_proxy_mode,
     get_term_idle_grace_seconds,
     get_term_standby_grace_seconds,
     get_terminal_font,
@@ -19,6 +22,7 @@ from app.config import (
     set_cursor_bin,
     set_default_workspace,
     set_proxy,
+    set_proxy_mode,
     set_term_idle_grace_seconds,
     set_term_standby_grace_seconds,
     set_terminal_font,
@@ -36,6 +40,7 @@ class ConfigView(BaseModel):
     claude_bin: str
     cursor_bin: str
     proxy: str
+    proxy_mode: str  # "tap_upstream" | "real"
     terminal_font: str
     term_idle_grace_seconds: int = 600
     term_standby_grace_seconds: int = 30
@@ -55,6 +60,7 @@ class CursorBinUpdateRequest(BaseModel):
 
 class ProxyUpdateRequest(BaseModel):
     proxy: str
+    proxy_mode: str = PROXY_MODE_TAP_UPSTREAM
 
 
 class TerminalFontRequest(BaseModel):
@@ -74,6 +80,7 @@ def _full_config() -> ConfigView:
         claude_bin=get_claude_bin(),
         cursor_bin=get_cursor_bin(),
         proxy=get_proxy(),
+        proxy_mode=get_proxy_mode(),
         terminal_font=get_terminal_font(),
         term_idle_grace_seconds=get_term_idle_grace_seconds(),
         term_standby_grace_seconds=get_term_standby_grace_seconds(),
@@ -105,7 +112,12 @@ def update_cursor_bin(body: CursorBinUpdateRequest, _admin: AdminUser) -> Config
 
 @router.put("/proxy")
 def update_proxy(body: ProxyUpdateRequest, _admin: AdminUser) -> ConfigView:
+    mode = body.proxy_mode.strip() or PROXY_MODE_TAP_UPSTREAM
+    if mode not in (PROXY_MODE_TAP_UPSTREAM, PROXY_MODE_REAL):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"invalid proxy_mode: {mode}")
     set_proxy(body.proxy.strip())
+    set_proxy_mode(mode)
     return _full_config()
 
 
