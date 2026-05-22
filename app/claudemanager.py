@@ -30,7 +30,6 @@ from app.config import (
     get_claude_shell,
     get_cursor_bin,
     get_default_admin,
-    get_proxy,
     get_session_db_path,
     get_term_idle_grace_seconds,
     get_term_standby_grace_seconds,
@@ -58,7 +57,6 @@ if os.environ.get("CLAUDE_PROXY_DISABLED", "").strip() in ("1", "true", "True", 
 else:
     _anthropic_proxy_port = int(os.environ.get("CLAUDE_PROXY_PORT", "19098"))
 tmux = TmuxService(
-    proxy=get_proxy(),
     claude_bin=get_claude_bin(),
     claude_shell=get_claude_shell(),
     cursor_bin=get_cursor_bin(),

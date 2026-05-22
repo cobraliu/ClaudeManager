@@ -203,11 +203,14 @@ export function setUserIsAdmin(username: string, is_admin: boolean): Promise<Use
 }
 
 // Config
+export type ProxyMode = "tap_upstream" | "real";
+
 export interface ConfigView {
   workspace: string;
   claude_bin: string;
   cursor_bin: string;
   proxy: string;
+  proxy_mode: ProxyMode;
   terminal_font: string;
   term_idle_grace_seconds: number;
   term_standby_grace_seconds: number;
@@ -254,10 +257,13 @@ export function setCursorBin(cursor_bin: string): Promise<ConfigView> {
   });
 }
 
-export function setProxy(proxy: string): Promise<ConfigView> {
+export function setProxy(
+  proxy: string,
+  proxy_mode: ProxyMode = "tap_upstream",
+): Promise<ConfigView> {
   return request("/api/config/proxy", {
     method: "PUT",
-    body: JSON.stringify({ proxy }),
+    body: JSON.stringify({ proxy, proxy_mode }),
   });
 }
 

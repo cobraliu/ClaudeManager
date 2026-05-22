@@ -154,7 +154,12 @@ class StreamAggregator:
 
 
 def _parse_sse_chunk(buf: str) -> tuple[list[tuple[str, dict[str, Any]]], str]:
-    """Parse complete SSE events out of `buf`. Returns (events, leftover)."""
+    """Parse complete SSE events out of `buf`. Returns (events, leftover).
+
+    SSE allows \\n\\n or \\r\\n\\r\\n as event separators; normalise to \\n so a
+    single buf.find handles both upstream conventions.
+    """
+    buf = buf.replace("\r\n", "\n")
     events: list[tuple[str, dict[str, Any]]] = []
     while True:
         sep = buf.find("\n\n")
@@ -178,7 +183,11 @@ def _parse_sse_chunk(buf: str) -> tuple[list[tuple[str, dict[str, Any]]], str]:
         events.append((event_name, data))
 
 
-async def handle(request: web.Request, upstream_proxy: str | None) -> web.StreamResponse:
+async def handle(
+    request: web.Request,
+    upstream_proxy: str | None,
+    shared_connector: aiohttp.TCPConnector,
+) -> web.StreamResponse:
     url = f"{UPSTREAM_HOST}{request.path_qs}"
     body = await request.read()
 
@@ -193,9 +202,15 @@ async def handle(request: web.Request, upstream_proxy: str | None) -> web.Stream
     aggregator = StreamAggregator(session_id, session_dir) if session_dir else None
 
     timeout = aiohttp.ClientTimeout(total=None, sock_read=600, connect=30)
-    connector = aiohttp.TCPConnector(limit=0)
+    client_gone = False
     try:
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as s:
+        # connector_owner=False keeps the app-wide TCPConnector alive across requests
+        # so TLS handshakes to api.anthropic.com get reused (big win for SSE).
+        async with aiohttp.ClientSession(
+            connector=shared_connector,
+            connector_owner=False,
+            timeout=timeout,
+        ) as s:
             async with s.request(
                 request.method, url,
                 data=body if body else None,
@@ -217,8 +232,17 @@ async def handle(request: web.Request, upstream_proxy: str | None) -> web.Stream
                 async for chunk in upstream.content.iter_any():
                     try:
                         await resp.write(chunk)
-                    except (ConnectionResetError, asyncio.CancelledError):
+                    except ConnectionResetError:
+                        client_gone = True
                         break
+                    except asyncio.CancelledError:
+                        # Task cancellation must propagate after we flush the
+                        # final snapshot — swallowing it here would mask
+                        # caller-driven shutdowns and leak the upstream socket.
+                        client_gone = True
+                        if is_sse and aggregator and aggregator._dirty:
+                            aggregator.maybe_snapshot(kind="final")
+                        raise
                     if is_sse:
                         try:
                             sse_buf += chunk.decode("utf-8", errors="replace")
@@ -234,9 +258,18 @@ async def handle(request: web.Request, upstream_proxy: str | None) -> web.Stream
                 if is_sse and aggregator and aggregator._dirty:
                     aggregator.maybe_snapshot(kind="final")
 
-                await resp.write_eof()
+                if not client_gone:
+                    try:
+                        await resp.write_eof()
+                    except (ConnectionResetError, asyncio.CancelledError):
+                        # Client vanished between last chunk and EOF — ignore
+                        # the broken write so we don't log a spurious 500.
+                        pass
                 return resp
-    except aiohttp.ClientError as exc:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        # aiohttp.ClientError does NOT subclass asyncio.TimeoutError; list both
+        # explicitly so sock-read/connect timeouts return a clean 502 instead
+        # of bubbling up as unhandled task exceptions.
         log.warning("upstream error for %s: %s", url, exc)
         return web.Response(status=502, text=f"proxy upstream error: {exc}")
 
@@ -244,11 +277,28 @@ async def handle(request: web.Request, upstream_proxy: str | None) -> web.Stream
 def make_app(upstream_proxy: str | None) -> web.Application:
     app = web.Application(client_max_size=64 * 1024 * 1024)
 
+    # One TCPConnector shared by every request: lets aiohttp reuse the TLS
+    # session to api.anthropic.com instead of doing a fresh handshake per call.
+    # Created/closed via aiohttp app lifecycle hooks so it's torn down cleanly.
+    async def _on_startup(app_: web.Application) -> None:
+        app_["shared_connector"] = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+
+    async def _on_cleanup(app_: web.Application) -> None:
+        conn = app_.get("shared_connector")
+        if conn is not None:
+            await conn.close()
+
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+
     async def health(_req: web.Request) -> web.Response:
         return web.json_response({"ok": True, "upstream_proxy": upstream_proxy or ""})
 
+    async def _dispatch(req: web.Request) -> web.StreamResponse:
+        return await handle(req, upstream_proxy, req.app["shared_connector"])
+
     app.router.add_get("/_proxy_health", health)
-    app.router.add_route("*", "/{tail:.*}", lambda r: handle(r, upstream_proxy))
+    app.router.add_route("*", "/{tail:.*}", _dispatch)
     return app
 
 

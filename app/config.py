@@ -93,8 +93,27 @@ def set_proxy(value: str) -> None:
     _set("proxy", value)
 
 
+# Proxy mode controls whether `proxy` is the tap proxy's internal upstream
+# (tap_upstream, default — Claude CLI is routed via the local recording proxy
+# at 19098) or Claude CLI's own HTTPS_PROXY (real — bypasses 19098).
+PROXY_MODE_TAP_UPSTREAM = "tap_upstream"
+PROXY_MODE_REAL = "real"
+_PROXY_MODES = (PROXY_MODE_TAP_UPSTREAM, PROXY_MODE_REAL)
+
+
+def get_proxy_mode() -> str:
+    v = _get("proxy_mode", PROXY_MODE_TAP_UPSTREAM)
+    return v if v in _PROXY_MODES else PROXY_MODE_TAP_UPSTREAM
+
+
+def set_proxy_mode(value: str) -> None:
+    if value not in _PROXY_MODES:
+        raise ValueError(f"proxy_mode must be one of {_PROXY_MODES}")
+    _set("proxy_mode", value)
+
+
 def get_proxy_env() -> dict[str, str]:
-    """Return proxy as env-var dict for subprocess injection."""
+    """Return proxy as env-var dict for subprocess injection (git, urllib, etc.)."""
     p = get_proxy()
     if not p:
         return {}
