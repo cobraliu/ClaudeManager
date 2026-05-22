@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
-export type TabKind = "file" | "git" | "jsonl" | "scratch";
+export type TabKind = "file" | "git" | "scratch";
 
 export interface FileTab {
   id: string;
@@ -15,11 +15,6 @@ export interface GitTab {
   kind: "git";
 }
 
-export interface JsonlTab {
-  id: string;
-  kind: "jsonl";
-}
-
 export interface ScratchTab {
   id: string;
   kind: "scratch";
@@ -27,7 +22,7 @@ export interface ScratchTab {
   content: string;   // in-memory editor buffer, persisted to localStorage
 }
 
-export type TabEntry = FileTab | GitTab | JsonlTab | ScratchTab;
+export type TabEntry = FileTab | GitTab | ScratchTab;
 
 interface TabsState {
   tabs: TabEntry[];
@@ -46,9 +41,11 @@ function load(sid: string): TabsState {
     if (!raw) return EMPTY;
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.tabs)) return EMPTY;
+    // JSONL is no longer a viewer-column tab — it shares the Chat/TUI zone via
+    // inlineView. Drop any persisted JSONL tabs so they don't render as ghosts.
     const tabs: TabEntry[] = parsed.tabs.filter((t: TabEntry) =>
       t && typeof t.id === "string" &&
-      (t.kind === "file" || t.kind === "git" || t.kind === "jsonl" || t.kind === "scratch")
+      (t.kind === "file" || t.kind === "git" || t.kind === "scratch")
     );
     const activeId = typeof parsed.activeId === "string" && tabs.some(t => t.id === parsed.activeId)
       ? parsed.activeId
@@ -117,18 +114,15 @@ export function useSessionTabs(sessionId: string | null) {
     });
   }, []);
 
-  const openSingleton = useCallback((kind: "git" | "jsonl") => {
+  const openGitTab = useCallback(() => {
     setState(prev => {
-      const existing = prev.tabs.find(t => t.kind === kind);
+      const existing = prev.tabs.find(t => t.kind === "git");
       if (existing) return { ...prev, activeId: existing.id };
       const id = genId();
-      const tab: TabEntry = kind === "git" ? { id, kind } : { id, kind };
+      const tab: GitTab = { id, kind: "git" };
       return { tabs: [...prev.tabs, tab], activeId: id };
     });
   }, []);
-
-  const openGitTab = useCallback(() => openSingleton("git"), [openSingleton]);
-  const openJsonlTab = useCallback(() => openSingleton("jsonl"), [openSingleton]);
 
   // Creates a fresh in-memory scratch tab. Title auto-increments per session
   // (Untitled-1, Untitled-2, …). Returns the new tab id so caller can focus.
@@ -235,7 +229,6 @@ export function useSessionTabs(sessionId: string | null) {
     activeTab,
     openFileTab,
     openGitTab,
-    openJsonlTab,
     openScratchTab,
     updateScratchContent,
     promoteScratchToFile,

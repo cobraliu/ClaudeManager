@@ -137,7 +137,6 @@ function FileCentricViewerColumn(props: {
     if (!t) return id;
     if (t.kind === "file") return t.path;
     if (t.kind === "git") return "(Git)";
-    if (t.kind === "jsonl") return "(JSONL)";
     return t.title;
   };
 
@@ -212,19 +211,16 @@ function FileCentricViewerColumn(props: {
       return base;
     }
     if (t.kind === "git") return "Git";
-    if (t.kind === "jsonl") return "JSONL";
     return t.title;
   };
   const titleFor = (t: TabEntry): string => {
     if (t.kind === "file") return t.path;
     if (t.kind === "git") return "Git status, diff, history, branches";
-    if (t.kind === "jsonl") return "Conversation JSONL preview";
     return `${t.title} (unsaved scratch)`;
   };
   const iconFor = (t: TabEntry): string => {
     if (t.kind === "file") return "📄";
     if (t.kind === "git") return "⎇";
-    if (t.kind === "jsonl") return "📋";
     return "📝";
   };
 
@@ -389,14 +385,6 @@ function FileCentricViewerColumn(props: {
               )}
               {t.kind === "git" && (
                 <GitPanel inline sessionId={sessionId} onClose={() => onClose(t.id)} />
-              )}
-              {t.kind === "jsonl" && (
-                <JsonlPreviewModal
-                  inline
-                  sessionId={sessionId}
-                  sessionTitle={sessionMeta.name || sessionMeta.project}
-                  onClose={() => onClose(t.id)}
-                />
               )}
               {t.kind === "scratch" && (
                 <ScratchEditorPane
@@ -2387,9 +2375,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               {activeSessionMeta && activeSessionMeta.claude_session_id && (
                 <button
                   onClick={() => {
-                    if (isFileCentric) {
-                      sessionTabs.openJsonlTab();
-                    } else if (inlineView === "jsonl") {
+                    if (inlineView === "jsonl") {
                       setInlineView(null);
                     } else {
                       setInlineView("jsonl");
@@ -2397,7 +2383,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                     }
                   }}
                   title="Preview conversation JSONL"
-                  style={{ fontSize: 11, padding: "2px 10px", background: (!isFileCentric && inlineView === "jsonl") ? "var(--bg-hover)" : "transparent", color: (!isFileCentric && inlineView === "jsonl") ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + ((!isFileCentric && inlineView === "jsonl") ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                  style={{ fontSize: 11, padding: "2px 10px", background: inlineView === "jsonl" ? "var(--bg-hover)" : "transparent", color: inlineView === "jsonl" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (inlineView === "jsonl" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
                 >
                   📄 JSONL
                 </button>
