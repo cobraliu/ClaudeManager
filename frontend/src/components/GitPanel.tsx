@@ -14,6 +14,8 @@ import {
   gitPush,
   getGitBranches,
   getGitGraph,
+  getMergeStatus,
+  type MergeStatus,
 } from "../api/sessionApi";
 import { GitGraph } from "./GitGraph";
 import { ConfirmAffectingChangeModal } from "./GitBranchPicker";
@@ -459,12 +461,15 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
   const [revertCandidate, setRevertCandidate] = useState<{ hash: string; short: string } | null>(null);
   // Top-level tab: history (the existing view) vs merge (conflict resolver)
   const [activeTab, setActiveTab] = useState<"history" | "merge">("history");
+  // Surfaced when a merge is half-done (in_progress) — drives a banner in the History tab.
+  const [mergeStatus, setMergeStatus] = useState<MergeStatus | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [info, br] = await Promise.all([
+      const [info, br, ms] = await Promise.all([
         getGitInfo(sessionId),
         getGitBranches(sessionId).catch(() => ({ current: "", local: [] }) as GitBranchInfo),
+        getMergeStatus(sessionId).catch(() => null),
       ]);
       setAutoCommit(info.auto_commit);
       setAllLog(info.log);
@@ -472,6 +477,7 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
       setRemote(info.remote ?? "");
       setRemoteDraft(info.remote ?? "");
       setBranches(br);
+      setMergeStatus(ms);
     } catch (e) {
       setMsg(`Failed to load git info: ${String(e)}`);
     } finally {
@@ -706,6 +712,36 @@ export function GitPanel({ sessionId, onClose, inline = false }: Props) {
             <span style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading...</span>
           ) : (
             <>
+              {mergeStatus?.in_progress && (
+                <div
+                  style={{
+                    background: "rgba(248,81,73,0.12)",
+                    border: "1px solid var(--accent-red)",
+                    borderRadius: 4,
+                    padding: "8px 12px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    fontSize: 12,
+                    color: "var(--text-body)",
+                  }}
+                >
+                  <span style={{ color: "var(--accent-red)", fontSize: 14 }}>⚠</span>
+                  <span>
+                    Merge in progress — <span style={{ fontFamily: "monospace", color: "var(--accent-amber)" }}>{mergeStatus.merge_head}</span> into <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{mergeStatus.current_branch}</span>.
+                    {mergeStatus.conflicted_files.length > 0 && (
+                      <> {mergeStatus.conflicted_files.length} file{mergeStatus.conflicted_files.length === 1 ? "" : "s"} with conflicts.</>
+                    )}
+                  </span>
+                  <div style={{ flex: 1 }} />
+                  <button
+                    onClick={() => setActiveTab("merge")}
+                    style={{ background: "var(--accent-red)", color: "#fff", fontSize: 11, padding: "4px 12px" }}
+                  >
+                    Resolve →
+                  </button>
+                </div>
+              )}
               {/* ── Controls row ── */}
               <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                 <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 13, color: "var(--text-body)" }}>

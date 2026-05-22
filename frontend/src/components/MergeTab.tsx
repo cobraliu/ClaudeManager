@@ -32,6 +32,7 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
   const [err, setErr] = useState<string | null>(null);
   const [preview, setPreview] = useState<MergePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [backupBranch, setBackupBranch] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     return getMergeStatus(sessionId)
@@ -88,11 +89,13 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
         return;
       }
       if (r.clean) {
-        setMsg(`Merged ${source} into ${target} cleanly.`);
+        const bk = r.backup_branch ? ` Backup: ${r.backup_branch} (delete with \`git branch -D\` once verified).` : "";
+        setMsg(`Merged ${source} into ${target} cleanly.${bk}`);
         onCompleted();
         return;
       }
-      // Conflict — refresh status to enter resolver mode.
+      // Conflict — stash backup-branch name for the resolver banner, then refresh status.
+      setBackupBranch(r.backup_branch ?? null);
       await refresh();
     } catch (e) {
       setErr(String(e).replace(/^Error:\s*/, ""));
@@ -110,8 +113,9 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
       <MergeResolver
         sessionId={sessionId}
         status={status}
+        backupBranch={backupBranch}
         onStatusChange={setStatus}
-        onCompleted={() => { setStatus(null); onCompleted(); }}
+        onCompleted={() => { setStatus(null); setBackupBranch(null); onCompleted(); }}
         setMsg={setMsg}
       />
     );
@@ -243,10 +247,11 @@ function langForPath(path: string): string {
 }
 
 function MergeResolver({
-  sessionId, status, onStatusChange, onCompleted, setMsg,
+  sessionId, status, backupBranch, onStatusChange, onCompleted, setMsg,
 }: {
   sessionId: string;
   status: MergeStatus;
+  backupBranch: string | null;
   onStatusChange: (s: MergeStatus) => void;
   onCompleted: () => void;
   setMsg: (m: string | null) => void;
@@ -331,6 +336,27 @@ function MergeResolver({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, padding: 0 }}>
+      {backupBranch && (
+        <div
+          style={{
+            padding: "6px 16px",
+            fontSize: 11,
+            background: "rgba(88,166,255,0.08)",
+            borderBottom: "1px solid var(--bg-hover)",
+            color: "var(--text-body)",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexShrink: 0,
+          }}
+        >
+          <span title="A backup branch was created pointing at the pre-merge HEAD. You can roll back at any time." style={{ color: "var(--accent-blue)" }}>💾 Backup:</span>
+          <span style={{ fontFamily: "monospace", color: "var(--accent-blue)" }}>{backupBranch}</span>
+          <span style={{ color: "var(--text-muted)" }}>
+            — to roll back: <span style={{ fontFamily: "monospace" }}>git reset --hard {backupBranch}</span>
+          </span>
+        </div>
+      )}
       {/* Toolbar */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 16px", background: "var(--bg-surface)", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0 }}>
         <div style={{ fontSize: 12, color: "var(--text-body)" }}>
