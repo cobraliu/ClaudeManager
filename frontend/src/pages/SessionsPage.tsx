@@ -1226,29 +1226,32 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const sideDockOpenRef = useRef(false);
   useEffect(() => { sideDockOpenRef.current = anyDockOpen; }, [anyDockOpen]);
   const sideDockDragging = useRef(false);
+  // Total (chat + dock) width captured at the moment the user starts dragging.
+  // Holding this constant in file-centric mode keeps the viewer width unchanged.
+  const sideDockDragTotal = useRef(0);
   const startSideDockDrag = useCallback(() => {
     sideDockDragging.current = true;
+    sideDockDragTotal.current = userConfig.fileCentricChatWidth + userConfig.sideDockWidth;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
-  }, []);
+  }, [userConfig.fileCentricChatWidth, userConfig.sideDockWidth]);
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!sideDockDragging.current) return;
       const minDock = 240;
-      let maxDock: number;
+      const minChat = 320;
       if (isFileCentric) {
-        const sidebar = sidebarCollapsed ? 0 : leftWidth + 5;
-        const tree = userConfig.fileCentricTreeWidth + 5;
-        const minViewer = 240;
-        maxDock = Math.max(
-          minDock,
-          window.innerWidth - sidebar - tree - 5 - userConfig.fileCentricChatWidth - 5 - minViewer,
-        );
+        // Preserve total = chat + dock so the viewer column never moves.
+        const total = sideDockDragTotal.current;
+        const maxDock = Math.max(minDock, total - minChat);
+        const newDock = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
+        const newChat = Math.max(minChat, total - newDock);
+        patchUserConfig({ sideDockWidth: newDock, fileCentricChatWidth: newChat });
       } else {
-        maxDock = Math.max(minDock, Math.floor(window.innerWidth * 0.6));
+        const maxDock = Math.max(minDock, Math.floor(window.innerWidth * 0.6));
+        const w = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
+        patchUserConfig({ sideDockWidth: w });
       }
-      const w = Math.max(minDock, Math.min(window.innerWidth - e.clientX, maxDock));
-      patchUserConfig({ sideDockWidth: w });
     };
     const onUp = () => {
       if (sideDockDragging.current) {
@@ -1263,11 +1266,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [
-    isFileCentric, sidebarCollapsed, leftWidth,
-    userConfig.fileCentricTreeWidth, userConfig.fileCentricChatWidth,
-    patchUserConfig,
-  ]);
+  }, [isFileCentric, patchUserConfig]);
 
   useEffect(() => {
     if (!showModelPicker) return;

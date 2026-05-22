@@ -3858,6 +3858,19 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
           );
         }
         if (isStreaming) {
+          // A queue-operation:enqueue that hasn't been promoted to a real user
+          // message is a user prompt waiting behind the active response.
+          const hasQueuedPrompt = displayEntries.some((e) => {
+            if (e.type !== "queue-operation") return false;
+            const r = e as unknown as Record<string, unknown>;
+            if (r.operation !== "enqueue") return false;
+            const content = String(r.content ?? "").trim();
+            return (
+              content.length > 0 &&
+              !content.startsWith("<task-notification>") &&
+              !content.startsWith("<system-reminder>")
+            );
+          });
           return (
             <div style={{
               flexShrink: 0, borderTop: "1px solid var(--border)",
@@ -3874,9 +3887,9 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                   padding: "3px 12px", fontSize: 11.5, cursor: "pointer",
                   display: "flex", alignItems: "center", gap: 5,
                 }}
-                title="Stop (Ctrl+C)"
+                title={hasQueuedPrompt ? "Skip current response; queued prompt becomes active (Ctrl+C)" : "Stop (Ctrl+C)"}
               >
-                <span style={{ fontSize: 10 }}>■</span> Stop
+                <span style={{ fontSize: 10 }}>■</span> {hasQueuedPrompt ? "Stop / Skip" : "Stop"}
               </button>
             </div>
           );
