@@ -1,15 +1,9 @@
-// Global right-click menu for text selections.
-//
-// Mounted once at the SessionsPage root. On contextmenu:
-//   - if there's no text selected → fall through to native menu
-//   - if target is inside an excluded zone (terminal, CodeMirror,
-//     [data-no-context-menu]) → fall through to native menu
-//   - otherwise: preventDefault and show our menu of string tools.
-//
-// After picking a tool, a result dialog opens showing the transformed
-// output with a Copy button. The selection text is captured at click
-// time so the result keeps working even after the selection is cleared
-// (which happens the moment you click on the menu).
+// Global menu for selected text. Triggered by **Shift + right-click** so the
+// native context menu (Inspect Element, Copy, Search…) is preserved for
+// plain right-clicks. Plain right-click: untouched. Shift+right-click on a
+// non-empty selection (outside xterm / CodeMirror / [data-no-context-menu]):
+// our menu opens with one column per category, everything visible at once,
+// no scroll.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CATEGORY_ORDER, STRING_TOOLS, StringTool, ToolCategory } from "../lib/stringTools";
@@ -27,6 +21,18 @@ interface ResultState {
   error?: string;
 }
 
+// Column width (px) sized to the longest label in each category. If you add
+// a tool with a longer label, bump the matching number here.
+const COL_WIDTH: Record<ToolCategory, number> = {
+  Encode: 120,
+  Format: 120,
+  Case: 130,
+  Lines: 120,
+  Hash: 120,
+  Info: 70,
+};
+const MENU_WIDTH = Object.values(COL_WIDTH).reduce((a, b) => a + b, 0) + 2; // + outer border
+
 function isInExcludedZone(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
   if (target.closest(".xterm")) return true;
@@ -40,38 +46,41 @@ export function TextSelectionMenu() {
   const [result, setResult] = useState<ResultState | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
-  // ── contextmenu trap ────────────────────────────────────────────────────────
+  // ── contextmenu trap (Shift + right-click only) ─────────────────────────────
   useEffect(() => {
     const onCtx = (e: MouseEvent) => {
       if (e.defaultPrevented) return;
+      if (!e.shiftKey) return; // plain right-click → let native menu fire
       if (isInExcludedZone(e.target)) return;
       const sel = window.getSelection();
       const text = sel ? sel.toString() : "";
       if (text.length === 0) return;
       e.preventDefault();
       e.stopPropagation();
-      // Clamp to viewport so the menu doesn't render offscreen.
-      const W = 220;
-      const H = 460;
-      const x = Math.min(e.clientX, window.innerWidth - W - 8);
-      const y = Math.min(e.clientY, window.innerHeight - H - 8);
+      const x = Math.max(8, Math.min(e.clientX, window.innerWidth - MENU_WIDTH - 8));
+      const y = Math.max(8, Math.min(e.clientY, window.innerHeight - 280));
       setMenu({ x, y, text });
     };
     window.addEventListener("contextmenu", onCtx, true);
     return () => window.removeEventListener("contextmenu", onCtx, true);
   }, []);
 
-  // ── dismiss on outside click / Esc / scroll / resize ────────────────────────
+  // ── dismiss on outside click / Esc / page scroll / resize ───────────────────
   useEffect(() => {
     if (!menu) return;
+    const isInsideMenu = (t: EventTarget | null) =>
+      menuRef.current && t instanceof Node && menuRef.current.contains(t);
     const onDown = (e: MouseEvent) => {
-      if (menuRef.current && menuRef.current.contains(e.target as Node)) return;
+      if (isInsideMenu(e.target)) return;
       setMenu(null);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setMenu(null);
     };
-    const onScroll = () => setMenu(null);
+    const onScroll = (e: Event) => {
+      if (isInsideMenu(e.target)) return;
+      setMenu(null);
+    };
     window.addEventListener("mousedown", onDown);
     window.addEventListener("keydown", onKey);
     window.addEventListener("scroll", onScroll, true);
@@ -112,9 +121,7 @@ export function TextSelectionMenu() {
             position: "fixed",
             top: menu.y,
             left: menu.x,
-            width: 220,
-            maxHeight: 460,
-            overflowY: "auto",
+            width: MENU_WIDTH,
             background: "var(--bg-modal, #1c1f24)",
             border: "1px solid var(--border, #333)",
             borderRadius: 6,
@@ -122,21 +129,32 @@ export function TextSelectionMenu() {
             zIndex: 9000,
             fontSize: 12,
             color: "var(--text-body)",
-            padding: "4px 0",
+            display: "flex",
+            alignItems: "stretch",
             userSelect: "none",
+            overflow: "hidden",
           }}
         >
-          {CATEGORY_ORDER.map(cat => (
-            <div key={cat}>
+          {CATEGORY_ORDER.map((cat, idx) => (
+            <div
+              key={cat}
+              style={{
+                width: COL_WIDTH[cat],
+                borderLeft: idx === 0 ? "none" : "1px solid var(--bg-hover, #2a2d33)",
+                display: "flex",
+                flexDirection: "column",
+                padding: "4px 0",
+              }}
+            >
               <div
                 style={{
-                  padding: "4px 10px 2px",
+                  padding: "3px 10px 4px",
                   fontSize: 10,
                   letterSpacing: 0.5,
                   textTransform: "uppercase",
                   color: "var(--text-muted)",
-                  borderTop: "1px solid var(--bg-hover, #222)",
-                  background: "var(--bg-surface, transparent)",
+                  borderBottom: "1px solid var(--bg-hover, #2a2d33)",
+                  marginBottom: 2,
                 }}
               >
                 {cat}
@@ -169,7 +187,7 @@ function MenuItem({ label, onClick }: { label: string; onClick: () => void }) {
       onMouseLeave={() => setHover(false)}
       onClick={onClick}
       style={{
-        padding: "5px 12px",
+        padding: "4px 10px",
         cursor: "pointer",
         background: hover ? "var(--bg-hover)" : "transparent",
         whiteSpace: "nowrap",

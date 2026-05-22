@@ -1,8 +1,10 @@
 // String transform registry used by the text-selection right-click menu.
 // Each tool takes the selected text and returns the transformed result.
-// Async tools (e.g. crypto.subtle hashes) return a Promise.
+// Async tools (e.g. crypto.subtle hashes, hash-wasm MD5 / xxhash3) return
+// a Promise.
 
 import { convert, validateConfig } from "./configConvert";
+import { md5 as wasmMd5, xxhash3 as wasmXxh3, xxhash128 as wasmXxh3_128 } from "hash-wasm";
 
 export type ToolCategory = "Encode" | "Format" | "Case" | "Lines" | "Hash" | "Info";
 
@@ -177,7 +179,7 @@ export const STRING_TOOLS: StringTool[] = [
   { id: "html-esc", label: "HTML escape", category: "Encode", run: htmlEscape },
   { id: "html-uesc", label: "HTML unescape", category: "Encode", run: htmlUnescape },
 
-  { id: "json-pretty", label: "JSON pretty (2 sp)", category: "Format", run: jsonPretty },
+  { id: "json-pretty", label: "JSON pretty", category: "Format", run: jsonPretty },
   { id: "json-min", label: "JSON minify", category: "Format", run: jsonMinify },
   { id: "json-val", label: "JSON validate", category: "Format", run: jsonValidate },
   { id: "json-yaml", label: "JSON → YAML", category: "Format", run: makeConvert("json", "yaml") },
@@ -196,17 +198,20 @@ export const STRING_TOOLS: StringTool[] = [
 
   { id: "lines-sort-az", label: "Sort A→Z", category: "Lines", run: s => sortLines(s, 1) },
   { id: "lines-sort-za", label: "Sort Z→A", category: "Lines", run: s => sortLines(s, -1) },
-  { id: "lines-uniq", label: "Unique (keep order)", category: "Lines", run: uniqueLines },
-  { id: "lines-rev", label: "Reverse lines", category: "Lines", run: reverseLines },
-  { id: "lines-trim", label: "Trim trailing spaces", category: "Lines", run: trimEachLine },
-  { id: "lines-noblank", label: "Drop blank lines", category: "Lines", run: removeBlankLines },
+  { id: "lines-uniq", label: "Unique", category: "Lines", run: uniqueLines },
+  { id: "lines-rev", label: "Reverse", category: "Lines", run: reverseLines },
+  { id: "lines-trim", label: "Trim trailing", category: "Lines", run: trimEachLine },
+  { id: "lines-noblank", label: "Strip blanks", category: "Lines", run: removeBlankLines },
   { id: "lines-num", label: "Number lines", category: "Lines", run: numberLines },
 
+  { id: "md5", label: "MD5", category: "Hash", run: s => wasmMd5(s) },
   { id: "sha1", label: "SHA-1", category: "Hash", run: s => sha(s, "SHA-1") },
   { id: "sha256", label: "SHA-256", category: "Hash", run: s => sha(s, "SHA-256") },
   { id: "sha512", label: "SHA-512", category: "Hash", run: s => sha(s, "SHA-512") },
+  { id: "xxh3-64", label: "xxhash3 (64)", category: "Hash", run: s => wasmXxh3(s) },
+  { id: "xxh3-128", label: "xxhash3 (128)", category: "Hash", run: s => wasmXxh3_128(s) },
 
-  { id: "info-stats", label: "Stats (chars/words/bytes)", category: "Info", run: stats },
+  { id: "info-stats", label: "Stats", category: "Info", run: stats },
 ];
 
 export const CATEGORY_ORDER: ToolCategory[] = ["Encode", "Format", "Case", "Lines", "Hash", "Info"];

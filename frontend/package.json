@@ -37,6 +37,7 @@
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/xterm": "^5.5.0",
     "cm6-graphql": "^0.2.1",
+    "hash-wasm": "^4.12.0",
     "highlight.js": "^11.11.1",
     "js-yaml": "^4.1.1",
     "katex": "^0.16.45",
