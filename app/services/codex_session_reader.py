@@ -244,15 +244,21 @@ def get_codex_conversation(session_id: str, cwd: str, from_ts: float = 0.0) -> l
 
 
 def get_codex_raw_messages(session_id: str, cwd: str, tail: int | None = None) -> dict:
-    """Synthesize Claude-shaped RawMessage entries from a Codex rollout.
+    """Synthesize per-event messages from a Codex rollout for the chat UI.
 
-    Codex's native rollout schema is {type: event_msg|response_item|session_meta,
-    payload: {...}} — incompatible with the frontend RawMessage type which
-    expects {type: "user"|"assistant", message: {role, content: [...]}}.
+    Codex's native rollout schema doesn't match Claude's {type:user/assistant,
+    message:{role,content}} shape, so we walk the file and emit one entry per
+    interesting event. The chat UI has dedicated renderers for each codex_*
+    type (see ConversationPane.tsx).
 
-    To make the chat UI work without a frontend rewrite, we walk the rollout
-    and emit one synthetic Claude-shaped message per event_msg.user_message
-    / event_msg.agent_message (the same events get_codex_conversation uses).
+    Emitted types:
+      user / assistant            — chat text (event_msg.user_message/agent_message)
+      codex_reasoning             — response_item.reasoning (often encrypted)
+      codex_tool_call             — function_call / custom_tool_call
+      codex_tool_result           — function_call_output / custom_tool_call_output
+      codex_patch_apply           — event_msg.patch_apply_end (richer than _output)
+      codex_lifecycle             — task_started / task_complete / turn_aborted
+      codex_token_count           — event_msg.token_count
 
     Returns {"messages": [...], "total": <total messages, pre-tail>}.
     """
@@ -260,39 +266,172 @@ def get_codex_raw_messages(session_id: str, cwd: str, tail: int | None = None) -
     if rollout is None:
         return {"messages": [], "total": 0}
 
-    messages: list[dict] = []
+    # ── Pass 1: find tool-output call_ids that also have a patch_apply_end.
+    # When both exist we prefer the patch_apply_end (richer fields). The plain
+    # *_output for the same call_id is skipped to avoid duplicate rendering.
+    patch_call_ids: set[str] = set()
     try:
         with open(rollout, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
-                if '"user_message"' not in line and '"agent_message"' not in line:
+            for line in f:
+                if '"patch_apply_end"' not in line:
                     continue
                 try:
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if d.get("type") != "event_msg":
+                p = d.get("payload") or {}
+                if d.get("type") == "event_msg" and p.get("type") == "patch_apply_end":
+                    cid = p.get("call_id")
+                    if isinstance(cid, str) and cid:
+                        patch_call_ids.add(cid)
+    except OSError:
+        return {"messages": [], "total": 0}
+
+    messages: list[dict] = []
+    try:
+        with open(rollout, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
                     continue
+                top = d.get("type")
                 p = d.get("payload") or {}
                 sub = p.get("type")
-                if sub == "user_message":
-                    role = "user"
-                elif sub == "agent_message":
-                    role = "assistant"
-                else:
-                    continue
-                text = (p.get("message") or "").strip()
-                if not text:
-                    continue
                 ts = d.get("timestamp") if isinstance(d.get("timestamp"), str) else None
-                messages.append({
-                    "type": role,
-                    "uuid": f"codex-{session_id}-{idx}",
-                    "timestamp": ts,
-                    "message": {
-                        "role": role,
-                        "content": [{"type": "text", "text": text}],
-                    },
-                })
+                base_uuid = f"codex-{session_id}-{idx}"
+
+                # 1. user/assistant text
+                if top == "event_msg" and sub in ("user_message", "agent_message"):
+                    role = "user" if sub == "user_message" else "assistant"
+                    text = (p.get("message") or "").strip()
+                    if not text:
+                        continue
+                    messages.append({
+                        "type": role,
+                        "uuid": base_uuid,
+                        "timestamp": ts,
+                        "message": {"role": role, "content": [{"type": "text", "text": text}]},
+                    })
+
+                # 2. reasoning (usually encrypted — emit a marker)
+                elif top == "response_item" and sub == "reasoning":
+                    summary = p.get("summary") or []
+                    content = p.get("content")
+                    visible_text = ""
+                    if isinstance(summary, list) and summary:
+                        bits = []
+                        for s in summary:
+                            if isinstance(s, dict) and s.get("text"):
+                                bits.append(str(s.get("text")))
+                            elif isinstance(s, str):
+                                bits.append(s)
+                        visible_text = "\n".join(bits).strip()
+                    if not visible_text and isinstance(content, list):
+                        bits = []
+                        for c in content:
+                            if isinstance(c, dict) and c.get("text"):
+                                bits.append(str(c.get("text")))
+                        visible_text = "\n".join(bits).strip()
+                    messages.append({
+                        "type": "codex_reasoning",
+                        "uuid": base_uuid,
+                        "timestamp": ts,
+                        "text": visible_text,
+                        "encrypted": bool(p.get("encrypted_content")) and not visible_text,
+                    })
+
+                # 3. tool call (function_call or custom_tool_call)
+                elif top == "response_item" and sub in ("function_call", "custom_tool_call"):
+                    name = p.get("name") or ""
+                    call_id = p.get("call_id") or ""
+                    # function_call: arguments is a JSON string. custom_tool_call: input is raw text.
+                    raw_args = p.get("arguments") if sub == "function_call" else p.get("input")
+                    parsed: object
+                    if sub == "function_call" and isinstance(raw_args, str):
+                        try:
+                            parsed = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            parsed = raw_args
+                    else:
+                        parsed = raw_args
+                    messages.append({
+                        "type": "codex_tool_call",
+                        "uuid": base_uuid,
+                        "timestamp": ts,
+                        "call_id": call_id,
+                        "name": name,
+                        "input": parsed,
+                        "status": p.get("status"),
+                    })
+
+                # 4. tool output (skip if a patch_apply_end will replace it)
+                elif top == "response_item" and sub in ("function_call_output", "custom_tool_call_output"):
+                    call_id = p.get("call_id") or ""
+                    if call_id in patch_call_ids:
+                        continue
+                    raw_output = p.get("output")
+                    # custom_tool_call_output sometimes wraps in {output, metadata}
+                    output_text: str
+                    if isinstance(raw_output, str):
+                        # Try to unwrap {"output": "..."} JSON when present
+                        try:
+                            parsed = json.loads(raw_output)
+                            if isinstance(parsed, dict) and "output" in parsed:
+                                output_text = str(parsed.get("output") or "")
+                            else:
+                                output_text = raw_output
+                        except json.JSONDecodeError:
+                            output_text = raw_output
+                    else:
+                        output_text = json.dumps(raw_output, ensure_ascii=False)
+                    messages.append({
+                        "type": "codex_tool_result",
+                        "uuid": base_uuid,
+                        "timestamp": ts,
+                        "call_id": call_id,
+                        "output": output_text,
+                    })
+
+                # 5. patch_apply_end (richer apply_patch result)
+                elif top == "event_msg" and sub == "patch_apply_end":
+                    messages.append({
+                        "type": "codex_patch_apply",
+                        "uuid": base_uuid,
+                        "timestamp": ts,
+                        "call_id": p.get("call_id") or "",
+                        "stdout": p.get("stdout") or "",
+                        "stderr": p.get("stderr") or "",
+                        "success": bool(p.get("success")),
+                        "changes": p.get("changes"),
+                        "status": p.get("status"),
+                    })
+
+                # 6. lifecycle events
+                elif top == "event_msg" and sub in ("task_started", "task_complete", "turn_aborted"):
+                    messages.append({
+                        "type": "codex_lifecycle",
+                        "uuid": base_uuid,
+                        "timestamp": ts,
+                        "subtype": sub,
+                        "turn_id": p.get("turn_id"),
+                        "duration_ms": p.get("duration_ms"),
+                        "reason": p.get("reason"),
+                        "model_context_window": p.get("model_context_window"),
+                    })
+
+                # 7. token usage
+                elif top == "event_msg" and sub == "token_count":
+                    info = p.get("info")
+                    if info is None:
+                        # All-null token_count events are noisy heartbeats — skip
+                        continue
+                    messages.append({
+                        "type": "codex_token_count",
+                        "uuid": base_uuid,
+                        "timestamp": ts,
+                        "info": info,
+                    })
     except OSError:
         return {"messages": [], "total": 0}
 

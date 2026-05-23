@@ -2698,6 +2698,227 @@ function TurnUsage({ model, usage }: { model?: string; usage?: RawUsage }) {
 
 const INTERRUPTED_TEXT = "[Request interrupted by user]";
 
+function CodexEncryptedReasoningBlock() {
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <div style={{
+        display: "inline-flex", alignItems: "center", gap: 6,
+        fontSize: 11, padding: "3px 10px", borderRadius: 5,
+        background: "var(--bg-surface)", border: "1px dashed var(--border)",
+        color: "var(--text-muted)", fontStyle: "italic",
+      }}>
+        <span>💭</span>
+        <span>reasoning (encrypted)</span>
+      </div>
+    </div>
+  );
+}
+
+function CodexToolCallBlock({ name, input, status, callId }: {
+  name: string; input: Record<string, unknown>; status: string; callId: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const inputJson = useMemo(() => {
+    try { return JSON.stringify(input, null, 2); } catch { return String(input); }
+  }, [input]);
+  const summary = useMemo(() => {
+    // Prefer common single-field signatures: command, path, args
+    const keys = ["command", "cmd", "path", "file_path", "query", "url"];
+    for (const k of keys) {
+      const v = input[k];
+      if (typeof v === "string" && v) return v;
+      if (Array.isArray(v)) return v.map(String).join(" ");
+    }
+    const oneLine = inputJson.replace(/\s+/g, " ");
+    return oneLine.length > 120 ? oneLine.slice(0, 120) + "…" : oneLine;
+  }, [input, inputJson]);
+  const dotColor = status === "completed" ? "var(--accent-green)"
+                : status === "failed" ? "var(--accent-red)"
+                : "var(--accent-amber)";
+
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          width: "100%", background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+          borderRadius: 6, padding: "6px 10px", cursor: "pointer", gap: 8, textAlign: "left",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0 }}>
+          <span style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: dotColor }} />
+          <span style={{ fontSize: 11 }}>🔧</span>
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font, 12.5px)", fontWeight: 700, color: "var(--text-bright)", flexShrink: 0 }}>
+            {name}
+          </span>
+          <span style={{
+            fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11.5px)", color: "var(--text-muted)",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
+          }}>
+            {summary}
+          </span>
+        </div>
+        <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+      {expanded && (
+        <div style={{ marginTop: 4, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, fontFamily: "monospace", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-muted)" }}>
+          {callId && <div style={{ color: "var(--text-faintest)", marginBottom: 4 }}>call_id: {callId}</div>}
+          {inputJson}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CodexToolResultBlock({ output, callId }: { output: string; callId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const trimmed = output.trim();
+  if (!trimmed) return null;
+  const firstLine = trimmed.split("\n")[0];
+  const isMultiline = trimmed.includes("\n");
+  const preview = firstLine.length > 160 ? firstLine.slice(0, 160) + "…" : firstLine;
+  return (
+    <div style={{ padding: "2px 16px 2px 32px" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", width: "100%",
+          background: "transparent", border: "none", padding: "2px 0", cursor: isMultiline ? "pointer" : "default",
+          gap: 6, textAlign: "left", color: "var(--text-muted)", fontSize: 11, fontFamily: "monospace",
+        }}
+      >
+        <span style={{ color: "var(--text-faintest)", flexShrink: 0 }}>↳</span>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{preview}</span>
+        {isMultiline && <span style={{ color: "var(--text-faintest)", fontSize: 10 }}>{expanded ? "▲" : "▼"}</span>}
+      </button>
+      {expanded && isMultiline && (
+        <div style={{ marginTop: 2, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, fontFamily: "monospace", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-muted)", maxHeight: 400, overflow: "auto" }}>
+          {trimmed}
+          {callId && <div style={{ color: "var(--text-faintest)", marginTop: 6, borderTop: "1px solid var(--border)", paddingTop: 4 }}>call_id: {callId}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CodexPatchApplyBlock({ stdout, stderr, success, changes, status }: {
+  stdout: string; stderr: string; success: boolean; changes: Record<string, unknown>; status: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const files = Object.keys(changes);
+  const dotColor = success ? "var(--accent-green)" : "var(--accent-red)";
+  const statusLabel = success ? "applied" : (status || "failed");
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          width: "100%", background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+          borderRadius: 6, padding: "6px 10px", cursor: "pointer", gap: 8, textAlign: "left",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0 }}>
+          <span style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: dotColor }} />
+          <span style={{ fontSize: 11 }}>📝</span>
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font, 12.5px)", fontWeight: 700, color: "var(--text-bright)", flexShrink: 0 }}>
+            patch_apply
+          </span>
+          <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{statusLabel}</span>
+          <span style={{
+            fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11.5px)", color: "var(--text-muted)",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
+          }}>
+            {files.length > 0 ? `${files.length} file${files.length === 1 ? "" : "s"}: ${files.slice(0, 2).join(", ")}${files.length > 2 ? "…" : ""}` : ""}
+          </span>
+        </div>
+        <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+      {expanded && (
+        <div style={{ marginTop: 4, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }}>
+          {files.length > 0 && (
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ color: "var(--text-faintest)", marginBottom: 2 }}>changes:</div>
+              {files.map((f) => (
+                <div key={f} style={{ paddingLeft: 8, color: "var(--text-muted)" }}>• {f}</div>
+              ))}
+            </div>
+          )}
+          {stdout.trim() && (
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ color: "var(--text-faintest)", marginBottom: 2 }}>stdout:</div>
+              <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 300, overflow: "auto" }}>{stdout}</div>
+            </div>
+          )}
+          {stderr.trim() && (
+            <div>
+              <div style={{ color: "var(--accent-red)", marginBottom: 2 }}>stderr:</div>
+              <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--accent-red)", maxHeight: 300, overflow: "auto" }}>{stderr}</div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CodexLifecycleBlock({ subtype, durationMs, reason, modelContextWindow }: {
+  subtype: string; durationMs: number | null; reason: string | null; modelContextWindow: number | null;
+}) {
+  const labels: Record<string, string> = {
+    task_started: "▶ task started",
+    task_complete: "✓ task complete",
+    turn_aborted: "⊘ turn aborted",
+    session_meta: "session start",
+    turn_context: "turn context",
+  };
+  const label = labels[subtype] || subtype;
+  const color = subtype === "turn_aborted" ? "var(--accent-red)"
+              : subtype === "task_complete" ? "var(--accent-green)"
+              : "var(--text-muted)";
+  const parts: string[] = [];
+  if (typeof durationMs === "number") {
+    parts.push(durationMs < 1000 ? `${durationMs}ms` : `${(durationMs / 1000).toFixed(1)}s`);
+  }
+  if (reason) parts.push(reason);
+  if (typeof modelContextWindow === "number") parts.push(`ctx ${modelContextWindow}`);
+  return (
+    <div style={{ display: "flex", justifyContent: "center", padding: "2px 16px" }}>
+      <div style={{
+        display: "inline-flex", alignItems: "center", gap: 6, padding: "2px 10px",
+        background: "var(--bg-surface)", border: "1px solid var(--border)",
+        borderRadius: 20, fontSize: 10, color, fontFamily: "monospace",
+      }}>
+        <span>{label}</span>
+        {parts.length > 0 && <span style={{ color: "var(--text-faintest)" }}>· {parts.join(" · ")}</span>}
+      </div>
+    </div>
+  );
+}
+
+function CodexTokenCountBlock({ info }: { info: Record<string, unknown> }) {
+  const lastTokenUsage = (info.last_token_usage as Record<string, unknown>) || {};
+  const totalTokenUsage = (info.total_token_usage as Record<string, unknown>) || {};
+  const lastIn = Number(lastTokenUsage.input_tokens ?? 0) + Number(lastTokenUsage.cached_input_tokens ?? 0);
+  const lastOut = Number(lastTokenUsage.output_tokens ?? 0);
+  const totalIn = Number(totalTokenUsage.input_tokens ?? 0) + Number(totalTokenUsage.cached_input_tokens ?? 0);
+  const totalOut = Number(totalTokenUsage.output_tokens ?? 0);
+  if (!lastIn && !lastOut && !totalIn && !totalOut) return null;
+  return (
+    <div style={{ display: "flex", justifyContent: "center", padding: "1px 16px" }}>
+      <div style={{
+        display: "inline-flex", alignItems: "center", gap: 6, padding: "1px 8px",
+        fontSize: 9, color: "var(--text-faintest)", fontFamily: "monospace",
+      }}>
+        <span title="this turn">↑{fmt(lastIn)} ↓{fmt(lastOut)}</span>
+        <span>·</span>
+        <span title="cumulative">Σ ↑{fmt(totalIn)} ↓{fmt(totalOut)}</span>
+      </div>
+    </div>
+  );
+}
+
 function MessageEntry({
   entry,
   toolResults,
@@ -2786,6 +3007,60 @@ function MessageEntry({
       return <UserBubble text={text} ts={ets} />;
     }
     return null;
+  }
+
+  // Codex-specific top-level types (synthesized from rollout JSONL by backend).
+  if (entry.type === "codex_reasoning") {
+    const r = entry as unknown as Record<string, unknown>;
+    const text = String(r.text || "").trim();
+    const encrypted = !!r.encrypted;
+    if (!text && !encrypted) return null;
+    if (text) return <ThinkingBlock thinking={text} isActive={false} />;
+    return <CodexEncryptedReasoningBlock />;
+  }
+
+  if (entry.type === "codex_tool_call") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexToolCallBlock
+      name={String(r.name || "tool")}
+      input={(r.input as Record<string, unknown>) || {}}
+      status={String(r.status || "")}
+      callId={String(r.call_id || "")}
+    />;
+  }
+
+  if (entry.type === "codex_tool_result") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexToolResultBlock
+      output={String(r.output ?? "")}
+      callId={String(r.call_id || "")}
+    />;
+  }
+
+  if (entry.type === "codex_patch_apply") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexPatchApplyBlock
+      stdout={String(r.stdout ?? "")}
+      stderr={String(r.stderr ?? "")}
+      success={!!r.success}
+      changes={(r.changes as Record<string, unknown>) || {}}
+      status={String(r.status || "")}
+    />;
+  }
+
+  if (entry.type === "codex_lifecycle") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexLifecycleBlock
+      subtype={String(r.subtype || "")}
+      durationMs={typeof r.duration_ms === "number" ? r.duration_ms : null}
+      reason={r.reason ? String(r.reason) : null}
+      modelContextWindow={typeof r.model_context_window === "number" ? r.model_context_window : null}
+    />;
+  }
+
+  if (entry.type === "codex_token_count") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexTokenCountBlock info={(r.info as Record<string, unknown>) || {}} />;
   }
 
   const msg = entry.message;
@@ -3206,6 +3481,16 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
   const displayEntries = useMemo(() => {
     const filtered = messages.filter((m) => {
       if (m.isMeta) return false;
+      // Codex-specific top-level types — synthesized by backend from rollout JSONL.
+      // Pass them through unchanged; MessageEntry has dedicated render branches.
+      if (
+        m.type === "codex_reasoning" ||
+        m.type === "codex_tool_call" ||
+        m.type === "codex_tool_result" ||
+        m.type === "codex_patch_apply" ||
+        m.type === "codex_lifecycle" ||
+        m.type === "codex_token_count"
+      ) return true;
       if (m.type === "user" || m.type === "assistant") {
         if (compactSummaryUuids.has(m.uuid || "")) return false;
         // Skip local-command caveat and stdout-echo XML wrappers; keep
