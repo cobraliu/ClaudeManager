@@ -2940,13 +2940,128 @@ function CodexToolResultBlock({ output, callId }: { output: string; callId: stri
   );
 }
 
+// Render a single unified-diff body with per-line colored backgrounds.
+function UnifiedDiffView({ diff, maxHeight }: { diff: string; maxHeight?: number }) {
+  const lines = diff.split("\n");
+  return (
+    <pre style={{
+      margin: 0, fontFamily: "monospace", fontSize: 11, lineHeight: 1.5,
+      maxHeight: maxHeight ?? 400, overflow: "auto",
+      background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: 4,
+    }}>
+      {lines.map((ln, i) => {
+        let bg = "transparent";
+        let color = "var(--text-muted)";
+        if (ln.startsWith("+++") || ln.startsWith("---")) { color = "var(--text-faint)"; }
+        else if (ln.startsWith("@@")) { color = "var(--accent-blue)"; bg = "var(--bg-surface)"; }
+        else if (ln.startsWith("+")) { bg = "rgba(46, 160, 67, 0.15)"; color = "#7ee787"; }
+        else if (ln.startsWith("-")) { bg = "rgba(248, 81, 73, 0.15)"; color = "#ffa198"; }
+        return (
+          <div key={i} style={{ background: bg, color, padding: "0 8px", whiteSpace: "pre" }}>
+            {ln || " "}
+          </div>
+        );
+      })}
+    </pre>
+  );
+}
+
+function CodexPatchFileRow({ path, info }: {
+  path: string;
+  info: { type?: string; content?: string; unified_diff?: string; move_path?: string };
+}) {
+  const [open, setOpen] = useState(false);
+  const type = info.type || "update";
+  const name = path.split("/").pop() || path;
+  const dir = path.slice(0, path.length - name.length).replace(/\/$/, "");
+  const typeStyle: Record<string, { sym: string; color: string; bg: string }> = {
+    add: { sym: "+", color: "#7ee787", bg: "rgba(46, 160, 67, 0.12)" },
+    update: { sym: "M", color: "var(--accent-blue)", bg: "transparent" },
+    delete: { sym: "−", color: "#ffa198", bg: "rgba(248, 81, 73, 0.12)" },
+  };
+  const t = typeStyle[type] || typeStyle.update;
+  // Compute +/− stats
+  const stats = useMemo(() => {
+    if (type === "add" && info.content) {
+      return { add: info.content.split("\n").length, del: 0 };
+    }
+    if (type === "update" && info.unified_diff) {
+      let add = 0, del = 0;
+      for (const ln of info.unified_diff.split("\n")) {
+        if (ln.startsWith("+") && !ln.startsWith("+++")) add++;
+        else if (ln.startsWith("-") && !ln.startsWith("---")) del++;
+      }
+      return { add, del };
+    }
+    return { add: 0, del: 0 };
+  }, [type, info.content, info.unified_diff]);
+  const hasBody = (type === "add" && !!info.content) || (type === "update" && !!info.unified_diff);
+
+  return (
+    <div style={{ borderTop: "1px solid var(--border)" }}>
+      <button
+        onClick={() => hasBody && setOpen(!open)}
+        style={{
+          display: "flex", alignItems: "center", width: "100%", gap: 8,
+          padding: "4px 8px", background: t.bg, border: "none",
+          cursor: hasBody ? "pointer" : "default", textAlign: "left",
+          fontFamily: "monospace", fontSize: 11, color: t.color,
+        }}
+      >
+        <span style={{ width: 12, textAlign: "center", flexShrink: 0, fontWeight: 700 }}>{t.sym}</span>
+        <span style={{ flexShrink: 0, fontWeight: 600 }}>{name}</span>
+        {dir && <span style={{ color: "var(--text-faintest)", fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{dir}</span>}
+        <span style={{ flex: 1 }} />
+        {info.move_path && (
+          <span style={{ color: "var(--text-faint)", fontSize: 10 }}>→ {info.move_path}</span>
+        )}
+        {(stats.add > 0 || stats.del > 0) && (
+          <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>
+            {stats.add > 0 && <span style={{ color: "#7ee787" }}>+{stats.add}</span>}
+            {stats.add > 0 && stats.del > 0 && " "}
+            {stats.del > 0 && <span style={{ color: "#ffa198" }}>−{stats.del}</span>}
+          </span>
+        )}
+        {hasBody && (
+          <span style={{ color: "var(--text-faintest)", fontSize: 10, flexShrink: 0 }}>{open ? "▲" : "▼"}</span>
+        )}
+      </button>
+      {open && hasBody && (
+        <div style={{ padding: "4px 8px 6px" }}>
+          {type === "update" && info.unified_diff && <UnifiedDiffView diff={info.unified_diff} />}
+          {type === "add" && info.content && (
+            <UnifiedDiffView
+              diff={info.content.split("\n").map((l) => "+" + l).join("\n")}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CodexPatchApplyBlock({ stdout, stderr, success, changes, status }: {
   stdout: string; stderr: string; success: boolean; changes: Record<string, unknown>; status: string;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const files = Object.keys(changes);
+  const entries = useMemo(() => Object.entries(changes || {}), [changes]);
   const dotColor = success ? "var(--accent-green)" : "var(--accent-red)";
   const statusLabel = success ? "applied" : (status || "failed");
+  const totals = useMemo(() => {
+    let add = 0, del = 0;
+    for (const [, info] of entries) {
+      const i = (info as { type?: string; content?: string; unified_diff?: string });
+      if (i.type === "add" && i.content) add += i.content.split("\n").length;
+      else if (i.type === "update" && i.unified_diff) {
+        for (const ln of i.unified_diff.split("\n")) {
+          if (ln.startsWith("+") && !ln.startsWith("+++")) add++;
+          else if (ln.startsWith("-") && !ln.startsWith("---")) del++;
+        }
+      }
+    }
+    return { add, del };
+  }, [entries]);
+
   return (
     <div style={{ padding: "2px 16px" }}>
       <button
@@ -2968,31 +3083,43 @@ function CodexPatchApplyBlock({ stdout, stderr, success, changes, status }: {
             fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11.5px)", color: "var(--text-muted)",
             overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
           }}>
-            {files.length > 0 ? `${files.length} file${files.length === 1 ? "" : "s"}: ${files.slice(0, 2).join(", ")}${files.length > 2 ? "…" : ""}` : ""}
+            {entries.length > 0
+              ? `${entries.length} file${entries.length === 1 ? "" : "s"} · `
+              : ""}
+            {(totals.add > 0 || totals.del > 0) && (
+              <>
+                {totals.add > 0 && <span style={{ color: "#7ee787" }}>+{totals.add}</span>}
+                {totals.add > 0 && totals.del > 0 && " "}
+                {totals.del > 0 && <span style={{ color: "#ffa198" }}>−{totals.del}</span>}
+              </>
+            )}
           </span>
         </div>
         <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
       </button>
       {expanded && (
-        <div style={{ marginTop: 4, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }}>
-          {files.length > 0 && (
-            <div style={{ marginBottom: 6 }}>
-              <div style={{ color: "var(--text-faintest)", marginBottom: 2 }}>changes:</div>
-              {files.map((f) => (
-                <div key={f} style={{ paddingLeft: 8, color: "var(--text-muted)" }}>• {f}</div>
-              ))}
-            </div>
-          )}
-          {stdout.trim() && (
-            <div style={{ marginBottom: 6 }}>
-              <div style={{ color: "var(--text-faintest)", marginBottom: 2 }}>stdout:</div>
-              <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 300, overflow: "auto" }}>{stdout}</div>
-            </div>
-          )}
-          {stderr.trim() && (
-            <div>
-              <div style={{ color: "var(--accent-red)", marginBottom: 2 }}>stderr:</div>
-              <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--accent-red)", maxHeight: 300, overflow: "auto" }}>{stderr}</div>
+        <div style={{ marginTop: 4, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, overflow: "hidden" }}>
+          {entries.map(([path, info]) => (
+            <CodexPatchFileRow
+              key={path}
+              path={path}
+              info={(info as { type?: string; content?: string; unified_diff?: string; move_path?: string }) || {}}
+            />
+          ))}
+          {(stdout.trim() || stderr.trim()) && (
+            <div style={{ padding: 8, borderTop: "1px solid var(--border)", fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }}>
+              {stdout.trim() && (
+                <div style={{ marginBottom: stderr.trim() ? 6 : 0 }}>
+                  <div style={{ color: "var(--text-faintest)", marginBottom: 2 }}>stdout:</div>
+                  <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 200, overflow: "auto" }}>{stdout}</div>
+                </div>
+              )}
+              {stderr.trim() && (
+                <div>
+                  <div style={{ color: "var(--accent-red)", marginBottom: 2 }}>stderr:</div>
+                  <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--accent-red)", maxHeight: 200, overflow: "auto" }}>{stderr}</div>
+                </div>
+              )}
             </div>
           )}
         </div>
