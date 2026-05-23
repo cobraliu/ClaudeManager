@@ -12,7 +12,7 @@ import {
   type ChangedFile, type ChangedFilesWarning, type FileData, type FileEntry,
   type GitLogEntry,
 } from "../api/sessionApi";
-import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker } from "./FileEditorModal";
+import { SqliteViewer, CsvViewer, ArchiveViewer, JsonlViewer, copyText, DirPicker } from "./FileEditorModal";
 import { CodeMirrorEditor, type CodeMirrorEditorHandle } from "./CodeMirrorEditor";
 import { GitPanel, CommitDetailModal } from "./GitPanel";
 import { GitBranchPicker, GitPullButton } from "./GitBranchPicker";
@@ -69,6 +69,7 @@ function isHtmlFile(name: string) {
   return e === "html" || e === "htm";
 }
 function isCsvFile(name: string) { const e = name.split(".").pop()?.toLowerCase() ?? ""; return e === "csv" || e === "tsv"; }
+function isJsonlFile(name: string) { return name.split(".").pop()?.toLowerCase() === "jsonl"; }
 function csvDelimiter(name: string) { return name.split(".").pop()?.toLowerCase() === "tsv" ? "\t" : ","; }
 
 const ARCHIVE_EXTS = new Set(["zip", "tar", "gz", "bz2", "xz", "tgz", "tbz2", "txz", "7z", "rar"]);
@@ -1375,7 +1376,7 @@ export function FileSidePanel({
 // ── File viewer header + content (shared by CodePane and FileViewerPane) ─────
 
 function ViewerHeader({
-  path, selectedChanged, fileData, showImage, showSqlite, isMd, isCsv, isHtml, mdPreview, setMdPreview, viewMode, setViewMode, noDiff,
+  path, selectedChanged, fileData, showImage, showSqlite, isMd, isCsv, isHtml, isJsonl, mdPreview, setMdPreview, viewMode, setViewMode, noDiff,
   onDownload, canEdit, editing, saving, isModified, onEditToggle, onCancelEdit,
 }: {
   path: string;
@@ -1386,6 +1387,7 @@ function ViewerHeader({
   isMd: boolean;
   isCsv: boolean;
   isHtml: boolean;
+  isJsonl: boolean;
   mdPreview: boolean;
   setMdPreview: (v: boolean) => void;
   viewMode: "full" | "diff" | "split";
@@ -1430,7 +1432,22 @@ function ViewerHeader({
       )}
       {fileData && !showImage && !showSqlite && (
         <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0, display: "flex", alignItems: "center", gap: 4 }}>
-          {!isMd && !isCsv && !isHtml && (fileData.is_binary ? "binary" : fileData.language)}
+          {!isMd && !isCsv && !isHtml && !isJsonl && (fileData.is_binary ? "binary" : fileData.language)}
+          {isJsonl && (
+            <button
+              onClick={() => setMdPreview(!mdPreview)}
+              title="Toggle table view / source"
+              style={{
+                fontSize: 9, padding: "1px 5px",
+                background: mdPreview ? "var(--bg-modal)" : "var(--bg-hover)",
+                color: mdPreview ? "#60a5fa" : "var(--text-muted)",
+                border: `1px solid ${mdPreview ? "#2563eb" : "var(--text-faintest)"}`,
+                borderRadius: 3, cursor: "pointer",
+              }}
+            >
+              {mdPreview ? "TABLE" : "SOURCE"}
+            </button>
+          )}
           {isHtml && (
             <button
               onClick={() => setMdPreview(!mdPreview)}
@@ -1476,9 +1493,9 @@ function ViewerHeader({
               {mdPreview ? "TABLE" : "SOURCE"}
             </button>
           )}
-          {!isMd && !isCsv && !(isHtml && mdPreview) && !noDiff && fileData.added_lines.length > 0 && <span style={{ color: "var(--accent-green)", marginLeft: 6 }}>+{fileData.added_lines.length}</span>}
-          {!isMd && !isCsv && !(isHtml && mdPreview) && !noDiff && fileData.removed_lines.length > 0 && <span style={{ color: "var(--accent-red)", marginLeft: 4 }}>−{fileData.removed_lines.length}</span>}
-          {!isMd && !isCsv && !(isHtml && mdPreview) && !noDiff && (fileData.added_lines.length > 0 || fileData.removed_lines.length > 0) && (
+          {!isMd && !isCsv && !(isHtml && mdPreview) && !(isJsonl && mdPreview) && !noDiff && fileData.added_lines.length > 0 && <span style={{ color: "var(--accent-green)", marginLeft: 6 }}>+{fileData.added_lines.length}</span>}
+          {!isMd && !isCsv && !(isHtml && mdPreview) && !(isJsonl && mdPreview) && !noDiff && fileData.removed_lines.length > 0 && <span style={{ color: "var(--accent-red)", marginLeft: 4 }}>−{fileData.removed_lines.length}</span>}
+          {!isMd && !isCsv && !(isHtml && mdPreview) && !(isJsonl && mdPreview) && !noDiff && (fileData.added_lines.length > 0 || fileData.removed_lines.length > 0) && (
             <button
               onClick={() => setViewMode(viewMode === "full" ? "diff" : viewMode === "diff" ? "split" : "full")}
               title="Cycle: Full → Diff → Split"
@@ -1612,8 +1629,10 @@ function ViewerContent({
   const showImage = isImage(entry.name);
   const isMd = isMdFile(entry.name);
   const isHtml = isHtmlFile(entry.name);
+  const isJsonl = isJsonlFile(entry.name);
   const showMarkdown = isMd && mdPreview && !!fileData;
   const showHtml = isHtml && mdPreview && !!fileData;
+  const showJsonlTable = isJsonl && mdPreview && !!fileData;
 
   const isCsv = isCsvFile(entry.name);
 
@@ -1623,6 +1642,7 @@ function ViewerContent({
   if (showImage) return <ImageViewer sessionId={sessionId} path={entry.path} />;
   if (fileLoading && !fileData) return <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 12 }}>Loading…</div>;
   if (showHtml) return <HtmlViewer key={fileData!.path + ":html"} sessionId={sessionId} path={fileData!.path} initialContent={fileData!.content} />;
+  if (showJsonlTable) return <JsonlViewer key={fileData!.path + ":jsonl"} content={fileData!.content} />;
   if (fileData?.is_binary) return (
     <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 13 }}>
       <div style={{ textAlign: "center" }}>
@@ -1675,14 +1695,15 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   const isMd = isMdFile(name);
   const isCsv = isCsvFile(name);
   const isHtml = isHtmlFile(name);
-  const [mdPreview, setMdPreview] = useState(isMd || isCsv || isHtml);
+  const isJsonl = isJsonlFile(name);
+  const [mdPreview, setMdPreview] = useState(isMd || isCsv || isHtml || isJsonl);
 
   useEffect(() => { editingRef.current = editing; }, [editing]);
 
   useEffect(() => { setViewMode(initViewMode); }, [initViewMode]);
   useEffect(() => {
     const n = path.split("/").pop() ?? path;
-    setMdPreview(isMdFile(n) || isCsvFile(n) || isHtmlFile(n));
+    setMdPreview(isMdFile(n) || isCsvFile(n) || isHtmlFile(n) || isJsonlFile(n));
     setEditing(false);
     setEditBuffer("");
     setEditStartMtime(null);
@@ -1837,6 +1858,7 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
         isMd={isMd}
         isCsv={isCsv}
         isHtml={isHtml}
+        isJsonl={isJsonl}
         mdPreview={mdPreview}
         setMdPreview={setMdPreview}
         viewMode={viewMode}
@@ -2890,6 +2912,7 @@ export function CodePane({
               isMd={isMdFile(selectedEntry.name)}
               isCsv={isCsvFile(selectedEntry.name)}
               isHtml={isHtmlFile(selectedEntry.name)}
+              isJsonl={isJsonlFile(selectedEntry.name)}
               mdPreview={mdPreview}
               setMdPreview={setMdPreview}
               viewMode={viewMode}
