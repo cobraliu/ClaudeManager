@@ -2714,27 +2714,106 @@ function CodexEncryptedReasoningBlock() {
   );
 }
 
+// Keys that are routing/plumbing noise — hide in expanded view by default.
+const CODEX_TOOL_NOISE_KEYS = new Set([
+  "yield_time_ms", "max_output_tokens", "sandbox_permissions",
+  "prefix_rule", "session_id",
+]);
+
+function codexToolCallSummary(name: string, input: unknown): string {
+  // String input (custom_tool_call like apply_patch): collapse to a short label.
+  if (typeof input === "string") {
+    if (name === "apply_patch") {
+      const lineCount = input.split("\n").length;
+      return `${lineCount} line${lineCount === 1 ? "" : "s"} of patch text`;
+    }
+    const oneLine = input.replace(/\s+/g, " ").trim();
+    return oneLine.length > 120 ? oneLine.slice(0, 120) + "…" : oneLine;
+  }
+  if (!input || typeof input !== "object") return "";
+  const obj = input as Record<string, unknown>;
+  // Per-tool smart summaries
+  if (name === "exec_command") {
+    const cmd = typeof obj.cmd === "string" ? obj.cmd : "";
+    return cmd || "(no command)";
+  }
+  if (name === "write_stdin") {
+    const chars = typeof obj.chars === "string" ? obj.chars : "";
+    const sid = obj.session_id;
+    const sidStr = sid != null ? `→ session ${sid}` : "";
+    const preview = chars ? `"${chars.replace(/\n/g, "↵").slice(0, 80)}${chars.length > 80 ? "…" : ""}"` : "(empty)";
+    return [sidStr, preview].filter(Boolean).join(" ");
+  }
+  // Generic fallback: first meaningful string field.
+  for (const k of ["command", "cmd", "path", "file_path", "query", "url", "input"]) {
+    const v = obj[k];
+    if (typeof v === "string" && v) {
+      return v.length > 120 ? v.slice(0, 120) + "…" : v;
+    }
+    if (Array.isArray(v)) return v.map(String).join(" ");
+  }
+  // Last resort: comma-joined key list (no JSON dump).
+  const keys = Object.keys(obj).filter((k) => !CODEX_TOOL_NOISE_KEYS.has(k));
+  return keys.length > 0 ? `{${keys.join(", ")}}` : "";
+}
+
 function CodexToolCallBlock({ name, input, status, callId }: {
-  name: string; input: Record<string, unknown>; status: string; callId: string;
+  name: string; input: unknown; status: string; callId: string;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const inputJson = useMemo(() => {
-    try { return JSON.stringify(input, null, 2); } catch { return String(input); }
-  }, [input]);
-  const summary = useMemo(() => {
-    // Prefer common single-field signatures: command, path, args
-    const keys = ["command", "cmd", "path", "file_path", "query", "url"];
-    for (const k of keys) {
-      const v = input[k];
-      if (typeof v === "string" && v) return v;
-      if (Array.isArray(v)) return v.map(String).join(" ");
-    }
-    const oneLine = inputJson.replace(/\s+/g, " ");
-    return oneLine.length > 120 ? oneLine.slice(0, 120) + "…" : oneLine;
-  }, [input, inputJson]);
+  const summary = useMemo(() => codexToolCallSummary(name, input), [name, input]);
   const dotColor = status === "completed" ? "var(--accent-green)"
                 : status === "failed" ? "var(--accent-red)"
                 : "var(--accent-amber)";
+
+  // Expanded view: render structured key/value list for object input, or raw
+  // text in a <pre> block for string input (e.g. apply_patch). Skips noise keys.
+  const expandedBody = useMemo(() => {
+    if (typeof input === "string") {
+      return (
+        <pre style={{ margin: 0, fontFamily: "monospace", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-muted)", maxHeight: 400, overflow: "auto" }}>
+          {input}
+        </pre>
+      );
+    }
+    if (!input || typeof input !== "object") return null;
+    const obj = input as Record<string, unknown>;
+    const visible = Object.entries(obj).filter(([k]) => !CODEX_TOOL_NOISE_KEYS.has(k));
+    const hidden = Object.entries(obj).filter(([k]) => CODEX_TOOL_NOISE_KEYS.has(k));
+    return (
+      <div>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 11 }}>
+          <tbody>
+            {visible.map(([k, v]) => (
+              <tr key={k}>
+                <td style={{ verticalAlign: "top", padding: "2px 8px 2px 0", color: "var(--text-faintest)", whiteSpace: "nowrap" }}>{k}</td>
+                <td style={{ padding: "2px 0", color: "var(--text-muted)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                  {typeof v === "string" ? v : JSON.stringify(v)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {hidden.length > 0 && (
+          <details style={{ marginTop: 6 }}>
+            <summary style={{ cursor: "pointer", color: "var(--text-faintest)", fontSize: 10 }}>
+              · {hidden.length} more (routing fields)
+            </summary>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 11, marginTop: 4 }}>
+              <tbody>
+                {hidden.map(([k, v]) => (
+                  <tr key={k}>
+                    <td style={{ padding: "2px 8px 2px 0", color: "var(--text-faintest)", whiteSpace: "nowrap" }}>{k}</td>
+                    <td style={{ padding: "2px 0", color: "var(--text-faint)" }}>{typeof v === "string" ? v : JSON.stringify(v)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </details>
+        )}
+      </div>
+    );
+  }, [input]);
 
   return (
     <div style={{ padding: "2px 16px" }}>
@@ -2762,40 +2841,99 @@ function CodexToolCallBlock({ name, input, status, callId }: {
         <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
       </button>
       {expanded && (
-        <div style={{ marginTop: 4, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, fontFamily: "monospace", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-muted)" }}>
-          {callId && <div style={{ color: "var(--text-faintest)", marginBottom: 4 }}>call_id: {callId}</div>}
-          {inputJson}
+        <div style={{ marginTop: 4, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, color: "var(--text-muted)" }}>
+          {callId && <div style={{ color: "var(--text-faintest)", marginBottom: 6, fontFamily: "monospace", fontSize: 10 }}>call_id: {callId}</div>}
+          {expandedBody}
         </div>
       )}
     </div>
   );
 }
 
+// Codex's exec_command tool wraps output in structured headers:
+//   "Chunk ID: <id>\nWall time: ...\nProcess exited with code N\n
+//    Original token count: ...\nOutput:\n<actual output>"
+// Parse them so the bubble shows the actual output (not the meta noise).
+function parseCodexExecOutput(raw: string): {
+  chunkId?: string;
+  wallTime?: string;
+  exitCode?: number;
+  tokenCount?: number;
+  body: string;
+} {
+  const headers: Record<string, string> = {};
+  const lines = raw.split("\n");
+  let bodyStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === "Output:") { bodyStart = i + 1; break; }
+    const m = line.match(/^([A-Za-z][A-Za-z ]*?):\s*(.*)$/);
+    if (m) headers[m[1]] = m[2];
+    else { bodyStart = i; break; }
+  }
+  const body = bodyStart >= 0 ? lines.slice(bodyStart).join("\n") : raw;
+  const exitMatch = (headers["Process exited with code"] || "").match(/^(-?\d+)/);
+  const tokenMatch = (headers["Original token count"] || "").match(/^(\d+)/);
+  return {
+    chunkId: headers["Chunk ID"],
+    wallTime: headers["Wall time"],
+    exitCode: exitMatch ? Number(exitMatch[1]) : undefined,
+    tokenCount: tokenMatch ? Number(tokenMatch[1]) : undefined,
+    body: body.replace(/\n+$/, ""),
+  };
+}
+
 function CodexToolResultBlock({ output, callId }: { output: string; callId: string }) {
   const [expanded, setExpanded] = useState(false);
   const trimmed = output.trim();
   if (!trimmed) return null;
-  const firstLine = trimmed.split("\n")[0];
-  const isMultiline = trimmed.includes("\n");
+  const parsed = useMemo(() => parseCodexExecOutput(trimmed), [trimmed]);
+  const hasExecHeaders = parsed.exitCode !== undefined || parsed.chunkId !== undefined;
+  const visibleBody = hasExecHeaders ? parsed.body : trimmed;
+  const isMultiline = visibleBody.includes("\n");
+  const firstLine = visibleBody.split("\n")[0] || "(no output)";
   const preview = firstLine.length > 160 ? firstLine.slice(0, 160) + "…" : firstLine;
+
+  const exitOk = parsed.exitCode === 0;
+  const exitBadge = parsed.exitCode !== undefined && (
+    <span style={{
+      flexShrink: 0, fontSize: 10, fontFamily: "monospace", padding: "1px 5px", borderRadius: 3,
+      background: exitOk ? "#064e3b" : "#4c1d1d",
+      color: exitOk ? "#6ee7b7" : "#fca5a5",
+      border: `1px solid ${exitOk ? "#065f46" : "#7f1d1d"}`,
+    }}>
+      exit {parsed.exitCode}
+    </span>
+  );
+
   return (
     <div style={{ padding: "2px 16px 2px 32px" }}>
       <button
         onClick={() => setExpanded(!expanded)}
         style={{
           display: "flex", alignItems: "center", width: "100%",
-          background: "transparent", border: "none", padding: "2px 0", cursor: isMultiline ? "pointer" : "default",
+          background: "transparent", border: "none", padding: "2px 0", cursor: isMultiline || hasExecHeaders ? "pointer" : "default",
           gap: 6, textAlign: "left", color: "var(--text-muted)", fontSize: 11, fontFamily: "monospace",
         }}
       >
         <span style={{ color: "var(--text-faintest)", flexShrink: 0 }}>↳</span>
+        {exitBadge}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{preview}</span>
-        {isMultiline && <span style={{ color: "var(--text-faintest)", fontSize: 10 }}>{expanded ? "▲" : "▼"}</span>}
+        {(isMultiline || hasExecHeaders) && <span style={{ color: "var(--text-faintest)", fontSize: 10 }}>{expanded ? "▲" : "▼"}</span>}
       </button>
-      {expanded && isMultiline && (
-        <div style={{ marginTop: 2, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, fontFamily: "monospace", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-muted)", maxHeight: 400, overflow: "auto" }}>
-          {trimmed}
-          {callId && <div style={{ color: "var(--text-faintest)", marginTop: 6, borderTop: "1px solid var(--border)", paddingTop: 4 }}>call_id: {callId}</div>}
+      {expanded && (isMultiline || hasExecHeaders) && (
+        <div style={{ marginTop: 2, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)", maxHeight: 400, overflow: "auto" }}>
+          {visibleBody && (
+            <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{visibleBody || "(empty output)"}</div>
+          )}
+          {(hasExecHeaders || callId) && (
+            <div style={{ color: "var(--text-faintest)", marginTop: 6, borderTop: "1px solid var(--border)", paddingTop: 4, fontSize: 10 }}>
+              {parsed.wallTime && <span style={{ marginRight: 10 }}>⏱ {parsed.wallTime}</span>}
+              {parsed.tokenCount !== undefined && <span style={{ marginRight: 10 }}>{parsed.tokenCount} tok</span>}
+              {parsed.chunkId && <span style={{ marginRight: 10 }}>chunk {parsed.chunkId}</span>}
+              {callId && <span>call_id: {callId}</span>}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -3023,7 +3161,7 @@ function MessageEntry({
     const r = entry as unknown as Record<string, unknown>;
     return <CodexToolCallBlock
       name={String(r.name || "tool")}
-      input={(r.input as Record<string, unknown>) || {}}
+      input={r.input}
       status={String(r.status || "")}
       callId={String(r.call_id || "")}
     />;

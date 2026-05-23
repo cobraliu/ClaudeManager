@@ -345,6 +345,10 @@ def get_codex_raw_messages(session_id: str, cwd: str, tail: int | None = None) -
                 elif top == "response_item" and sub in ("function_call", "custom_tool_call"):
                     name = p.get("name") or ""
                     call_id = p.get("call_id") or ""
+                    # apply_patch with a matching patch_apply_end is fully covered by
+                    # the richer codex_patch_apply block — suppress the duplicate call.
+                    if name == "apply_patch" and call_id in patch_call_ids:
+                        continue
                     # function_call: arguments is a JSON string. custom_tool_call: input is raw text.
                     raw_args = p.get("arguments") if sub == "function_call" else p.get("input")
                     parsed: object
