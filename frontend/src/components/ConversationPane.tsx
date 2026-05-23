@@ -2853,7 +2853,9 @@ function CodexToolCallBlock({ name, input, status, callId }: {
 // Codex's exec_command tool wraps output in structured headers:
 //   "Chunk ID: <id>\nWall time: ...\nProcess exited with code N\n
 //    Original token count: ...\nOutput:\n<actual output>"
-// Parse them so the bubble shows the actual output (not the meta noise).
+// Note "Process exited with code N" has NO colon after "code" — needs its
+// own regex. We split on the "Output:" line (everything after is the body)
+// then scan the prefix for known header lines.
 function parseCodexExecOutput(raw: string): {
   chunkId?: string;
   wallTime?: string;
@@ -2861,37 +2863,39 @@ function parseCodexExecOutput(raw: string): {
   tokenCount?: number;
   body: string;
 } {
-  const headers: Record<string, string> = {};
   const lines = raw.split("\n");
-  let bodyStart = -1;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line === "Output:") { bodyStart = i + 1; break; }
-    const m = line.match(/^([A-Za-z][A-Za-z ]*?):\s*(.*)$/);
-    if (m) headers[m[1]] = m[2];
-    else { bodyStart = i; break; }
+  // Look for the "Output:" delimiter in the first ~10 lines (header block).
+  let outputIdx = -1;
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    if (lines[i] === "Output:") { outputIdx = i; break; }
   }
-  const body = bodyStart >= 0 ? lines.slice(bodyStart).join("\n") : raw;
-  const exitMatch = (headers["Process exited with code"] || "").match(/^(-?\d+)/);
-  const tokenMatch = (headers["Original token count"] || "").match(/^(\d+)/);
-  return {
-    chunkId: headers["Chunk ID"],
-    wallTime: headers["Wall time"],
-    exitCode: exitMatch ? Number(exitMatch[1]) : undefined,
-    tokenCount: tokenMatch ? Number(tokenMatch[1]) : undefined,
-    body: body.replace(/\n+$/, ""),
-  };
+  if (outputIdx < 0) {
+    return { body: raw.replace(/\n+$/, "") };
+  }
+  const headerLines = lines.slice(0, outputIdx);
+  const body = lines.slice(outputIdx + 1).join("\n").replace(/\n+$/, "");
+  const result: {
+    chunkId?: string; wallTime?: string; exitCode?: number; tokenCount?: number; body: string;
+  } = { body };
+  for (const line of headerLines) {
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/^Chunk ID:\s*(.+)$/))) result.chunkId = m[1].trim();
+    else if ((m = line.match(/^Wall time:\s*(.+)$/))) result.wallTime = m[1].trim();
+    else if ((m = line.match(/^Process exited with code\s+(-?\d+)/))) result.exitCode = Number(m[1]);
+    else if ((m = line.match(/^Original token count:\s*(\d+)/))) result.tokenCount = Number(m[1]);
+  }
+  return result;
 }
 
 function CodexToolResultBlock({ output, callId }: { output: string; callId: string }) {
   const [expanded, setExpanded] = useState(false);
   const trimmed = output.trim();
-  if (!trimmed) return null;
   const parsed = useMemo(() => parseCodexExecOutput(trimmed), [trimmed]);
+  if (!trimmed) return null;
   const hasExecHeaders = parsed.exitCode !== undefined || parsed.chunkId !== undefined;
   const visibleBody = hasExecHeaders ? parsed.body : trimmed;
   const isMultiline = visibleBody.includes("\n");
-  const firstLine = visibleBody.split("\n")[0] || "(no output)";
+  const firstLine = visibleBody.split("\n")[0] || (hasExecHeaders ? "(command produced no output)" : "(no output)");
   const preview = firstLine.length > 160 ? firstLine.slice(0, 160) + "…" : firstLine;
 
   const exitOk = parsed.exitCode === 0;
