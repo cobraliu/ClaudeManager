@@ -382,6 +382,13 @@ function FileCentricViewerColumn(props: {
                 key={t.id}
                 ref={(el) => { tabElRefs.current[t.id] = el; }}
                 onClick={() => onActivate(t.id)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setMenuPos({ top: r.bottom + 2, right: Math.max(4, window.innerWidth - r.right) });
+                  setMenuTabId(t.id);
+                }}
                 title={titleFor(t)}
                 style={{
                   position: "relative",

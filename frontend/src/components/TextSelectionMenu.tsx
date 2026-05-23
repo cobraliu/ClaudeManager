@@ -1,9 +1,12 @@
-// Global menu for selected text. Triggered by **Shift + right-click** so the
-// native context menu (Inspect Element, Copy, Search…) is preserved for
-// plain right-clicks. Plain right-click: untouched. Shift+right-click on a
-// non-empty selection (outside xterm / CodeMirror / [data-no-context-menu]):
-// our menu opens with one column per category, everything visible at once,
-// no scroll.
+// Global menu for selected text. Two trigger modes:
+//   1. **Shift + right-click** anywhere outside excluded zones (xterm /
+//      CodeMirror / [data-no-context-menu]) — preserves the native context
+//      menu for plain right-clicks.
+//   2. **Plain right-click** inside a `[data-str-menu-auto]` zone (e.g.
+//      FileViewer content) — but only when there is a non-empty selection.
+//      With no selection, we let the native context menu fire as usual.
+//      Inside an auto zone, the CodeMirror exclusion is overridden so the
+//      menu works on selected code too.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CATEGORY_ORDER, STRING_TOOLS, StringTool, ToolCategory } from "../lib/stringTools";
@@ -42,6 +45,11 @@ function isInExcludedZone(target: EventTarget | null): boolean {
   return false;
 }
 
+function isInAutoZone(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  return target.closest("[data-str-menu-auto]") !== null;
+}
+
 export function TextSelectionMenu() {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [result, setResult] = useState<ResultState | null>(null);
@@ -56,18 +64,31 @@ export function TextSelectionMenu() {
   useEffect(() => {
     const onMouseDown = (e: MouseEvent) => {
       if (e.button !== 2 || !e.shiftKey) return;
-      if (isInExcludedZone(e.target)) return;
+      // Skip excluded zones, unless we're inside an auto zone (FileViewer)
+      // where CodeMirror normally falls under exclusion but should still
+      // honor selection preservation.
+      if (isInExcludedZone(e.target) && !isInAutoZone(e.target)) return;
       const sel = window.getSelection();
       if (!sel || sel.toString().length === 0) return;
       e.preventDefault();
     };
     const onCtx = (e: MouseEvent) => {
       if (e.defaultPrevented) return;
-      if (!e.shiftKey) return; // plain right-click → let native menu fire
-      if (isInExcludedZone(e.target)) return;
       const sel = window.getSelection();
       const text = sel ? sel.toString() : "";
-      if (text.length === 0) return;
+      const inAuto = isInAutoZone(e.target);
+
+      if (inAuto) {
+        // Plain right-click inside auto zone: only override native menu when
+        // there's a selection to act on; empty selection → let native fire.
+        if (text.length === 0) return;
+      } else {
+        // Outside auto zone: original Shift+right-click contract.
+        if (!e.shiftKey) return;
+        if (isInExcludedZone(e.target)) return;
+        if (text.length === 0) return;
+      }
+
       e.preventDefault();
       e.stopPropagation();
       const x = Math.max(8, Math.min(e.clientX, window.innerWidth - MENU_WIDTH - 8));
