@@ -64,9 +64,16 @@ interface Props {
   fontFamily?: string;
   scrollToBottomRef?: React.MutableRefObject<(() => void) | null>;
   sendRawRef?: React.MutableRefObject<((data: string) => void) | null>;
+  /**
+   * When true: in alt-screen mode, swallow mouse-wheel/touch-scroll events
+   * instead of forwarding them to the TUI as SGR mouse sequences. Use for
+   * TUIs like Codex whose chat history does NOT bind wheel — forwarding
+   * just makes the input box scroll, which is worse than no-op.
+   */
+  suppressAltScreenWheel?: boolean;
 }
 
-export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRef }: Props) {
+export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRef, suppressAltScreenWheel }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef      = useRef<Terminal | null>(null);
   const fitRef       = useRef<FitAddon | null>(null);
@@ -87,6 +94,10 @@ export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRe
   useEffect(() => {
     try { window.localStorage.setItem("tuiWideMode", wideMode ? "1" : "0"); } catch { /* ignore */ }
   }, [wideMode]);
+
+  // Latest value of suppressAltScreenWheel, for closures captured by the once-only setup effect.
+  const suppressWheelRef = useRef(!!suppressAltScreenWheel);
+  useEffect(() => { suppressWheelRef.current = !!suppressAltScreenWheel; }, [suppressAltScreenWheel]);
   // Re-apply sizing when wide mode toggles
   useEffect(() => {
     const term = termRef.current;
@@ -234,6 +245,16 @@ export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRe
     // (alt-screen TUI), wheel events get forwarded as mouse escape sequences and
     // Claude scrolls its own chat history. Custom tmux-copy-mode interception
     // didn't work because alt-screen panes have no tmux scrollback to show.
+    //
+    // Exception: when suppressAltScreenWheel is on (e.g. Codex, whose chat
+    // history doesn't bind wheel — forwarding just scrolls the input box),
+    // swallow the event so it stays a no-op instead of disrupting the input.
+    el.addEventListener("wheel", (e) => {
+      if (!suppressWheelRef.current) return;
+      if (term.buffer.active.type !== "alternate") return;
+      e.preventDefault();
+      e.stopPropagation();
+    }, { passive: false, capture: true });
 
     // Touch scroll: xterm.js doesn't synthesize wheel/mouse-tracking events from
     // touch, so on mobile users can't scroll TUI history. Translate touchmove into
@@ -348,6 +369,12 @@ export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRe
         const tt = termRef.current;
         if (!tt) return;
         const isAlt = tt.buffer.active.type === "alternate";
+        if (isAlt && suppressWheelRef.current) {
+          // Codex-style TUI: chat history doesn't bind wheel. Just swallow the
+          // touch scroll so we don't drive the input box.
+          e.preventDefault();
+          return;
+        }
         if (isAlt) {
           // Forward as SGR mouse wheel — Claude TUI scrolls its own history.
           // ticks > 0 (finger moved up) = newer = wheel-down (button 65).
