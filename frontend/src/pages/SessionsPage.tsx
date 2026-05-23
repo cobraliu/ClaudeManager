@@ -2268,7 +2268,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                     theme={theme}
                     scrollToBottomRef={tuiScrollToBottomRef}
                     fontFamily={terminalFont}
-                    suppressAltScreenWheel={activeSessionMeta?.tool === "codex"}
+                    useTmuxScroll={activeSessionMeta?.tool === "codex"}
                   />
                 </div>
               </div>

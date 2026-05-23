@@ -65,15 +65,18 @@ interface Props {
   scrollToBottomRef?: React.MutableRefObject<(() => void) | null>;
   sendRawRef?: React.MutableRefObject<((data: string) => void) | null>;
   /**
-   * When true: in alt-screen mode, swallow mouse-wheel/touch-scroll events
-   * instead of forwarding them to the TUI as SGR mouse sequences. Use for
-   * TUIs like Codex whose chat history does NOT bind wheel — forwarding
-   * just makes the input box scroll, which is worse than no-op.
+   * When true: take over wheel/touch events and send them to the server as
+   * tmux copy-mode scroll commands instead of letting xterm.js forward them
+   * to the TUI. Required for TUIs that don't bind wheel for history (Codex
+   * routes wheel to its input box) AND that run inline (so tmux's main-buffer
+   * scrollback actually holds the chat history). xterm.js by itself can't
+   * scroll, because `tmux attach-session` only replays the current viewport,
+   * never the scrollback — so xterm.js never receives the history bytes.
    */
-  suppressAltScreenWheel?: boolean;
+  useTmuxScroll?: boolean;
 }
 
-export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRef, suppressAltScreenWheel }: Props) {
+export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRef, useTmuxScroll }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef      = useRef<Terminal | null>(null);
   const fitRef       = useRef<FitAddon | null>(null);
@@ -95,9 +98,9 @@ export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRe
     try { window.localStorage.setItem("tuiWideMode", wideMode ? "1" : "0"); } catch { /* ignore */ }
   }, [wideMode]);
 
-  // Latest value of suppressAltScreenWheel, for closures captured by the once-only setup effect.
-  const suppressWheelRef = useRef(!!suppressAltScreenWheel);
-  useEffect(() => { suppressWheelRef.current = !!suppressAltScreenWheel; }, [suppressAltScreenWheel]);
+  // Latest value of useTmuxScroll, for closures captured by the once-only setup effect.
+  const useTmuxScrollRef = useRef(!!useTmuxScroll);
+  useEffect(() => { useTmuxScrollRef.current = !!useTmuxScroll; }, [useTmuxScroll]);
   // Re-apply sizing when wide mode toggles
   useEffect(() => {
     const term = termRef.current;
@@ -246,20 +249,19 @@ export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRe
     // Claude scrolls its own chat history. Custom tmux-copy-mode interception
     // didn't work because alt-screen panes have no tmux scrollback to show.
     //
-    // Exception: when suppressAltScreenWheel is on (e.g. Codex, launched with
-    // --no-alt-screen so it lives on the main screen). Codex still requests
-    // mouse tracking, which makes xterm.js forward wheel events to the app —
-    // and Codex routes them to its input box, never the chat history. Take
-    // over the wheel ourselves: on the main screen scroll xterm's own
-    // scrollback (where Codex's inline output accumulates); on alt-screen
-    // (shouldn't happen with --no-alt-screen, kept as safety) swallow.
+    // Exception: when useTmuxScroll is on (Codex, launched with --no-alt-screen
+    // so it lives on the main screen). Codex itself doesn't bind wheel for
+    // history, AND xterm.js's own scrollback is empty here because
+    // `tmux attach-session` only replays the current viewport — the chat
+    // history lives ONLY in tmux's scrollback. Send the wheel delta to the
+    // server, which enters tmux copy-mode and scrolls there; tmux then
+    // redraws the new viewport over the PTY and xterm.js renders it.
     el.addEventListener("wheel", (e) => {
-      if (!suppressWheelRef.current) return;
+      if (!useTmuxScrollRef.current) return;
       e.preventDefault();
       e.stopPropagation();
-      if (term.buffer.active.type === "alternate") return;
       const lines = Math.round(e.deltaY / 40) || (e.deltaY > 0 ? 1 : -1);
-      term.scrollLines(lines);
+      wsRef.current?.sendScroll(lines);
     }, { passive: false, capture: true });
 
     // Touch scroll: xterm.js doesn't synthesize wheel/mouse-tracking events from
@@ -375,10 +377,12 @@ export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRe
         const tt = termRef.current;
         if (!tt) return;
         const isAlt = tt.buffer.active.type === "alternate";
-        if (isAlt && suppressWheelRef.current) {
-          // Codex-style TUI: chat history doesn't bind wheel. Just swallow the
-          // touch scroll so we don't drive the input box.
+        if (useTmuxScrollRef.current) {
+          // Codex (or other inline TUIs we host): route touch scroll to the
+          // server's tmux copy-mode handler so the chat history actually
+          // shows.
           e.preventDefault();
+          wsRef.current?.sendScroll(-ticks * WHEEL_LINES_PER_TICK);
           return;
         }
         if (isAlt) {

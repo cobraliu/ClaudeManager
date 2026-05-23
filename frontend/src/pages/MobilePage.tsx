@@ -5365,7 +5365,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
             fontFamily={terminalFont}
             scrollToBottomRef={tuiScrollBottomRef}
             sendRawRef={tuiSendRawRef}
-            suppressAltScreenWheel={session.tool === "codex"}
+            useTmuxScroll={session.tool === "codex"}
           />
         </div>
       )}
