@@ -5,7 +5,7 @@ export type ConfigFormat = "json" | "yaml" | "toml";
 
 export function detectFormat(filename: string): ConfigFormat | null {
   const ext = filename.split(".").pop()?.toLowerCase() ?? "";
-  if (ext === "json" || ext === "jsonl") return "json";
+  if (ext === "json") return "json";
   if (ext === "yaml" || ext === "yml") return "yaml";
   if (ext === "toml") return "toml";
   return null;
