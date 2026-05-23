@@ -243,6 +243,65 @@ def get_codex_conversation(session_id: str, cwd: str, from_ts: float = 0.0) -> l
     return turns
 
 
+def get_codex_raw_messages(session_id: str, cwd: str, tail: int | None = None) -> dict:
+    """Synthesize Claude-shaped RawMessage entries from a Codex rollout.
+
+    Codex's native rollout schema is {type: event_msg|response_item|session_meta,
+    payload: {...}} — incompatible with the frontend RawMessage type which
+    expects {type: "user"|"assistant", message: {role, content: [...]}}.
+
+    To make the chat UI work without a frontend rewrite, we walk the rollout
+    and emit one synthetic Claude-shaped message per event_msg.user_message
+    / event_msg.agent_message (the same events get_codex_conversation uses).
+
+    Returns {"messages": [...], "total": <total messages, pre-tail>}.
+    """
+    rollout = _find_rollout(session_id, cwd)
+    if rollout is None:
+        return {"messages": [], "total": 0}
+
+    messages: list[dict] = []
+    try:
+        with open(rollout, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                if '"user_message"' not in line and '"agent_message"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "event_msg":
+                    continue
+                p = d.get("payload") or {}
+                sub = p.get("type")
+                if sub == "user_message":
+                    role = "user"
+                elif sub == "agent_message":
+                    role = "assistant"
+                else:
+                    continue
+                text = (p.get("message") or "").strip()
+                if not text:
+                    continue
+                ts = d.get("timestamp") if isinstance(d.get("timestamp"), str) else None
+                messages.append({
+                    "type": role,
+                    "uuid": f"codex-{session_id}-{idx}",
+                    "timestamp": ts,
+                    "message": {
+                        "role": role,
+                        "content": [{"type": "text", "text": text}],
+                    },
+                })
+    except OSError:
+        return {"messages": [], "total": 0}
+
+    total = len(messages)
+    if tail is not None and len(messages) > tail:
+        messages = messages[-tail:]
+    return {"messages": messages, "total": total}
+
+
 def search_codex_conversation(session_id: str, cwd: str, query: str) -> bool:
     """Case-insensitive substring search across the conversation."""
     ql = query.lower()

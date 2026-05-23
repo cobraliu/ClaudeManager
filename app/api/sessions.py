@@ -32,6 +32,7 @@ from app.services.claude_pid import format_tui_hint, get_pid_waiting_state, pars
 from app.services.claude_session_reader import enrich_session, find_newest_claude_session_id, get_latest_turn_info, get_conversation, search_conversation, list_project_session_ids, list_subagents, get_subagent_lines, list_all_claude_sessions_global, get_todo_plans
 from app.services.claude_goals import read_goals
 from app.services.claude_auqs import list_auqs
+from app.agents import get_adapter
 from app.services.cursor_session_reader import list_all_cursor_sessions_global
 from app.services.git_service import (
     git_add_commit, git_checkout_branch, git_checkout_remote_branch, git_clone,
@@ -1880,6 +1881,11 @@ def get_raw_messages(
 
     adapter = get_adapter(session.tool)
     chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+
+    if session.tool == "codex" and chat_sid:
+        from app.services.codex_session_reader import get_codex_raw_messages
+        return get_codex_raw_messages(chat_sid, session.cwd, tail=tail)
+
     jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd) if chat_sid else None
 
     if jsonl_path is None:
@@ -2101,6 +2107,11 @@ def get_raw_messages_all(
 
     adapter = get_adapter(session.tool)
     chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+
+    if session.tool == "codex" and chat_sid:
+        from app.services.codex_session_reader import get_codex_raw_messages
+        return get_codex_raw_messages(chat_sid, session.cwd, tail=None)
+
     jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd) if chat_sid else None
 
     if jsonl_path is None:
