@@ -4336,8 +4336,13 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
                 if (!taskRun.isStart) return null;
                 return <TaskGroupBlock key={uid} blocks={taskRun.blocks} />;
               }
-              // Account for optimistic msg appearing after: last *real* assistant entry
-              const isActiveThinking = isStreaming && entry.type === "assistant" && (isLast || (prevIsLast && optimisticMsgs.length > 0));
+              // Account for optimistic msg appearing after: last *real* assistant entry.
+              // Gate on stop_reason: an assistant entry that already carries one is done,
+              // even when backend is_streaming flips true from incidental tmux activity.
+              // Without this guard, a finished message that follows a compact_boundary
+              // gets re-rendered as the "Compacting…" placeholder every ~8s.
+              const isFinishedAssistant = entry.type === "assistant" && !!entry.message?.stop_reason;
+              const isActiveThinking = isStreaming && entry.type === "assistant" && !isFinishedAssistant && (isLast || (prevIsLast && optimisticMsgs.length > 0));
               // During compaction: the entry before the active assistant is the compact_boundary system message
               // (possibly with a compact-summary user message in between, so check 2 entries back)
               const prevEntry = i > 0 ? displayEntries[i - 1] as unknown as Record<string, unknown> : null;
