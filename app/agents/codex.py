@@ -48,7 +48,14 @@ class CodexAdapter:
         codex_bin = shutil.which("codex") or "codex"
         bin_q = shlex.quote(codex_bin)
 
-        parts = [bin_q]
+        # --no-alt-screen runs Codex's TUI on the main screen instead of the
+        # alternate buffer, so xterm.js / tmux can show conversation history in
+        # their normal scrollback. Codex's docs list this flag specifically for
+        # terminal multiplexers (Zellij, tmux) — which is exactly how we host
+        # it. Without it the chat history is unreachable: Codex's TUI binds
+        # mouse wheel only to its input box, so scrolling never reveals past
+        # turns.
+        parts = [bin_q, "--no-alt-screen"]
         if model:
             # `-c model="gpt-5"` (CLI parses value as TOML — quote it).
             parts.append("-c")
