@@ -2757,8 +2757,12 @@ function codexToolCallSummary(name: string, input: unknown): string {
   return keys.length > 0 ? `{${keys.join(", ")}}` : "";
 }
 
-function CodexToolCallBlock({ name, input, status, callId }: {
+function CodexToolCallBlock({ name, input, status, callId, pairedOutput }: {
   name: string; input: unknown; status: string; callId: string;
+  /** When set: the matching codex_tool_result has been folded into this card
+   *  (instead of rendering separately further down the chat) so the call and
+   *  its output stay visually paired even when Codex batches multiple execs. */
+  pairedOutput?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const summary = useMemo(() => codexToolCallSummary(name, input), [name, input]);
@@ -2845,6 +2849,9 @@ function CodexToolCallBlock({ name, input, status, callId }: {
           {callId && <div style={{ color: "var(--text-faintest)", marginBottom: 6, fontFamily: "monospace", fontSize: 10 }}>call_id: {callId}</div>}
           {expandedBody}
         </div>
+      )}
+      {pairedOutput !== undefined && (
+        <CodexToolResultBlock output={pairedOutput} callId={callId} />
       )}
     </div>
   );
@@ -3191,6 +3198,7 @@ function CodexTokenCountBlock({ info }: { info: Record<string, unknown> }) {
 function MessageEntry({
   entry,
   toolResults,
+  codexToolResults,
   compactSummaries,
   isActiveThinking = false,
   isNewCompact = false,
@@ -3203,6 +3211,7 @@ function MessageEntry({
 }: {
   entry: RawMessage;
   toolResults: Map<string, { content: string; isError: boolean }>;
+  codexToolResults?: Map<string, string>;
   compactSummaries: Map<string, string>;
   isActiveThinking?: boolean;
   isNewCompact?: boolean;
@@ -3290,11 +3299,14 @@ function MessageEntry({
 
   if (entry.type === "codex_tool_call") {
     const r = entry as unknown as Record<string, unknown>;
+    const cid = String(r.call_id || "");
+    const pairedOutput = cid ? codexToolResults?.get(cid) : undefined;
     return <CodexToolCallBlock
       name={String(r.name || "tool")}
       input={r.input}
       status={String(r.status || "")}
-      callId={String(r.call_id || "")}
+      callId={cid}
+      pairedOutput={pairedOutput}
     />;
   }
 
@@ -3639,6 +3651,35 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
     return map;
   }, [messages]);
 
+  // Codex emits exec call → exec output as two separate top-level events that
+  // may be many messages apart (especially when several exec_commands are
+  // batched in one turn). Build a call_id → output map so each
+  // CodexToolCallBlock can render its result inline; the standalone
+  // codex_tool_result entries are then filtered out of displayEntries below.
+  const codexToolResults = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const m of messages) {
+      if (m.type !== "codex_tool_result") continue;
+      const r = m as unknown as Record<string, unknown>;
+      const callId = String(r.call_id || "");
+      if (callId) map.set(callId, String(r.output ?? ""));
+    }
+    return map;
+  }, [messages]);
+
+  // Set of call_ids that have BOTH a codex_tool_call and a codex_tool_result.
+  // Used to drop the standalone result rows since the call block embeds them.
+  const codexPairedCallIds = useMemo(() => {
+    const callIds = new Set<string>();
+    for (const m of messages) {
+      if (m.type !== "codex_tool_call") continue;
+      const r = m as unknown as Record<string, unknown>;
+      const cid = String(r.call_id || "");
+      if (cid && codexToolResults.has(cid)) callIds.add(cid);
+    }
+    return callIds;
+  }, [messages, codexToolResults]);
+
   // Used to dedup with `pendingAuqData` (the hook/screen-parsed fallback that
   // covers the gap before JSONL is written). The body-loop renders ANY
   // unanswered AUQ tool_use block from JSONL regardless of its position, so we
@@ -3752,10 +3793,17 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
       if (m.isMeta) return false;
       // Codex-specific top-level types — synthesized by backend from rollout JSONL.
       // Pass them through unchanged; MessageEntry has dedicated render branches.
+      if (m.type === "codex_tool_result") {
+        // Hide standalone result rows that have a matching call — the call
+        // block embeds them so the two stay visually paired even when Codex
+        // emits them many messages apart.
+        const r = m as unknown as Record<string, unknown>;
+        const cid = String(r.call_id || "");
+        return !cid || !codexPairedCallIds.has(cid);
+      }
       if (
         m.type === "codex_reasoning" ||
         m.type === "codex_tool_call" ||
-        m.type === "codex_tool_result" ||
         m.type === "codex_patch_apply" ||
         m.type === "codex_lifecycle" ||
         m.type === "codex_token_count"
@@ -3846,7 +3894,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
       return false;
     });
     return filtered;
-  }, [messages, compactSummaryUuids]);
+  }, [messages, compactSummaryUuids, codexPairedCallIds]);
 
   // ── Task run grouping ─────────────────────────────────────────────────────
   // Pre-compute runs of consecutive Task* assistant messages so they render as one group.
@@ -4332,7 +4380,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                       <MessageEntry
                         key={uid}
                         entry={entry}
-                        toolResults={toolResults}
+                        toolResults={toolResults} codexToolResults={codexToolResults}
                         compactSummaries={compactSummaries}
                         isActiveThinking={isActiveThinking}
                         isNewCompact={newCompactUuids.has(entry.uuid || "")}
@@ -4356,7 +4404,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                       {/* hideExitPlanBlock=true: PlanApprovalBlock below handles the UI */}
                       <MessageEntry
                         entry={entry}
-                        toolResults={toolResults}
+                        toolResults={toolResults} codexToolResults={codexToolResults}
                         compactSummaries={compactSummaries}
                         isActiveThinking={isActiveThinking}
                         isNewCompact={newCompactUuids.has(entry.uuid || "")}
@@ -4383,7 +4431,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                     <React.Fragment key={uid}>
                       <MessageEntry
                         entry={entry}
-                        toolResults={toolResults}
+                        toolResults={toolResults} codexToolResults={codexToolResults}
                         compactSummaries={compactSummaries}
                         isActiveThinking={isActiveThinking}
                         isNewCompact={newCompactUuids.has(entry.uuid || "")}
@@ -4405,7 +4453,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                 <MessageEntry
                   key={uid}
                   entry={entry}
-                  toolResults={toolResults}
+                  toolResults={toolResults} codexToolResults={codexToolResults}
                   compactSummaries={compactSummaries}
                   isActiveThinking={isActiveThinking}
                   isNewCompact={newCompactUuids.has(entry.uuid || "")}
