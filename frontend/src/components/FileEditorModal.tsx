@@ -781,7 +781,33 @@ function jsonlPageSize(colCount: number): number {
   return Math.min(500, Math.max(10, raw));
 }
 
-function JsonlViewer({ content }: { content: string }) {
+// Flatten an object into dotted keys up to `maxDepth` levels deep.
+// Arrays are never flattened (they stay as a single column value).
+// Objects at the depth limit are also left as-is (rendered as JSON in cell).
+function flattenJsonlRow(
+  obj: Record<string, unknown>,
+  maxDepth: number,
+  prefix = "",
+  depth = 1,
+  out: Record<string, unknown> = {},
+): Record<string, unknown> {
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (Array.isArray(v)) {
+      out[key] = v;
+    } else if (v !== null && typeof v === "object" && depth < maxDepth) {
+      flattenJsonlRow(v as Record<string, unknown>, maxDepth, key, depth + 1, out);
+    } else {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+const JSONL_FLATTEN_MAX_DEPTH = 2;
+
+export function JsonlViewer({ content }: { content: string }) {
   const [sortCol, setSortCol] = useState<string | null>(null);
   const [sortAsc, setSortAsc] = useState(true);
   const [expandedCell, setExpandedCell] = useState<{ value: string; col: string } | null>(null);
@@ -798,13 +824,15 @@ function JsonlViewer({ content }: { content: string }) {
       try {
         const obj = JSON.parse(trimmed);
         if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) {
-          // Flatten 1 level: top-level keys become columns; nested values stay as-is
-          for (const k of Object.keys(obj as object)) {
+          // Flatten up to JSONL_FLATTEN_MAX_DEPTH levels via dotted keys.
+          // Arrays are kept as-is (single cell, JSON-stringified on display).
+          const flat = flattenJsonlRow(obj as Record<string, unknown>, JSONL_FLATTEN_MAX_DEPTH);
+          for (const k of Object.keys(flat)) {
             if (!keySet.has(k)) { keySet.add(k); keyOrder.push(k); }
           }
-          parsed.push(obj as Record<string, unknown>);
+          parsed.push(flat);
         } else {
-          // Arrays, primitives: single "_value" column
+          // Top-level arrays or primitives: single "_value" column
           if (!keySet.has("_value")) { keySet.add("_value"); keyOrder.push("_value"); }
           parsed.push({ _value: obj });
         }
