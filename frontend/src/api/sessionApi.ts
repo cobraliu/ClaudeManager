@@ -1279,6 +1279,28 @@ export interface ChangedFile {
   status: "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflict";
   added?: number;
   removed?: number;
+  /** Set when the entry stands in for a collapsed-but-skipped untracked dir
+   *  (see ChangedFilesWarning). The frontend renders it as a non-expandable
+   *  row so the user knows changes exist but isn't allowed to drill in. */
+  is_skipped_dir?: boolean;
+}
+
+export interface ChangedFilesWarning {
+  /** "large_untracked_dir": dir exceeded size/file-count probe threshold.
+   *  "bare_git_repo": dir looks like a bare git repository (HEAD+objects+refs).
+   */
+  kind: "large_untracked_dir" | "bare_git_repo";
+  path: string;
+  file_count?: number;
+  approx_size_bytes?: number;
+  is_bare_repo?: boolean;
+  /** A line to append to .gitignore that would suppress this warning. */
+  suggested_ignore: string;
+}
+
+export interface ChangedFilesResponse {
+  files: ChangedFile[];
+  warnings: ChangedFilesWarning[];
 }
 
 export interface FileData {
@@ -1305,7 +1327,7 @@ export interface TreeNode {
   children?: TreeNode[] | null;
 }
 
-export function getCodeChangedFiles(sessionId: string): Promise<ChangedFile[]> {
+export function getCodeChangedFiles(sessionId: string): Promise<ChangedFilesResponse> {
   return request(`/api/sessions/${sessionId}/code/changed-files`);
 }
 
