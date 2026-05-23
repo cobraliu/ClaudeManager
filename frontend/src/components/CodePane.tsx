@@ -220,7 +220,7 @@ function HtmlViewer({ sessionId, path, initialContent }: {
   const goHome = () => setNavStack([path]);
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, background: "var(--bg-base)" }}>
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0, background: "var(--bg-base)" }}>
       {(canBack || true) && (
         <div style={{
           display: "flex", alignItems: "center", gap: 6,

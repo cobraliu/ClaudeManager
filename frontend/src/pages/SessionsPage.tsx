@@ -1490,6 +1490,11 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   );
   const dragging = useRef(false);
   const codeDragging = useRef(false);
+  // While any column-resize drag is active, render a full-window transparent
+  // overlay above all <iframe>s. Iframes are separate browsing contexts that
+  // capture mouse events when the cursor crosses them, freezing the parent's
+  // mousemove handler — visible as drag "sticking" over HTML / PDF previews.
+  const [resizeDragActive, setResizeDragActive] = useState(false);
 
   const searchRef2 = useRef(search);
   searchRef2.current = search;
@@ -1644,12 +1649,14 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     dragging.current = true;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+    setResizeDragActive(true);
   }, []);
 
   const startCodeDrag = useCallback(() => {
     codeDragging.current = true;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+    setResizeDragActive(true);
   }, []);
 
   useEffect(() => {
@@ -1663,6 +1670,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         dragging.current = false;
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
+        setResizeDragActive(false);
         localStorage.setItem("splitW", String(leftWidth));
       }
     };
@@ -1677,6 +1685,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       if (dragging.current) {
         dragging.current = false;
         document.body.style.userSelect = "";
+        setResizeDragActive(false);
         localStorage.setItem("splitW", String(leftWidth));
       }
     };
@@ -1720,6 +1729,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         codeDragging.current = false;
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
+        setResizeDragActive(false);
         if (!isFileCentric) localStorage.setItem("codeW", String(codeWidth));
       }
     };
@@ -1738,6 +1748,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     fcChatDragging.current = true;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+    setResizeDragActive(true);
   }, []);
   useEffect(() => {
     if (!isFileCentric) return;
@@ -1758,6 +1769,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         fcChatDragging.current = false;
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
+        setResizeDragActive(false);
       }
     };
     window.addEventListener("mousemove", onMove);
@@ -1781,6 +1793,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     sideDockDragging.current = true;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+    setResizeDragActive(true);
   }, []);
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
@@ -1804,6 +1817,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         sideDockDragging.current = false;
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
+        setResizeDragActive(false);
       }
     };
     window.addEventListener("mousemove", onMove);
@@ -1982,6 +1996,14 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
 
   return (
     <div style={{ display: "flex", position: "fixed", top: 0, left: 0, width: winW, height: winH, overflow: "hidden" }}>
+      {resizeDragActive && (
+        <div
+          style={{
+            position: "fixed", inset: 0, zIndex: 99999,
+            cursor: "col-resize", background: "transparent",
+          }}
+        />
+      )}
       {/* ── Left: Session list ── */}
       <div
         style={{
