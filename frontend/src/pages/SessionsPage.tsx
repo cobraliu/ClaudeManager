@@ -58,6 +58,120 @@ import { useSessionTabs, type TabEntry } from "../hooks/useSessionTabs";
 
 const PAGE_SIZE = 30;
 
+/* ───── Fullscreen Clock ─────
+ * Only mounts a 1s interval while the browser tab is actually in fullscreen
+ * (Fullscreen API or PWA display-mode). Double-click cycles through:
+ *   A → unix → B → unix → C → unix → D → unix → E → unix → A → …
+ * so each string format alternates with a unix-seconds view. Choice persists
+ * in localStorage as the cycle index.
+ */
+const CLOCK_FMT_KEY = "fullscreenClockIdx";
+type StringFmt = "local" | "longMDY" | "longDMY12" | "isoZ" | "isoOffset";
+const STRING_FMTS: StringFmt[] = ["local", "longMDY", "longDMY12", "isoZ", "isoOffset"];
+const CYCLE_LEN = STRING_FMTS.length * 2;
+const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+function formatString(fmt: StringFmt, d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  switch (fmt) {
+    case "local":
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    case "longMDY":
+      return `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    case "longDMY12": {
+      const h24 = d.getHours();
+      const ampm = h24 >= 12 ? "PM" : "AM";
+      const h12 = h24 % 12 || 12;
+      return `${d.getDate()} ${MONTHS_SHORT[d.getMonth()]} ${d.getFullYear()} ${h12}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${ampm}`;
+    }
+    case "isoZ":
+      return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}Z`;
+    case "isoOffset": {
+      const offMin = -d.getTimezoneOffset();
+      const sign = offMin >= 0 ? "+" : "-";
+      const abs = Math.abs(offMin);
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+    }
+  }
+}
+
+function clockTextAt(idx: number, d: Date): string {
+  // Even slots show a string format; odd slots show unix seconds.
+  if (idx % 2 === 0) return formatString(STRING_FMTS[idx / 2], d);
+  return String(Math.floor(d.getTime() / 1000));
+}
+
+function FullscreenClock() {
+  const [isFs, setIsFs] = useState<boolean>(() => {
+    if (typeof document === "undefined") return false;
+    return !!document.fullscreenElement
+      || (typeof window !== "undefined" && window.matchMedia("(display-mode: fullscreen)").matches);
+  });
+  const [idx, setIdx] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(CLOCK_FMT_KEY);
+      if (raw !== null) {
+        const n = parseInt(raw, 10);
+        if (Number.isInteger(n) && n >= 0 && n < CYCLE_LEN) return n;
+      }
+    } catch { /* storage disabled */ }
+    return 0;
+  });
+  const [now, setNow] = useState<Date>(() => new Date());
+
+  useEffect(() => {
+    const sync = () => {
+      const fs = !!document.fullscreenElement
+        || window.matchMedia("(display-mode: fullscreen)").matches;
+      setIsFs(fs);
+    };
+    document.addEventListener("fullscreenchange", sync);
+    const mm = window.matchMedia("(display-mode: fullscreen)");
+    mm.addEventListener?.("change", sync);
+    return () => {
+      document.removeEventListener("fullscreenchange", sync);
+      mm.removeEventListener?.("change", sync);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isFs) return;
+    setNow(new Date());
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, [isFs]);
+
+  if (!isFs) return null;
+
+  const cycle = () => {
+    setIdx(prev => {
+      const next = (prev + 1) % CYCLE_LEN;
+      try { localStorage.setItem(CLOCK_FMT_KEY, String(next)); } catch { /* quota / disabled */ }
+      return next;
+    });
+  };
+
+  return (
+    <div
+      onDoubleClick={cycle}
+      title="Double-click to cycle time formats"
+      style={{
+        marginLeft: "auto",
+        fontSize: 11,
+        padding: "2px 8px",
+        color: "var(--text-faint)",
+        fontFamily: "var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)",
+        fontVariantNumeric: "tabular-nums",
+        whiteSpace: "nowrap",
+        userSelect: "none",
+        cursor: "default",
+      }}
+    >
+      {clockTextAt(idx, now)}
+    </div>
+  );
+}
+
 /* ───── File-Centric Viewer Column ─────
  * The middle column in file-centric layout. Holds a tab bar + the active tab's
  * content. All tab contents are mounted simultaneously with display:none for
@@ -2556,6 +2670,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   &gt;_ Term
                 </button>
               </div>
+              <FullscreenClock />
               </div>
             </div>
             <EmbeddedTerminalPanel
