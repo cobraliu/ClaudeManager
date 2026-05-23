@@ -3594,7 +3594,8 @@ function _cleanupExpiredDrafts(): void {
   } catch { /* ignore */ }
 }
 
-export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+  const agentDisplayName = tool === "cursor" ? "Cursor" : tool === "codex" ? "Codex" : "Claude";
   const [messages, setMessages] = useState<RawMessage[]>([]);
   const [tail, setTail] = useState(DEFAULT_TAIL);
   const [total, setTotal] = useState(0);
@@ -4561,7 +4562,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
               padding: "5px 12px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
             }}>
               <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--accent-blue, #58a6ff)", animation: "cursor-blink 1s step-end infinite" }} />
-              <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Claude is responding…</span>
+              <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>{agentDisplayName} is responding…</span>
               <button
                 onClick={stopResponse}
                 style={{

@@ -246,14 +246,20 @@ export function TuiPane({ wsUrl, theme, fontFamily, scrollToBottomRef, sendRawRe
     // Claude scrolls its own chat history. Custom tmux-copy-mode interception
     // didn't work because alt-screen panes have no tmux scrollback to show.
     //
-    // Exception: when suppressAltScreenWheel is on (e.g. Codex, whose chat
-    // history doesn't bind wheel — forwarding just scrolls the input box),
-    // swallow the event so it stays a no-op instead of disrupting the input.
+    // Exception: when suppressAltScreenWheel is on (e.g. Codex, launched with
+    // --no-alt-screen so it lives on the main screen). Codex still requests
+    // mouse tracking, which makes xterm.js forward wheel events to the app —
+    // and Codex routes them to its input box, never the chat history. Take
+    // over the wheel ourselves: on the main screen scroll xterm's own
+    // scrollback (where Codex's inline output accumulates); on alt-screen
+    // (shouldn't happen with --no-alt-screen, kept as safety) swallow.
     el.addEventListener("wheel", (e) => {
       if (!suppressWheelRef.current) return;
-      if (term.buffer.active.type !== "alternate") return;
       e.preventDefault();
       e.stopPropagation();
+      if (term.buffer.active.type === "alternate") return;
+      const lines = Math.round(e.deltaY / 40) || (e.deltaY > 0 ? 1 : -1);
+      term.scrollLines(lines);
     }, { passive: false, capture: true });
 
     // Touch scroll: xterm.js doesn't synthesize wheel/mouse-tracking events from
