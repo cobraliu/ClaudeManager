@@ -6,10 +6,10 @@ import {
   listFiles, fetchRawFileBlob,
   getGitInfo,
   searchFiles, createDir, uploadFile, renameEntry, moveEntry, deleteEntry, writeFile, FileWriteConflictError,
-  downloadFile,
+  downloadFile, readFile,
   getFileGitLog, getFileGitShow, getFileGitDiff,
   getCodeSubdirs, checkCodePathExists,
-  type ChangedFile, type FileData, type FileEntry,
+  type ChangedFile, type ChangedFilesWarning, type FileData, type FileEntry,
   type GitLogEntry,
 } from "../api/sessionApi";
 import { SqliteViewer, CsvViewer, ArchiveViewer, copyText, DirPicker } from "./FileEditorModal";
@@ -533,7 +533,9 @@ function CodeViewer({ data, scrollToFirst, diffOnly, noDiff }: { data: FileData;
     >
       {data.truncated && (
         <div style={{ padding: "4px 12px", background: "var(--bg-deep)", color: "var(--text-secondary)", fontSize: 11, borderBottom: "1px solid var(--border)" }}>
-          File truncated to 3000 lines
+          {data.truncated_by === "bytes"
+            ? `File truncated — showing first ${(data.displayed_lines ?? 0).toLocaleString()} lines (size cap)`
+            : `File truncated — showing first ${(data.displayed_lines ?? 0).toLocaleString()} lines`}
         </div>
       )}
       <table style={{ borderCollapse: "collapse", minWidth: "100%" }}>
@@ -837,24 +839,34 @@ function ChangesNodeRow({
 
   const f = node.file!;
   const isSelected = selectedPath === node.path;
+  // Skipped untracked dirs (backed by a warning) are non-clickable: there are
+  // no expanded files behind them, so opening anything would be misleading.
+  const skipped = !!f.is_skipped_dir;
   return (
     <div
-      onClick={() => onClickFile(f, node.path)}
+      onClick={() => { if (!skipped) onClickFile(f, node.path); }}
+      title={skipped ? "Skipped: directory exceeds size/file-count limits. Add to .gitignore to enable." : undefined}
       style={{
         display: "flex", alignItems: "center", gap: 5,
-        padding: `3px 8px 3px ${indent}px`, cursor: "pointer", fontSize: 11,
+        padding: `3px 8px 3px ${indent}px`,
+        cursor: skipped ? "not-allowed" : "pointer", fontSize: 11,
         background: isSelected ? "var(--bg-hover)" : "transparent",
-        color: "var(--text-secondary)",
+        color: skipped ? "var(--text-faint)" : "var(--text-secondary)",
+        opacity: skipped ? 0.75 : 1,
       }}
-      onMouseEnter={e => { if (!isSelected) e.currentTarget.style.background = "var(--bg-surface)"; }}
+      onMouseEnter={e => { if (!isSelected && !skipped) e.currentTarget.style.background = "var(--bg-surface)"; }}
       onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}
     >
       <span style={{ fontSize: 9, color: STATUS_COLORS[f.status] ?? "var(--text-secondary)", minWidth: 10, fontWeight: 700, flexShrink: 0 }}>
         {f.status[0].toUpperCase()}
       </span>
-      <FileIcon name={node.name} />
-      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{node.name}</span>
-      {(f.added != null || f.removed != null) && (
+      <FileIcon isDir={skipped} name={skipped ? undefined : node.name} />
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+        {node.name}{skipped ? "/" : ""}
+      </span>
+      {skipped ? (
+        <span style={{ fontSize: 9, color: "var(--accent-amber)", flexShrink: 0 }}>skipped</span>
+      ) : (f.added != null || f.removed != null) && (
         <span style={{ display: "flex", gap: 3, flexShrink: 0, fontSize: 9, fontFamily: "monospace" }}>
           {f.added != null && f.added > 0 && <span style={{ color: "var(--accent-green)" }}>+{f.added}</span>}
           {f.removed != null && f.removed > 0 && <span style={{ color: "var(--accent-red)" }}>-{f.removed}</span>}
@@ -951,6 +963,167 @@ function RecentCommitsPanel({ sessionId }: { sessionId: string }) {
   );
 }
 
+// ── Changed-files warning banner ──────────────────────────────────────────
+
+/**
+ * Renders the warnings returned by /code/changed-files. Each warning means a
+ * collapsed untracked directory exceeded our cheap probe (too many files, too
+ * many bytes, or it looks like a bare git repo). We surface them so the user
+ * can add the directory to .gitignore — otherwise the backend would have had
+ * to fully expand and read every file, which is the OOM scenario this banner
+ * exists to prevent.
+ */
+function ChangedFilesWarningsBanner({
+  sessionId,
+  warnings,
+  onApplied,
+}: {
+  sessionId: string;
+  warnings: ChangedFilesWarning[];
+  onApplied: () => void;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [appliedMsg, setAppliedMsg] = useState<string | null>(null);
+
+  if (warnings.length === 0) return null;
+
+  const lines = Array.from(new Set(warnings.map(w => w.suggested_ignore)));
+  const ignoreSnippet = lines.join("\n");
+
+  const totalFiles = warnings.reduce((n, w) => n + (w.file_count ?? 0), 0);
+  const totalBytes = warnings.reduce((n, w) => n + (w.approx_size_bytes ?? 0), 0);
+  const anyBare = warnings.some(w => w.is_bare_repo);
+  const anyExceeded = warnings.some(w => !w.is_bare_repo);
+
+  const summary = (() => {
+    const parts: string[] = [];
+    if (anyExceeded) parts.push(`${totalFiles.toLocaleString()}+ untracked files, ~${humanBytes(totalBytes)}`);
+    if (anyBare) parts.push(`${warnings.filter(w => w.is_bare_repo).length} bare git repo${warnings.filter(w => w.is_bare_repo).length === 1 ? "" : "s"}`);
+    return parts.join(" · ");
+  })();
+
+  const handleCopy = async () => {
+    try { await copyText(ignoreSnippet); setAppliedMsg("Copied"); }
+    catch { setAppliedMsg("Copy failed"); }
+    finally { setTimeout(() => setAppliedMsg(null), 1500); }
+  };
+
+  const handleAppend = async () => {
+    setBusy(true);
+    try {
+      // Read existing .gitignore (if any). Missing file → 404, treat as empty.
+      let existing = "";
+      try {
+        const r = await readFile(sessionId, ".gitignore");
+        existing = r.content || "";
+      } catch { /* assume no .gitignore yet */ }
+
+      // De-dupe: don't add lines that already match (string compare, trimmed).
+      const existingLines = new Set(existing.split(/\r?\n/).map(s => s.trim()).filter(Boolean));
+      const toAppend = lines.filter(l => !existingLines.has(l.trim()));
+      if (toAppend.length === 0) {
+        setAppliedMsg("Already in .gitignore");
+        setTimeout(() => setAppliedMsg(null), 1800);
+        return;
+      }
+
+      const sep = existing && !existing.endsWith("\n") ? "\n" : "";
+      const header = "\n# Added by ClaudeManager (large untracked dirs)\n";
+      const next = existing + sep + header + toAppend.join("\n") + "\n";
+      await writeFile(sessionId, ".gitignore", next, { force: true });
+      setAppliedMsg(`Added ${toAppend.length} line${toAppend.length === 1 ? "" : "s"} to .gitignore`);
+      setTimeout(() => setAppliedMsg(null), 2500);
+      onApplied();
+    } catch (e) {
+      setAppliedMsg(`Failed: ${String(e)}`);
+      setTimeout(() => setAppliedMsg(null), 3000);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{
+      margin: "6px 10px 4px",
+      padding: "6px 8px",
+      borderRadius: 4,
+      background: "rgba(251, 191, 36, 0.08)",
+      border: "1px solid rgba(251, 191, 36, 0.35)",
+      fontSize: 11,
+      color: "var(--text-secondary)",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ color: "var(--accent-amber)", fontSize: 11 }}>⚠</span>
+        <span style={{ flex: 1, minWidth: 0 }}>
+          Skipped {warnings.length} dir{warnings.length === 1 ? "" : "s"} from CHANGES
+          {summary && <span style={{ color: "var(--text-faint)" }}> ({summary})</span>}
+        </span>
+        <button
+          onClick={() => setCollapsed(c => !c)}
+          style={{
+            background: "transparent", border: "none", color: "var(--text-muted)",
+            cursor: "pointer", fontSize: 10, padding: "1px 4px",
+          }}
+        >
+          {collapsed ? "▸" : "▾"}
+        </button>
+      </div>
+      {!collapsed && (
+        <>
+          <div style={{ marginTop: 6, paddingLeft: 16, color: "var(--text-faint)", fontSize: 10 }}>
+            {warnings.map(w => (
+              <div key={w.path} style={{ display: "flex", gap: 6, alignItems: "baseline" }}>
+                <span style={{ color: "var(--text-secondary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {w.path}/
+                </span>
+                <span>
+                  {w.is_bare_repo ? "bare repo" : `${(w.file_count ?? 0).toLocaleString()} files, ~${humanBytes(w.approx_size_bytes ?? 0)}`}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 6, paddingLeft: 16 }}>
+            <div style={{ fontSize: 10, color: "var(--text-muted)" }}>Suggested .gitignore lines:</div>
+            <pre style={{
+              margin: "3px 0", padding: "4px 6px",
+              background: "var(--bg-surface)",
+              borderRadius: 3, fontSize: 11,
+              color: "var(--text-primary)",
+              overflowX: "auto", whiteSpace: "pre",
+            }}>{ignoreSnippet}</pre>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button
+                onClick={handleCopy}
+                disabled={busy}
+                style={{
+                  padding: "3px 8px", fontSize: 11, borderRadius: 3,
+                  background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+                  color: "var(--text-secondary)", cursor: busy ? "default" : "pointer",
+                }}
+              >Copy</button>
+              <button
+                onClick={handleAppend}
+                disabled={busy}
+                style={{
+                  padding: "3px 8px", fontSize: 11, borderRadius: 3,
+                  background: "var(--accent-amber)",
+                  border: "1px solid var(--accent-amber)",
+                  color: "#000", cursor: busy ? "default" : "pointer",
+                  opacity: busy ? 0.6 : 1,
+                }}
+              >Append to .gitignore</button>
+              {appliedMsg && (
+                <span style={{ color: "var(--text-faint)", fontSize: 11 }}>{appliedMsg}</span>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── FileSidePanel — reusable left-panel for Chat mode ─────────────────────
 
 export function FileSidePanel({
@@ -963,6 +1136,7 @@ export function FileSidePanel({
   onFileClick: (path: string, fromChanges: boolean) => void;
 }) {
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
+  const [changedWarnings, setChangedWarnings] = useState<ChangedFilesWarning[]>([]);
   const [filesRefreshKey, setFilesRefreshKey] = useState(0);
   const prevChangedRef = useRef<Set<string>>(new Set());
 
@@ -970,12 +1144,13 @@ export function FileSidePanel({
     let mounted = true;
     const poll = async () => {
       try {
-        const files = await getCodeChangedFiles(sessionId);
+        const resp = await getCodeChangedFiles(sessionId);
         if (!mounted) return;
-        setChangedFiles(files);
+        setChangedFiles(resp.files);
+        setChangedWarnings(resp.warnings ?? []);
         // Bump refreshKey on any change to the changed-files set (additions OR
         // removals) so deletions, reverts, and new files all refresh the tree.
-        const nextSet = new Set(files.map(f => f.path));
+        const nextSet = new Set(resp.files.map(f => f.path));
         const prev = prevChangedRef.current;
         const sameSize = nextSet.size === prev.size;
         const sameMembers = sameSize && [...nextSet].every(p => prev.has(p));
@@ -1031,6 +1206,11 @@ export function FileSidePanel({
         <div style={{ padding: "5px 10px", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
           Changes ({changedFiles.length})
         </div>
+        <ChangedFilesWarningsBanner
+          sessionId={sessionId}
+          warnings={changedWarnings}
+          onApplied={() => setFilesRefreshKey(k => k + 1)}
+        />
         {changedFiles.length === 0 ? (
           <div style={{ padding: "4px 12px 8px", color: "var(--text-faint)", fontSize: 11 }}>No changes</div>
         ) : (
@@ -1084,7 +1264,7 @@ function ViewerHeader({
   const isTextFile = !!fileData && !fileData.is_binary && !showImage && !showSqlite;
   const linesText = isTextFile && fileData?.total_lines != null
     ? (fileData.truncated
-        ? `${fileData.total_lines.toLocaleString()} lines (showing first 3000)`
+        ? `${fileData.total_lines.toLocaleString()} lines (showing first ${(fileData.displayed_lines ?? 0).toLocaleString()})`
         : `${fileData.total_lines.toLocaleString()} lines`)
     : null;
   return (
@@ -1375,7 +1555,7 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
 
   useEffect(() => {
     let mounted = true;
-    const poll = () => getCodeChangedFiles(sessionId).then(f => { if (mounted) setChangedFiles(f); }).catch(() => {});
+    const poll = () => getCodeChangedFiles(sessionId).then(r => { if (mounted) setChangedFiles(r.files); }).catch(() => {});
     poll();
     const id = setInterval(poll, POLL_MS);
     return () => { mounted = false; clearInterval(id); };
@@ -2016,6 +2196,7 @@ export function CodePane({
   const treeOnly = !!onFileSelect;
 
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
+  const [changedWarnings, setChangedWarnings] = useState<ChangedFilesWarning[]>([]);
   const [selectedEntry, setSelectedEntry] = useState<FileEntry | null>(null);
   const [fileData, setFileData] = useState<FileData | null>(null);
   const [fileLoading, setFileLoading] = useState(false);
@@ -2140,9 +2321,11 @@ export function CodePane({
     let mounted = true;
     const poll = async () => {
       try {
-        const files = await getCodeChangedFiles(sessionId);
+        const resp = await getCodeChangedFiles(sessionId);
         if (!mounted) return;
+        const files = resp.files;
         setChangedFiles(files);
+        setChangedWarnings(resp.warnings ?? []);
 
         // Bump refreshKey on any change to the changed-files set (additions OR
         // removals) so deletions, reverts, and new files all refresh the tree.
@@ -2497,6 +2680,11 @@ export function CodePane({
                 </button>
               )}
             </div>
+            <ChangedFilesWarningsBanner
+              sessionId={sessionId}
+              warnings={changedWarnings}
+              onApplied={() => setFilesRefreshKey(k => k + 1)}
+            />
             {changedFiles.length === 0 ? (
               <div style={{ padding: "6px 12px", color: "var(--text-faint)", fontSize: 11 }}>No changes</div>
             ) : (

@@ -1130,6 +1130,12 @@ interface AskQuestion { header?: string; question: string; multiSelect?: boolean
 
 // Persist dismissed block IDs in sessionStorage so page refreshes don't re-show
 // answered questions while Claude Code is still processing the response.
+//
+// Both stores below are MODULE-LEVEL (shared by every ConversationPane mount).
+// Without namespacing by sessionId, dismissing "Continue?" in session A would
+// suppress the same-text AUQ in session B. The pending blockId itself
+// ("__pending_auq__:" + question) also collides cross-session, so blockIds
+// are namespaced the same way.
 const _AUQ_SS_KEY = "cm_auq_dismissed";
 function _auqLoadDismissed(): Set<string> {
   try { return new Set(JSON.parse(sessionStorage.getItem(_AUQ_SS_KEY) || "[]")); }
@@ -1139,23 +1145,35 @@ function _auqPersist(set: Set<string>) {
   try { sessionStorage.setItem(_AUQ_SS_KEY, JSON.stringify([...set])); } catch {}
 }
 const _dismissedAUQ = _auqLoadDismissed();
-// Tracks question text of recently dismissed AUQs so the JSONL widget and the
-// hook-based pendingAuqData widget cross-suppress each other while the two
-// signals settle. Cleared after a short window to avoid suppressing a future
-// re-ask of the same question.
-const _recentlyDismissedAuqQ = new Map<string, number>(); // question → timestamp
+// Tracks recently dismissed AUQs so the JSONL widget and the hook-based
+// pendingAuqData widget cross-suppress each other while the two signals
+// settle. Cleared after a short window to avoid suppressing a future re-ask.
+const _recentlyDismissedAuqQ = new Map<string, number>(); // nsKey → timestamp
 const _AUQ_SUPPRESS_MS = 15000;
-function _markAuqDismissed(question: string) {
-  _recentlyDismissedAuqQ.set(question, Date.now());
+// U+0001 (SOH) is a control char that cannot appear in user-typed questions
+// or tool_use ids. sessionStorage round-trips it as the JSON escape \u0001.
+function _nsKey(sessionId: string, key: string): string {
+  return sessionId + "" + key;
 }
-function _isAuqRecentlyDismissed(question: string): boolean {
-  const t = _recentlyDismissedAuqQ.get(question);
+function _markAuqDismissed(sessionId: string, question: string) {
+  _recentlyDismissedAuqQ.set(_nsKey(sessionId, question), Date.now());
+}
+function _isAuqRecentlyDismissed(sessionId: string, question: string): boolean {
+  const k = _nsKey(sessionId, question);
+  const t = _recentlyDismissedAuqQ.get(k);
   if (!t) return false;
   if (Date.now() - t > _AUQ_SUPPRESS_MS) {
-    _recentlyDismissedAuqQ.delete(question);
+    _recentlyDismissedAuqQ.delete(k);
     return false;
   }
   return true;
+}
+function _isAuqBlockDismissed(sessionId: string, blockId: string): boolean {
+  return _dismissedAUQ.has(_nsKey(sessionId, blockId));
+}
+function _markAuqBlockDismissed(sessionId: string, blockId: string) {
+  _dismissedAUQ.add(_nsKey(sessionId, blockId));
+  _auqPersist(_dismissedAUQ);
 }
 
 // ── TodoWrite / TodoRead ──────────────────────────────────────────────────────
@@ -1698,7 +1716,8 @@ function PlanApprovalBlock({ blockId, planText, onSubmit }: {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
+function AskUserQuestionBlock({ sessionId, blockId, questions, onSubmitAnswers }: {
+  sessionId: string;
   blockId: string;
   questions: AskQuestion[];
   onSubmitAnswers: (answers: unknown[]) => void;
@@ -1732,7 +1751,7 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
   // tool_result arrives in JSONL refresh (so hasUnansweredAuq flips false) before
   // the 3s tui status poll clears pendingAuqData → pending widget renders fresh.
   const _qText = questions[0]?.question ?? "";
-  if (dismissed || _dismissedAUQ.has(blockId) || _isAuqRecentlyDismissed(_qText)) return null;
+  if (dismissed || _isAuqBlockDismissed(sessionId, blockId) || _isAuqRecentlyDismissed(sessionId, _qText)) return null;
 
   const toggleOption = (label: string) => {
     setSelections(prev => {
@@ -1772,9 +1791,8 @@ function AskUserQuestionBlock({ blockId, questions, onSubmitAnswers }: {
   };
 
   const _dismiss = () => {
-    _dismissedAUQ.add(blockId);
-    _auqPersist(_dismissedAUQ);
-    _markAuqDismissed(_qText);
+    _markAuqBlockDismissed(sessionId, blockId);
+    _markAuqDismissed(sessionId, _qText);
     setDismissed(true);
   };
 
@@ -2680,9 +2698,507 @@ function TurnUsage({ model, usage }: { model?: string; usage?: RawUsage }) {
 
 const INTERRUPTED_TEXT = "[Request interrupted by user]";
 
+function CodexEncryptedReasoningBlock() {
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <div style={{
+        display: "inline-flex", alignItems: "center", gap: 6,
+        fontSize: 11, padding: "3px 10px", borderRadius: 5,
+        background: "var(--bg-surface)", border: "1px dashed var(--border)",
+        color: "var(--text-muted)", fontStyle: "italic",
+      }}>
+        <span>💭</span>
+        <span>reasoning (encrypted)</span>
+      </div>
+    </div>
+  );
+}
+
+// Keys that are routing/plumbing noise — hide in expanded view by default.
+const CODEX_TOOL_NOISE_KEYS = new Set([
+  "yield_time_ms", "max_output_tokens", "sandbox_permissions",
+  "prefix_rule", "session_id",
+]);
+
+function codexToolCallSummary(name: string, input: unknown): string {
+  // String input (custom_tool_call like apply_patch): collapse to a short label.
+  if (typeof input === "string") {
+    if (name === "apply_patch") {
+      const lineCount = input.split("\n").length;
+      return `${lineCount} line${lineCount === 1 ? "" : "s"} of patch text`;
+    }
+    const oneLine = input.replace(/\s+/g, " ").trim();
+    return oneLine.length > 120 ? oneLine.slice(0, 120) + "…" : oneLine;
+  }
+  if (!input || typeof input !== "object") return "";
+  const obj = input as Record<string, unknown>;
+  // Per-tool smart summaries
+  if (name === "exec_command") {
+    const cmd = typeof obj.cmd === "string" ? obj.cmd : "";
+    return cmd || "(no command)";
+  }
+  if (name === "write_stdin") {
+    const chars = typeof obj.chars === "string" ? obj.chars : "";
+    const sid = obj.session_id;
+    const sidStr = sid != null ? `→ session ${sid}` : "";
+    const preview = chars ? `"${chars.replace(/\n/g, "↵").slice(0, 80)}${chars.length > 80 ? "…" : ""}"` : "(empty)";
+    return [sidStr, preview].filter(Boolean).join(" ");
+  }
+  // Generic fallback: first meaningful string field.
+  for (const k of ["command", "cmd", "path", "file_path", "query", "url", "input"]) {
+    const v = obj[k];
+    if (typeof v === "string" && v) {
+      return v.length > 120 ? v.slice(0, 120) + "…" : v;
+    }
+    if (Array.isArray(v)) return v.map(String).join(" ");
+  }
+  // Last resort: comma-joined key list (no JSON dump).
+  const keys = Object.keys(obj).filter((k) => !CODEX_TOOL_NOISE_KEYS.has(k));
+  return keys.length > 0 ? `{${keys.join(", ")}}` : "";
+}
+
+function CodexToolCallBlock({ name, input, status, callId, pairedOutput }: {
+  name: string; input: unknown; status: string; callId: string;
+  /** When set: the matching codex_tool_result has been folded into this card
+   *  (instead of rendering separately further down the chat) so the call and
+   *  its output stay visually paired even when Codex batches multiple execs. */
+  pairedOutput?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const summary = useMemo(() => codexToolCallSummary(name, input), [name, input]);
+  const dotColor = status === "completed" ? "var(--accent-green)"
+                : status === "failed" ? "var(--accent-red)"
+                : "var(--accent-amber)";
+
+  // Expanded view: render structured key/value list for object input, or raw
+  // text in a <pre> block for string input (e.g. apply_patch). Skips noise keys.
+  const expandedBody = useMemo(() => {
+    if (typeof input === "string") {
+      return (
+        <pre style={{ margin: 0, fontFamily: "monospace", fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-muted)", maxHeight: 400, overflow: "auto" }}>
+          {input}
+        </pre>
+      );
+    }
+    if (!input || typeof input !== "object") return null;
+    const obj = input as Record<string, unknown>;
+    const visible = Object.entries(obj).filter(([k]) => !CODEX_TOOL_NOISE_KEYS.has(k));
+    const hidden = Object.entries(obj).filter(([k]) => CODEX_TOOL_NOISE_KEYS.has(k));
+    return (
+      <div>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 11 }}>
+          <tbody>
+            {visible.map(([k, v]) => (
+              <tr key={k}>
+                <td style={{ verticalAlign: "top", padding: "2px 8px 2px 0", color: "var(--text-faintest)", whiteSpace: "nowrap" }}>{k}</td>
+                <td style={{ padding: "2px 0", color: "var(--text-muted)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                  {typeof v === "string" ? v : JSON.stringify(v)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {hidden.length > 0 && (
+          <details style={{ marginTop: 6 }}>
+            <summary style={{ cursor: "pointer", color: "var(--text-faintest)", fontSize: 10 }}>
+              · {hidden.length} more (routing fields)
+            </summary>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 11, marginTop: 4 }}>
+              <tbody>
+                {hidden.map(([k, v]) => (
+                  <tr key={k}>
+                    <td style={{ padding: "2px 8px 2px 0", color: "var(--text-faintest)", whiteSpace: "nowrap" }}>{k}</td>
+                    <td style={{ padding: "2px 0", color: "var(--text-faint)" }}>{typeof v === "string" ? v : JSON.stringify(v)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </details>
+        )}
+      </div>
+    );
+  }, [input]);
+
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          width: "100%", background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+          borderRadius: 6, padding: "6px 10px", cursor: "pointer", gap: 8, textAlign: "left",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0 }}>
+          <span style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: dotColor }} />
+          <span style={{ fontSize: 11 }}>🔧</span>
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font, 12.5px)", fontWeight: 700, color: "var(--text-bright)", flexShrink: 0 }}>
+            {name}
+          </span>
+          <span style={{
+            fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11.5px)", color: "var(--text-muted)",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
+          }}>
+            {summary}
+          </span>
+        </div>
+        <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+      {expanded && (
+        <div style={{ marginTop: 4, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, color: "var(--text-muted)" }}>
+          {callId && <div style={{ color: "var(--text-faintest)", marginBottom: 6, fontFamily: "monospace", fontSize: 10 }}>call_id: {callId}</div>}
+          {expandedBody}
+        </div>
+      )}
+      {pairedOutput !== undefined && (
+        <CodexToolResultBlock output={pairedOutput} callId={callId} />
+      )}
+    </div>
+  );
+}
+
+// Codex's exec_command tool wraps output in structured headers:
+//   "Chunk ID: <id>\nWall time: ...\nProcess exited with code N\n
+//    Original token count: ...\nOutput:\n<actual output>"
+// Note "Process exited with code N" has NO colon after "code" — needs its
+// own regex. We split on the "Output:" line (everything after is the body)
+// then scan the prefix for known header lines.
+function parseCodexExecOutput(raw: string): {
+  chunkId?: string;
+  wallTime?: string;
+  exitCode?: number;
+  tokenCount?: number;
+  body: string;
+} {
+  const lines = raw.split("\n");
+  // Look for the "Output:" delimiter in the first ~10 lines (header block).
+  let outputIdx = -1;
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    if (lines[i] === "Output:") { outputIdx = i; break; }
+  }
+  if (outputIdx < 0) {
+    return { body: raw.replace(/\n+$/, "") };
+  }
+  const headerLines = lines.slice(0, outputIdx);
+  const body = lines.slice(outputIdx + 1).join("\n").replace(/\n+$/, "");
+  const result: {
+    chunkId?: string; wallTime?: string; exitCode?: number; tokenCount?: number; body: string;
+  } = { body };
+  for (const line of headerLines) {
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/^Chunk ID:\s*(.+)$/))) result.chunkId = m[1].trim();
+    else if ((m = line.match(/^Wall time:\s*(.+)$/))) result.wallTime = m[1].trim();
+    else if ((m = line.match(/^Process exited with code\s+(-?\d+)/))) result.exitCode = Number(m[1]);
+    else if ((m = line.match(/^Original token count:\s*(\d+)/))) result.tokenCount = Number(m[1]);
+  }
+  return result;
+}
+
+function CodexToolResultBlock({ output, callId }: { output: string; callId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const trimmed = output.trim();
+  const parsed = useMemo(() => parseCodexExecOutput(trimmed), [trimmed]);
+  if (!trimmed) return null;
+  const hasExecHeaders = parsed.exitCode !== undefined || parsed.chunkId !== undefined;
+  const visibleBody = hasExecHeaders ? parsed.body : trimmed;
+  const isMultiline = visibleBody.includes("\n");
+  const firstLine = visibleBody.split("\n")[0] || (hasExecHeaders ? "(command produced no output)" : "(no output)");
+  const preview = firstLine.length > 160 ? firstLine.slice(0, 160) + "…" : firstLine;
+
+  const exitOk = parsed.exitCode === 0;
+  const exitBadge = parsed.exitCode !== undefined && (
+    <span style={{
+      flexShrink: 0, fontSize: 10, fontFamily: "monospace", padding: "1px 5px", borderRadius: 3,
+      background: exitOk ? "#064e3b" : "#4c1d1d",
+      color: exitOk ? "#6ee7b7" : "#fca5a5",
+      border: `1px solid ${exitOk ? "#065f46" : "#7f1d1d"}`,
+    }}>
+      exit {parsed.exitCode}
+    </span>
+  );
+
+  return (
+    <div style={{ padding: "2px 16px 2px 32px" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", width: "100%",
+          background: "transparent", border: "none", padding: "2px 0", cursor: isMultiline || hasExecHeaders ? "pointer" : "default",
+          gap: 6, textAlign: "left", color: "var(--text-muted)", fontSize: 11, fontFamily: "monospace",
+        }}
+      >
+        <span style={{ color: "var(--text-faintest)", flexShrink: 0 }}>↳</span>
+        {exitBadge}
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{preview}</span>
+        {(isMultiline || hasExecHeaders) && <span style={{ color: "var(--text-faintest)", fontSize: 10 }}>{expanded ? "▲" : "▼"}</span>}
+      </button>
+      {expanded && (isMultiline || hasExecHeaders) && (
+        <div style={{ marginTop: 2, padding: 8, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)", maxHeight: 400, overflow: "auto" }}>
+          {visibleBody && (
+            <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{visibleBody || "(empty output)"}</div>
+          )}
+          {(hasExecHeaders || callId) && (
+            <div style={{ color: "var(--text-faintest)", marginTop: 6, borderTop: "1px solid var(--border)", paddingTop: 4, fontSize: 10 }}>
+              {parsed.wallTime && <span style={{ marginRight: 10 }}>⏱ {parsed.wallTime}</span>}
+              {parsed.tokenCount !== undefined && <span style={{ marginRight: 10 }}>{parsed.tokenCount} tok</span>}
+              {parsed.chunkId && <span style={{ marginRight: 10 }}>chunk {parsed.chunkId}</span>}
+              {callId && <span>call_id: {callId}</span>}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Render a single unified-diff body with per-line colored backgrounds.
+function UnifiedDiffView({ diff, maxHeight }: { diff: string; maxHeight?: number }) {
+  const lines = diff.split("\n");
+  return (
+    <pre style={{
+      margin: 0, fontFamily: "monospace", fontSize: 11, lineHeight: 1.5,
+      maxHeight: maxHeight ?? 400, overflow: "auto",
+      background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: 4,
+    }}>
+      {lines.map((ln, i) => {
+        let bg = "transparent";
+        let color = "var(--text-muted)";
+        if (ln.startsWith("+++") || ln.startsWith("---")) { color = "var(--text-faint)"; }
+        else if (ln.startsWith("@@")) { color = "var(--accent-blue)"; bg = "var(--bg-surface)"; }
+        else if (ln.startsWith("+")) { bg = "rgba(46, 160, 67, 0.15)"; color = "#7ee787"; }
+        else if (ln.startsWith("-")) { bg = "rgba(248, 81, 73, 0.15)"; color = "#ffa198"; }
+        return (
+          <div key={i} style={{ background: bg, color, padding: "0 8px", whiteSpace: "pre" }}>
+            {ln || " "}
+          </div>
+        );
+      })}
+    </pre>
+  );
+}
+
+function CodexPatchFileRow({ path, info }: {
+  path: string;
+  info: { type?: string; content?: string; unified_diff?: string; move_path?: string };
+}) {
+  const [open, setOpen] = useState(false);
+  const type = info.type || "update";
+  const name = path.split("/").pop() || path;
+  const dir = path.slice(0, path.length - name.length).replace(/\/$/, "");
+  const typeStyle: Record<string, { sym: string; color: string; bg: string }> = {
+    add: { sym: "+", color: "#7ee787", bg: "rgba(46, 160, 67, 0.12)" },
+    update: { sym: "M", color: "var(--accent-blue)", bg: "transparent" },
+    delete: { sym: "−", color: "#ffa198", bg: "rgba(248, 81, 73, 0.12)" },
+  };
+  const t = typeStyle[type] || typeStyle.update;
+  // Compute +/− stats
+  const stats = useMemo(() => {
+    if (type === "add" && info.content) {
+      return { add: info.content.split("\n").length, del: 0 };
+    }
+    if (type === "update" && info.unified_diff) {
+      let add = 0, del = 0;
+      for (const ln of info.unified_diff.split("\n")) {
+        if (ln.startsWith("+") && !ln.startsWith("+++")) add++;
+        else if (ln.startsWith("-") && !ln.startsWith("---")) del++;
+      }
+      return { add, del };
+    }
+    return { add: 0, del: 0 };
+  }, [type, info.content, info.unified_diff]);
+  const hasBody = (type === "add" && !!info.content) || (type === "update" && !!info.unified_diff);
+
+  return (
+    <div style={{ borderTop: "1px solid var(--border)" }}>
+      <button
+        onClick={() => hasBody && setOpen(!open)}
+        style={{
+          display: "flex", alignItems: "center", width: "100%", gap: 8,
+          padding: "4px 8px", background: t.bg, border: "none",
+          cursor: hasBody ? "pointer" : "default", textAlign: "left",
+          fontFamily: "monospace", fontSize: 11, color: t.color,
+        }}
+      >
+        <span style={{ width: 12, textAlign: "center", flexShrink: 0, fontWeight: 700 }}>{t.sym}</span>
+        <span style={{ flexShrink: 0, fontWeight: 600 }}>{name}</span>
+        {dir && <span style={{ color: "var(--text-faintest)", fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{dir}</span>}
+        <span style={{ flex: 1 }} />
+        {info.move_path && (
+          <span style={{ color: "var(--text-faint)", fontSize: 10 }}>→ {info.move_path}</span>
+        )}
+        {(stats.add > 0 || stats.del > 0) && (
+          <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>
+            {stats.add > 0 && <span style={{ color: "#7ee787" }}>+{stats.add}</span>}
+            {stats.add > 0 && stats.del > 0 && " "}
+            {stats.del > 0 && <span style={{ color: "#ffa198" }}>−{stats.del}</span>}
+          </span>
+        )}
+        {hasBody && (
+          <span style={{ color: "var(--text-faintest)", fontSize: 10, flexShrink: 0 }}>{open ? "▲" : "▼"}</span>
+        )}
+      </button>
+      {open && hasBody && (
+        <div style={{ padding: "4px 8px 6px" }}>
+          {type === "update" && info.unified_diff && <UnifiedDiffView diff={info.unified_diff} />}
+          {type === "add" && info.content && (
+            <UnifiedDiffView
+              diff={info.content.split("\n").map((l) => "+" + l).join("\n")}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CodexPatchApplyBlock({ stdout, stderr, success, changes, status }: {
+  stdout: string; stderr: string; success: boolean; changes: Record<string, unknown>; status: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const entries = useMemo(() => Object.entries(changes || {}), [changes]);
+  const dotColor = success ? "var(--accent-green)" : "var(--accent-red)";
+  const statusLabel = success ? "applied" : (status || "failed");
+  const totals = useMemo(() => {
+    let add = 0, del = 0;
+    for (const [, info] of entries) {
+      const i = (info as { type?: string; content?: string; unified_diff?: string });
+      if (i.type === "add" && i.content) add += i.content.split("\n").length;
+      else if (i.type === "update" && i.unified_diff) {
+        for (const ln of i.unified_diff.split("\n")) {
+          if (ln.startsWith("+") && !ln.startsWith("+++")) add++;
+          else if (ln.startsWith("-") && !ln.startsWith("---")) del++;
+        }
+      }
+    }
+    return { add, del };
+  }, [entries]);
+
+  return (
+    <div style={{ padding: "2px 16px" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          width: "100%", background: "var(--bg-surface)", border: "1px solid var(--bg-hover)",
+          borderRadius: 6, padding: "6px 10px", cursor: "pointer", gap: 8, textAlign: "left",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0 }}>
+          <span style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: dotColor }} />
+          <span style={{ fontSize: 11 }}>📝</span>
+          <span style={{ fontFamily: "monospace", fontSize: "var(--conv-font, 12.5px)", fontWeight: 700, color: "var(--text-bright)", flexShrink: 0 }}>
+            patch_apply
+          </span>
+          <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{statusLabel}</span>
+          <span style={{
+            fontFamily: "monospace", fontSize: "var(--conv-font-sm, 11.5px)", color: "var(--text-muted)",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
+          }}>
+            {entries.length > 0
+              ? `${entries.length} file${entries.length === 1 ? "" : "s"} · `
+              : ""}
+            {(totals.add > 0 || totals.del > 0) && (
+              <>
+                {totals.add > 0 && <span style={{ color: "#7ee787" }}>+{totals.add}</span>}
+                {totals.add > 0 && totals.del > 0 && " "}
+                {totals.del > 0 && <span style={{ color: "#ffa198" }}>−{totals.del}</span>}
+              </>
+            )}
+          </span>
+        </div>
+        <span style={{ fontSize: "var(--conv-font-xs, 10px)", color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+      {expanded && (
+        <div style={{ marginTop: 4, background: "var(--bg-surface)", border: "1px solid var(--bg-hover)", borderRadius: 6, overflow: "hidden" }}>
+          {entries.map(([path, info]) => (
+            <CodexPatchFileRow
+              key={path}
+              path={path}
+              info={(info as { type?: string; content?: string; unified_diff?: string; move_path?: string }) || {}}
+            />
+          ))}
+          {(stdout.trim() || stderr.trim()) && (
+            <div style={{ padding: 8, borderTop: "1px solid var(--border)", fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }}>
+              {stdout.trim() && (
+                <div style={{ marginBottom: stderr.trim() ? 6 : 0 }}>
+                  <div style={{ color: "var(--text-faintest)", marginBottom: 2 }}>stdout:</div>
+                  <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 200, overflow: "auto" }}>{stdout}</div>
+                </div>
+              )}
+              {stderr.trim() && (
+                <div>
+                  <div style={{ color: "var(--accent-red)", marginBottom: 2 }}>stderr:</div>
+                  <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--accent-red)", maxHeight: 200, overflow: "auto" }}>{stderr}</div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CodexLifecycleBlock({ subtype, durationMs, reason, modelContextWindow }: {
+  subtype: string; durationMs: number | null; reason: string | null; modelContextWindow: number | null;
+}) {
+  const labels: Record<string, string> = {
+    task_started: "▶ task started",
+    task_complete: "✓ task complete",
+    turn_aborted: "⊘ turn aborted",
+    session_meta: "session start",
+    turn_context: "turn context",
+  };
+  const label = labels[subtype] || subtype;
+  const color = subtype === "turn_aborted" ? "var(--accent-red)"
+              : subtype === "task_complete" ? "var(--accent-green)"
+              : "var(--text-muted)";
+  const parts: string[] = [];
+  if (typeof durationMs === "number") {
+    parts.push(durationMs < 1000 ? `${durationMs}ms` : `${(durationMs / 1000).toFixed(1)}s`);
+  }
+  if (reason) parts.push(reason);
+  if (typeof modelContextWindow === "number") parts.push(`ctx ${modelContextWindow}`);
+  return (
+    <div style={{ display: "flex", justifyContent: "center", padding: "2px 16px" }}>
+      <div style={{
+        display: "inline-flex", alignItems: "center", gap: 6, padding: "2px 10px",
+        background: "var(--bg-surface)", border: "1px solid var(--border)",
+        borderRadius: 20, fontSize: 10, color, fontFamily: "monospace",
+      }}>
+        <span>{label}</span>
+        {parts.length > 0 && <span style={{ color: "var(--text-faintest)" }}>· {parts.join(" · ")}</span>}
+      </div>
+    </div>
+  );
+}
+
+function CodexTokenCountBlock({ info }: { info: Record<string, unknown> }) {
+  const lastTokenUsage = (info.last_token_usage as Record<string, unknown>) || {};
+  const totalTokenUsage = (info.total_token_usage as Record<string, unknown>) || {};
+  const lastIn = Number(lastTokenUsage.input_tokens ?? 0) + Number(lastTokenUsage.cached_input_tokens ?? 0);
+  const lastOut = Number(lastTokenUsage.output_tokens ?? 0);
+  const totalIn = Number(totalTokenUsage.input_tokens ?? 0) + Number(totalTokenUsage.cached_input_tokens ?? 0);
+  const totalOut = Number(totalTokenUsage.output_tokens ?? 0);
+  if (!lastIn && !lastOut && !totalIn && !totalOut) return null;
+  return (
+    <div style={{ display: "flex", justifyContent: "center", padding: "1px 16px" }}>
+      <div style={{
+        display: "inline-flex", alignItems: "center", gap: 6, padding: "1px 8px",
+        fontSize: 9, color: "var(--text-faintest)", fontFamily: "monospace",
+      }}>
+        <span title="this turn">↑{fmt(lastIn)} ↓{fmt(lastOut)}</span>
+        <span>·</span>
+        <span title="cumulative">Σ ↑{fmt(totalIn)} ↓{fmt(totalOut)}</span>
+      </div>
+    </div>
+  );
+}
+
 function MessageEntry({
   entry,
   toolResults,
+  codexToolResults,
   compactSummaries,
   isActiveThinking = false,
   isNewCompact = false,
@@ -2695,6 +3211,7 @@ function MessageEntry({
 }: {
   entry: RawMessage;
   toolResults: Map<string, { content: string; isError: boolean }>;
+  codexToolResults?: Map<string, string>;
   compactSummaries: Map<string, string>;
   isActiveThinking?: boolean;
   isNewCompact?: boolean;
@@ -2768,6 +3285,63 @@ function MessageEntry({
       return <UserBubble text={text} ts={ets} />;
     }
     return null;
+  }
+
+  // Codex-specific top-level types (synthesized from rollout JSONL by backend).
+  if (entry.type === "codex_reasoning") {
+    const r = entry as unknown as Record<string, unknown>;
+    const text = String(r.text || "").trim();
+    const encrypted = !!r.encrypted;
+    if (!text && !encrypted) return null;
+    if (text) return <ThinkingBlock thinking={text} isActive={false} />;
+    return <CodexEncryptedReasoningBlock />;
+  }
+
+  if (entry.type === "codex_tool_call") {
+    const r = entry as unknown as Record<string, unknown>;
+    const cid = String(r.call_id || "");
+    const pairedOutput = cid ? codexToolResults?.get(cid) : undefined;
+    return <CodexToolCallBlock
+      name={String(r.name || "tool")}
+      input={r.input}
+      status={String(r.status || "")}
+      callId={cid}
+      pairedOutput={pairedOutput}
+    />;
+  }
+
+  if (entry.type === "codex_tool_result") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexToolResultBlock
+      output={String(r.output ?? "")}
+      callId={String(r.call_id || "")}
+    />;
+  }
+
+  if (entry.type === "codex_patch_apply") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexPatchApplyBlock
+      stdout={String(r.stdout ?? "")}
+      stderr={String(r.stderr ?? "")}
+      success={!!r.success}
+      changes={(r.changes as Record<string, unknown>) || {}}
+      status={String(r.status || "")}
+    />;
+  }
+
+  if (entry.type === "codex_lifecycle") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexLifecycleBlock
+      subtype={String(r.subtype || "")}
+      durationMs={typeof r.duration_ms === "number" ? r.duration_ms : null}
+      reason={r.reason ? String(r.reason) : null}
+      modelContextWindow={typeof r.model_context_window === "number" ? r.model_context_window : null}
+    />;
+  }
+
+  if (entry.type === "codex_token_count") {
+    const r = entry as unknown as Record<string, unknown>;
+    return <CodexTokenCountBlock info={(r.info as Record<string, unknown>) || {}} />;
   }
 
   const msg = entry.message;
@@ -2926,7 +3500,7 @@ function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
 
 interface Props {
   sessionId: string;
-  tool?: "claude" | "cursor";
+  tool?: "claude" | "cursor" | "codex";
   isStreaming?: boolean;
   /** True while claude is running its compaction pass — drives the bottom banner's compacting variant. */
   isCompacting?: boolean;
@@ -3020,7 +3594,8 @@ function _cleanupExpiredDrafts(): void {
   } catch { /* ignore */ }
 }
 
-export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+  const agentDisplayName = tool === "cursor" ? "Cursor" : tool === "codex" ? "Codex" : "Claude";
   const [messages, setMessages] = useState<RawMessage[]>([]);
   const [tail, setTail] = useState(DEFAULT_TAIL);
   const [total, setTotal] = useState(0);
@@ -3076,6 +3651,35 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
     }
     return map;
   }, [messages]);
+
+  // Codex emits exec call → exec output as two separate top-level events that
+  // may be many messages apart (especially when several exec_commands are
+  // batched in one turn). Build a call_id → output map so each
+  // CodexToolCallBlock can render its result inline; the standalone
+  // codex_tool_result entries are then filtered out of displayEntries below.
+  const codexToolResults = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const m of messages) {
+      if (m.type !== "codex_tool_result") continue;
+      const r = m as unknown as Record<string, unknown>;
+      const callId = String(r.call_id || "");
+      if (callId) map.set(callId, String(r.output ?? ""));
+    }
+    return map;
+  }, [messages]);
+
+  // Set of call_ids that have BOTH a codex_tool_call and a codex_tool_result.
+  // Used to drop the standalone result rows since the call block embeds them.
+  const codexPairedCallIds = useMemo(() => {
+    const callIds = new Set<string>();
+    for (const m of messages) {
+      if (m.type !== "codex_tool_call") continue;
+      const r = m as unknown as Record<string, unknown>;
+      const cid = String(r.call_id || "");
+      if (cid && codexToolResults.has(cid)) callIds.add(cid);
+    }
+    return callIds;
+  }, [messages, codexToolResults]);
 
   // Used to dedup with `pendingAuqData` (the hook/screen-parsed fallback that
   // covers the gap before JSONL is written). The body-loop renders ANY
@@ -3134,7 +3738,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
   // is the whole point: survive compacting-induced source flickers.
   useEffect(() => {
     if (!currentAuq) return;
-    if (_dismissedAUQ.has(currentAuq.blockId) || _isAuqRecentlyDismissed(currentAuq.key)) return;
+    if (_isAuqBlockDismissed(sessionId, currentAuq.blockId) || _isAuqRecentlyDismissed(sessionId, currentAuq.key)) return;
     setStickyAuq(prev => {
       if (!prev) return currentAuq;
       // Same question → keep, but upgrade pending-blockId to JSONL-blockId
@@ -3156,7 +3760,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
   // got recently dismissed).
   useEffect(() => {
     if (!stickyAuq) return;
-    if (_dismissedAUQ.has(stickyAuq.blockId) || _isAuqRecentlyDismissed(stickyAuq.key)) {
+    if (_isAuqBlockDismissed(sessionId, stickyAuq.blockId) || _isAuqRecentlyDismissed(sessionId, stickyAuq.key)) {
       setStickyAuq(null);
     }
   }, [stickyAuq, messages, pendingAuqData]);
@@ -3188,6 +3792,23 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
   const displayEntries = useMemo(() => {
     const filtered = messages.filter((m) => {
       if (m.isMeta) return false;
+      // Codex-specific top-level types — synthesized by backend from rollout JSONL.
+      // Pass them through unchanged; MessageEntry has dedicated render branches.
+      if (m.type === "codex_tool_result") {
+        // Hide standalone result rows that have a matching call — the call
+        // block embeds them so the two stay visually paired even when Codex
+        // emits them many messages apart.
+        const r = m as unknown as Record<string, unknown>;
+        const cid = String(r.call_id || "");
+        return !cid || !codexPairedCallIds.has(cid);
+      }
+      if (
+        m.type === "codex_reasoning" ||
+        m.type === "codex_tool_call" ||
+        m.type === "codex_patch_apply" ||
+        m.type === "codex_lifecycle" ||
+        m.type === "codex_token_count"
+      ) return true;
       if (m.type === "user" || m.type === "assistant") {
         if (compactSummaryUuids.has(m.uuid || "")) return false;
         // Skip local-command caveat and stdout-echo XML wrappers; keep
@@ -3274,7 +3895,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
       return false;
     });
     return filtered;
-  }, [messages, compactSummaryUuids]);
+  }, [messages, compactSummaryUuids, codexPairedCallIds]);
 
   // ── Task run grouping ─────────────────────────────────────────────────────
   // Pre-compute runs of consecutive Task* assistant messages so they render as one group.
@@ -3760,7 +4381,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                       <MessageEntry
                         key={uid}
                         entry={entry}
-                        toolResults={toolResults}
+                        toolResults={toolResults} codexToolResults={codexToolResults}
                         compactSummaries={compactSummaries}
                         isActiveThinking={isActiveThinking}
                         isNewCompact={newCompactUuids.has(entry.uuid || "")}
@@ -3784,7 +4405,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                       {/* hideExitPlanBlock=true: PlanApprovalBlock below handles the UI */}
                       <MessageEntry
                         entry={entry}
-                        toolResults={toolResults}
+                        toolResults={toolResults} codexToolResults={codexToolResults}
                         compactSummaries={compactSummaries}
                         isActiveThinking={isActiveThinking}
                         isNewCompact={newCompactUuids.has(entry.uuid || "")}
@@ -3811,7 +4432,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                     <React.Fragment key={uid}>
                       <MessageEntry
                         entry={entry}
-                        toolResults={toolResults}
+                        toolResults={toolResults} codexToolResults={codexToolResults}
                         compactSummaries={compactSummaries}
                         isActiveThinking={isActiveThinking}
                         isNewCompact={newCompactUuids.has(entry.uuid || "")}
@@ -3833,7 +4454,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
                 <MessageEntry
                   key={uid}
                   entry={entry}
-                  toolResults={toolResults}
+                  toolResults={toolResults} codexToolResults={codexToolResults}
                   compactSummaries={compactSummaries}
                   isActiveThinking={isActiveThinking}
                   isNewCompact={newCompactUuids.has(entry.uuid || "")}
@@ -3886,6 +4507,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
       {stickyAuq && (
         <div style={{ flexShrink: 0, borderTop: "1px solid var(--border)", background: "var(--bg-surface)" }}>
           <AskUserQuestionBlock
+            sessionId={sessionId}
             blockId={stickyAuq.blockId}
             questions={stickyAuq.questions}
             onSubmitAnswers={(answers) => {
@@ -3940,7 +4562,7 @@ export function ConversationPane({ sessionId, tool: _tool, isStreaming, isCompac
               padding: "5px 12px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
             }}>
               <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--accent-blue, #58a6ff)", animation: "cursor-blink 1s step-end infinite" }} />
-              <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Claude is responding…</span>
+              <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>{agentDisplayName} is responding…</span>
               <button
                 onClick={stopResponse}
                 style={{

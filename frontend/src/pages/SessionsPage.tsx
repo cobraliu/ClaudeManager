@@ -19,6 +19,7 @@ import {
   getAvailableTools,
   browseExternalSessions,
   browseCursorSessions,
+  browseCodexSessions,
   getExternalPreview,
   listModels,
   setSessionModel,
@@ -574,7 +575,7 @@ function NewSessionModal({
 }: {
   workspaceBase: string;
   loading: boolean;
-  onSubmit: (p: { project: string; cwd?: string; git_repo_url?: string; tool: "claude" | "cursor" }) => void;
+  onSubmit: (p: { project: string; cwd?: string; git_repo_url?: string; tool: "claude" | "cursor" | "codex" }) => void;
   onClose: () => void;
 }) {
   // Always read username from the current JWT to stay in sync with actual token
@@ -582,7 +583,7 @@ function NewSessionModal({
   const prefix = `${workspaceBase}/${username}/`;
 
   const [project, setProject] = useState("");
-  const tool = "claude" as const;
+  const [tool, setTool] = useState<"claude" | "cursor" | "codex">("claude");
 
   // suffix is the editable part after the fixed prefix
   const [suffix, setSuffix] = useState("");
@@ -661,6 +662,33 @@ function NewSessionModal({
           style={inputStyle}
           autoFocus
         />
+        <div>
+          <label style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+            Agent
+          </label>
+          <div style={{ display: "flex", gap: 6 }}>
+            {(["claude", "codex"] as const).map((k) => (
+              <button
+                key={k}
+                onClick={() => setTool(k)}
+                style={{
+                  flex: 1,
+                  padding: "5px 8px",
+                  fontSize: 12,
+                  borderRadius: 5,
+                  border: "1px solid " + (tool === k ? "var(--accent-blue)" : "var(--border)"),
+                  background: tool === k ? "rgba(88,166,255,0.15)" : "var(--bg-main)",
+                  color: tool === k ? "var(--text-body)" : "var(--text-secondary)",
+                  fontWeight: tool === k ? 600 : 400,
+                  cursor: "pointer",
+                  textTransform: "capitalize",
+                }}
+              >
+                {k}
+              </button>
+            ))}
+          </div>
+        </div>
         <div>
           <label style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
             Working Directory
@@ -920,9 +948,10 @@ function BrowseExternalPanel({
   onLoad,
   onClose,
 }: {
-  onLoad: (session: ExternalSession) => void;
+  onLoad: (tool: "claude" | "cursor" | "codex", session: ExternalSession) => void;
   onClose: () => void;
 }) {
+  const [tool, setTool] = useState<"claude" | "cursor" | "codex">("claude");
   const [groups, setGroups] = useState<ExternalSessionGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -931,14 +960,21 @@ function BrowseExternalPanel({
   const [viewingSession, setViewingSession] = useState<ExternalSession | null>(null);
 
   useEffect(() => {
-    browseExternalSessions()
+    setLoading(true);
+    setGroups([]);
+    setSelectedDir(null);
+    const fetcher =
+      tool === "cursor" ? browseCursorSessions :
+      tool === "codex" ? browseCodexSessions :
+      browseExternalSessions;
+    fetcher()
       .then((data) => {
         setGroups(data);
         if (data.length > 0) setSelectedDir(data[0].dir);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tool]);
 
   const isEmpty = (s: ExternalSession) => !s.title && s.prompts.length === 0;
 
@@ -989,6 +1025,27 @@ function BrowseExternalPanel({
         {/* Header */}
         <div style={{ padding: "11px 16px 10px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
           <span style={{ fontSize: 14, fontWeight: 600, marginRight: 4 }}>Browse External Sessions</span>
+          <div style={{ display: "flex", gap: 4 }}>
+            {(["claude", "codex"] as const).map((k) => (
+              <button
+                key={k}
+                onClick={() => setTool(k)}
+                style={{
+                  padding: "3px 10px",
+                  fontSize: 11,
+                  borderRadius: 4,
+                  border: "1px solid " + (tool === k ? "var(--accent-blue)" : "var(--border)"),
+                  background: tool === k ? "rgba(88,166,255,0.15)" : "transparent",
+                  color: tool === k ? "var(--text-body)" : "var(--text-secondary)",
+                  fontWeight: tool === k ? 600 : 400,
+                  cursor: "pointer",
+                  textTransform: "capitalize",
+                }}
+              >
+                {k}
+              </button>
+            ))}
+          </div>
           <div style={{ flex: 1 }} />
           <input
             autoFocus
@@ -1127,7 +1184,7 @@ function BrowseExternalPanel({
                         onClick={async () => {
                           if (!canLoad) return;
                           setLoadingId(s.claude_session_id);
-                          try { await onLoad(s); } finally { setLoadingId(null); }
+                          try { await onLoad(tool, s); } finally { setLoadingId(null); }
                         }}
                         style={{
                           background: canLoad ? "var(--accent-blue)" : "var(--bg-hover)",
@@ -1150,7 +1207,7 @@ function BrowseExternalPanel({
         </div>
       </div>
       {viewingSession && (
-        <SessionPreviewModal session={viewingSession} tool="claude" onClose={() => setViewingSession(null)} />
+        <SessionPreviewModal session={viewingSession} tool={tool} onClose={() => setViewingSession(null)} />
       )}
     </div>
   );
@@ -1199,12 +1256,18 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [tuiApproveData, setTuiApproveData] = useState<TuiApproveData | null>(null);
   const [isCompacting, setIsCompacting] = useState(false);
   const [compactingProgress, setCompactingProgress] = useState<string | null>(null);
+  // Which session the above tui* states belong to. Used to gate the values at
+  // render time so a remounting ConversationPane never observes data fetched
+  // for a different session (the poll effect can only clear *after* commit).
+  const [tuiOwnerSessionId, setTuiOwnerSessionId] = useState<string | null>(null);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [modelList, setModelList] = useState<ModelInfo[]>([]);
   const [settingModel, setSettingModel] = useState(false);
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const activeSessionMeta = sessions.find((s) => s.id === activeSessionId);
   const isCursorSession = activeSessionMeta?.tool === "cursor";
+  // Claude-only features (UsageBar, AUQ history, /goal, TodoWrite) — gate UI on this.
+  const isClaudeSession = activeSessionMeta?.tool === "claude";
 
   // Per-session file/git/jsonl tabs (file-centric layout). Lives at the page
   // level so switching sessions reloads each session's tab set from localStorage.
@@ -1292,7 +1355,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     } catch { /* ignore */ }
   }, [activeSessionId]);
   useEffect(() => {
-    if (!activeSessionId || isCursorSession) {
+    if (!activeSessionId || !isClaudeSession) {
       setDockTodos([]); setDockTodoHistory([]); setDockActiveGoal(null); setDockGoalHistory([]);
       return;
     }
@@ -1300,7 +1363,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     refreshDockGoals();
     const id = setInterval(() => { refreshDockTodos(); refreshDockGoals(); }, 5000);
     return () => clearInterval(id);
-  }, [activeSessionId, isCursorSession, refreshDockTodos, refreshDockGoals]);
+  }, [activeSessionId, isClaudeSession, refreshDockTodos, refreshDockGoals]);
 
   const { width: winW, height: winH } = useWindowSize();
 
@@ -1403,7 +1466,16 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
 
   // Poll hint status for active session (triggers JSONL refresh when AUQ/approval appears)
   useEffect(() => {
-    if (!activeSessionId) { setTuiHint(null); return; }
+    // Clear stale per-session TUI state synchronously on session switch so the
+    // remounted ConversationPane doesn't observe the previous session's AUQ /
+    // approval / hint before the first poll for the new session returns.
+    setTuiAuqData(null);
+    setTuiApproveData(null);
+    setTuiHint(null);
+    setIsCompacting(false);
+    setCompactingProgress(null);
+
+    if (!activeSessionId) return;
     let cancelled = false;
     const poll = async () => {
       try {
@@ -1420,12 +1492,14 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
           setTuiApproveData(st.tui_approve_data ?? null);
           setIsCompacting(!!st.is_compacting);
           setCompactingProgress(st.compacting_progress ?? null);
+          setTuiOwnerSessionId(activeSessionId);
         } else {
           setTuiHint(null);
           setTuiAuqData(null);
           setTuiApproveData(null);
           setIsCompacting(false);
           setCompactingProgress(null);
+          setTuiOwnerSessionId(activeSessionId);
         }
       } catch { /* ignore */ }
     };
@@ -1642,7 +1716,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     project: string;
     cwd?: string;
     git_repo_url?: string;
-    tool: "claude" | "cursor";
+    tool: "claude" | "cursor" | "codex";
   }) => {
     setLoading(true);
     try {
@@ -1749,6 +1823,22 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       cwd: ext.cwd,
       resume_session_id: ext.claude_session_id,
       tool: "cursor",
+    });
+    await refresh();
+    const res = await attachSession(newSession.id);
+    setActive(res);
+    setActiveSessionId(newSession.id);
+    setChatOnlyMode(false);
+    setShowBrowse(false);
+  };
+
+  const handleLoadCodex = async (ext: ExternalSession) => {
+    const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
+    const newSession = await createSession({
+      project: dirName,
+      cwd: ext.cwd,
+      resume_session_id: ext.claude_session_id,
+      tool: "codex",
     });
     await refresh();
     const res = await attachSession(newSession.id);
@@ -2178,12 +2268,36 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                     theme={theme}
                     scrollToBottomRef={tuiScrollToBottomRef}
                     fontFamily={terminalFont}
+                    useTmuxScroll={activeSessionMeta?.tool === "codex"}
                   />
                 </div>
               </div>
             )}
             <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "bubble" ? "flex" : "none", flexDirection: "column" }}>
-              <ConversationPane key={active.session_id + active.ws_token} sessionId={active.session_id} tool={activeSessionMeta?.tool} isStreaming={activeSessionMeta?.is_streaming} isCompacting={isCompacting} compactingProgress={compactingProgress} chatOnly={chatOnlyMode} isWaitingForAuq={!!tuiHint?.includes("asking a question")} pendingAuqData={tuiAuqData} pendingApproveData={tuiApproveData} refreshRef={convRefreshRef} />
+              {(() => {
+                // Gate every tui-derived prop on the freshness check: the
+                // value must have been polled for THIS session id, otherwise
+                // we pass nulls. Without this gate a newly-mounted
+                // ConversationPane (key changes on session switch) would
+                // observe the previous session's AUQ for one render and
+                // pin it into its stickyAuq.
+                const fresh = tuiOwnerSessionId === active.session_id;
+                return (
+                  <ConversationPane
+                    key={active.session_id + active.ws_token}
+                    sessionId={active.session_id}
+                    tool={activeSessionMeta?.tool}
+                    isStreaming={activeSessionMeta?.is_streaming}
+                    isCompacting={fresh ? isCompacting : false}
+                    compactingProgress={fresh ? compactingProgress : null}
+                    chatOnly={chatOnlyMode}
+                    isWaitingForAuq={fresh && !!tuiHint?.includes("asking a question")}
+                    pendingAuqData={fresh ? tuiAuqData : null}
+                    pendingApproveData={fresh ? tuiApproveData : null}
+                    refreshRef={convRefreshRef}
+                  />
+                );
+              })()}
             </div>
             {codeFileView && (
               <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -2230,7 +2344,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               <SessionSideDock
                 sessionId={activeSessionMeta.id}
                 sessionName={activeSessionMeta.name || activeSessionMeta.project}
-                isCursor={isCursorSession}
+                isCursor={!isClaudeSession}
                 open={dockOpen}
                 onClose={(key) => setDockSection(key, false)}
                 todos={dockTodos}
@@ -2246,7 +2360,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
           </div>
           {/* Bottom toolbar — three groups: Functional | Views | Term */}
             <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, padding: "3px 8px", background: "var(--bg-base)", borderTop: "1px solid var(--bg-page)" }}>
-              {!isCursorSession && <UsageBar />}
+              {isClaudeSession && <UsageBar />}
               {/* In file-centric, push the button cluster rightward so it sits below
                   the chat column. The cluster gets a fixed width = chat + dock so
                   its left edge hits chat col's left edge exactly. */}
@@ -2260,7 +2374,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               }}>
               {/* Group 1: Functional — Auqs / Tasks / Goals / Model */}
               <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              {activeSessionMeta && activeSessionMeta.tool !== "cursor" && (
+              {activeSessionMeta && isClaudeSession && (
                 <button
                   onClick={() => setDockSection("auqs", !dockOpen.auqs)}
                   title="Show AskUserQuestion history for this session"
@@ -2291,7 +2405,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   </button>
                 );
               })()}
-              {activeSessionMeta && activeSessionMeta.tool !== "cursor" && (() => {
+              {activeSessionMeta && isClaudeSession && (() => {
                 const hasActive = !!dockActiveGoal;
                 return (
                   <button
@@ -2483,7 +2597,11 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       {/* Browse external sessions panel */}
       {showBrowse && (
         <BrowseExternalPanel
-          onLoad={handleLoadExternal}
+          onLoad={(t, s) => {
+            if (t === "codex") return handleLoadCodex(s);
+            if (t === "cursor") return handleLoadCursor(s);
+            return handleLoadExternal(s);
+          }}
           onClose={() => setShowBrowse(false)}
         />
       )}

@@ -10,10 +10,12 @@ import {
   setWorkspace,
   setClaudeBin,
   setProxy,
+  setFileViewer,
   restartServer,
   type UserInfo,
   type SessionMeta,
   type ProxyMode,
+  type FileViewerMode,
 } from "../api/sessionApi";
 import { SessionCard } from "../components/SessionCard";
 
@@ -44,6 +46,12 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
   const [proxyInput, setProxyInput] = useState("");
   const [proxyMode, setProxyModeVal] = useState<ProxyMode>("tap_upstream");
   const [proxyModeInput, setProxyModeInput] = useState<ProxyMode>("tap_upstream");
+  const [fvMode, setFvMode] = useState<FileViewerMode>("lines");
+  const [fvMaxLines, setFvMaxLines] = useState<number>(3000);
+  const [fvMaxBytesMb, setFvMaxBytesMb] = useState<number>(1);
+  const [fvModeSaved, setFvModeSaved] = useState<FileViewerMode>("lines");
+  const [fvMaxLinesSaved, setFvMaxLinesSaved] = useState<number>(3000);
+  const [fvMaxBytesMbSaved, setFvMaxBytesMbSaved] = useState<number>(1);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
   const [restarting, setRestarting] = useState(false);
@@ -75,6 +83,13 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
       setProxyInput(c.proxy);
       setProxyModeVal(c.proxy_mode);
       setProxyModeInput(c.proxy_mode);
+      setFvMode(c.file_viewer_mode);
+      setFvModeSaved(c.file_viewer_mode);
+      setFvMaxLines(c.file_viewer_max_lines);
+      setFvMaxLinesSaved(c.file_viewer_max_lines);
+      const mb = Math.max(0.1, Math.round((c.file_viewer_max_bytes / (1024 * 1024)) * 100) / 100);
+      setFvMaxBytesMb(mb);
+      setFvMaxBytesMbSaved(mb);
     } catch {}
   }, []);
 
@@ -386,6 +401,78 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
               <p style={{ fontSize: 11, color: "var(--text-muted)", margin: 0 }}>
                 <b>Tap upstream</b>: Claude CLI → local 19098 → this proxy → api.anthropic.com. SSE snapshots recorded.<br />
                 <b>Real proxy</b>: Claude CLI → this proxy → api.anthropic.com. 19098 is bypassed; no recording.
+              </p>
+            </div>
+
+            {/* File Viewer */}
+            <div style={cardStyle}>
+              <h3 style={{ marginBottom: 12, fontSize: 15 }}>File Viewer</h3>
+              <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
+                Cap how much of a file the Code pane returns. Pick <b>unlimited</b> for no truncation,
+                <b> lines</b> to cap by line count, or <b>size</b> to cap by file size (in MB).
+              </p>
+              <div style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <select
+                  value={fvMode}
+                  onChange={(e) => setFvMode(e.target.value as FileViewerMode)}
+                  style={{ ...inputStyle, width: 180, cursor: "pointer" }}
+                >
+                  <option value="unlimited">Unlimited (no cap)</option>
+                  <option value="lines">Limit by lines</option>
+                  <option value="bytes">Limit by size</option>
+                </select>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: fvMode === "lines" ? "var(--text-bright)" : "var(--text-faint)" }}>
+                  Lines:
+                  <input
+                    type="number"
+                    min={100}
+                    max={1000000}
+                    step={100}
+                    value={fvMaxLines}
+                    onChange={(e) => setFvMaxLines(Math.max(100, Number(e.target.value) || 0))}
+                    disabled={fvMode !== "lines"}
+                    style={{ ...inputStyle, width: 110 }}
+                  />
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: fvMode === "bytes" ? "var(--text-bright)" : "var(--text-faint)" }}>
+                  Size (MB):
+                  <input
+                    type="number"
+                    min={0.01}
+                    max={1024}
+                    step={0.5}
+                    value={fvMaxBytesMb}
+                    onChange={(e) => setFvMaxBytesMb(Math.max(0.01, Number(e.target.value) || 0))}
+                    disabled={fvMode !== "bytes"}
+                    style={{ ...inputStyle, width: 110 }}
+                  />
+                </label>
+                <button
+                  disabled={
+                    fvMode === fvModeSaved &&
+                    fvMaxLines === fvMaxLinesSaved &&
+                    fvMaxBytesMb === fvMaxBytesMbSaved
+                  }
+                  onClick={async () => {
+                    try {
+                      const bytes = Math.max(4096, Math.round(fvMaxBytesMb * 1024 * 1024));
+                      const c = await setFileViewer(fvMode, fvMaxLines, bytes);
+                      setFvModeSaved(c.file_viewer_mode);
+                      setFvMaxLinesSaved(c.file_viewer_max_lines);
+                      const mb = Math.round((c.file_viewer_max_bytes / (1024 * 1024)) * 100) / 100;
+                      setFvMaxBytesMbSaved(mb);
+                      setFvMaxBytesMb(mb);
+                      setMsg("File viewer limit updated.");
+                    } catch (e) { setMsg(String(e)); }
+                  }}
+                  style={{ background: "#58a6ff", color: "#fff" }}
+                >
+                  Save
+                </button>
+              </div>
+              <p style={{ fontSize: 11, color: "var(--text-muted)", margin: 0 }}>
+                Lines mode minimum: 100. Size mode minimum: 4 KB. Unlimited returns the entire file
+                — beware of OOM on multi-GB files.
               </p>
             </div>
 

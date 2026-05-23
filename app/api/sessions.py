@@ -32,10 +32,8 @@ from app.services.claude_pid import format_tui_hint, get_pid_waiting_state, pars
 from app.services.claude_session_reader import enrich_session, find_newest_claude_session_id, get_latest_turn_info, get_conversation, search_conversation, list_project_session_ids, list_subagents, get_subagent_lines, list_all_claude_sessions_global, get_todo_plans
 from app.services.claude_goals import read_goals
 from app.services.claude_auqs import list_auqs
-from app.services.cursor_session_reader import (
-    enrich_cursor_session, find_newest_cursor_session_id, get_cursor_conversation, list_cursor_sessions,
-    list_all_cursor_sessions_global,
-)
+from app.agents import get_adapter
+from app.services.cursor_session_reader import list_all_cursor_sessions_global
 from app.services.git_service import (
     git_add_commit, git_checkout_branch, git_checkout_remote_branch, git_clone,
     git_conflict_file_versions, git_file_diff, git_file_log, git_file_show,
@@ -52,46 +50,10 @@ router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 models_router = APIRouter(prefix="/api/models", tags=["models"])
 
-CLAUDE_MODELS = [
-    {"id": "claude-opus-4-7",           "name": "Claude Opus 4.7"},
-    {"id": "claude-sonnet-4-6",         "name": "Claude Sonnet 4.6"},
-    {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5"},
-]
-
-_cursor_models_cache: list[dict] | None = None
-
-
-def _fetch_cursor_models() -> list[dict]:
-    global _cursor_models_cache
-    if _cursor_models_cache is not None:
-        return _cursor_models_cache
-    import shutil, subprocess as _sp
-    agent_bin = shutil.which("agent")
-    if not agent_bin:
-        return []
-    try:
-        out = _sp.check_output([agent_bin, "--list-models"], text=True, timeout=10)
-    except Exception:
-        return []
-    models = []
-    for line in out.splitlines():
-        line = line.strip()
-        if " - " not in line:
-            continue
-        mid, _, name = line.partition(" - ")
-        mid = mid.strip()
-        name = name.strip()
-        if mid and name:
-            models.append({"id": mid, "name": name})
-    _cursor_models_cache = models
-    return models
-
-
 @models_router.get("")
 def list_models(tool: str = "claude") -> list[dict]:
-    if tool == "cursor":
-        return _fetch_cursor_models()
-    return CLAUDE_MODELS
+    from app.agents import get_adapter
+    return get_adapter(tool).list_models()
 
 _store: SessionStore | None = None
 _tmux: TmuxService | None = None
@@ -410,8 +372,8 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
     store.transition(session.id, SessionStatus.RUNNING)
     audit_event(user_id, "create", session.id, {"project": body.project, "tool": body.tool})
 
-    # For cursor sessions, resume_session_id IS the cursor chat ID — store it immediately.
-    if body.tool == "cursor" and body.resume_session_id:
+    # For cursor/codex sessions, resume_session_id IS the agent session UUID — store immediately.
+    if body.tool in ("cursor", "codex") and body.resume_session_id:
         store.update_claude_session_id(session.id, body.resume_session_id)
 
     if body.tool == "claude":
@@ -426,6 +388,21 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
                 store.update_claude_session_id(session.id, claude_sid)
 
         threading.Thread(target=_resolve, daemon=True).start()
+    elif body.tool == "codex" and is_new:
+        # Fresh Codex session: poll for the newest rollout file in cwd to pick up
+        # the session UUID once the CLI has written its session_meta line.
+        def _resolve_codex():
+            from app.agents import get_adapter
+            adapter = get_adapter("codex")
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                sid = adapter.find_newest_session_id(cwd)
+                if sid:
+                    store.update_claude_session_id(session.id, sid)
+                    return
+                time.sleep(1.0)
+
+        threading.Thread(target=_resolve_codex, daemon=True).start()
 
     return session
 
@@ -439,12 +416,10 @@ def _enrich(
     task_map: dict[str, list] | None = None,
 ) -> SessionView:
     """Add Claude title, display prompts, new-output flag, and streaming flag."""
+    from app.agents import get_adapter
     view = SessionView(**session.model_dump())
     if session.claude_session_id:
-        if session.tool == "cursor":
-            data = enrich_cursor_session(session.claude_session_id, session.cwd)
-        else:
-            data = enrich_session(session.claude_session_id, session.cwd)
+        data = get_adapter(session.tool).enrich(session.claude_session_id, session.cwd)
         view.claude_title = data.get("title")
         view.prompts = data.get("prompts", [])
         view.last_user_input_at = data.get("last_user_input_at")
@@ -551,13 +526,20 @@ def browse_cursor_sessions(user_id: CurrentUser) -> list[dict]:
     return list_all_cursor_sessions_global(occupied)
 
 
+@router.get("/external-codex")
+def browse_codex_sessions(user_id: CurrentUser) -> list[dict]:
+    """Return all Codex sessions from ~/.codex/sessions/ not already in ClaudeManager."""
+    from app.services.codex_session_reader import list_all_codex_sessions_global as _list_codex
+    store = _get_store()
+    occupied = store.get_all_claude_session_ids()
+    return _list_codex(occupied)
+
+
 @router.get("/external-preview")
 def get_external_preview(claude_session_id: str, cwd: str, user_id: CurrentUser, tool: str = "claude") -> dict:
     """Return first 100 + last 100 turns of an external session for preview."""
-    if tool == "cursor":
-        turns = get_cursor_conversation(claude_session_id, cwd)
-    else:
-        turns = get_conversation(claude_session_id, cwd)
+    from app.agents import get_adapter
+    turns = get_adapter(tool).get_conversation(claude_session_id, cwd)
     total = len(turns)
     if total <= 200:
         preview = turns
@@ -1737,19 +1719,11 @@ def get_session_conversation(
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    chat_sid = session.claude_session_id
-    if session.tool == "cursor":
-        if not chat_sid:
-            chat_sid = find_newest_cursor_session_id(session.cwd)
-        if not chat_sid:
-            return []
-        turns = get_cursor_conversation(chat_sid, session.cwd, from_ts=from_ts)
-    else:
-        if not chat_sid:
-            chat_sid = find_newest_claude_session_id(session.cwd)
-        if not chat_sid:
-            return []
-        turns = get_conversation(chat_sid, session.cwd, from_ts=from_ts)
+    adapter = get_adapter(session.tool)
+    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    if not chat_sid:
+        return []
+    turns = adapter.get_conversation(chat_sid, session.cwd, from_ts=from_ts)
     if tail is not None and tail > 0 and from_ts == 0.0:
         confirmed = [t for t in turns if not t.get("pending") and not t.get("streaming")]
         rest = [t for t in turns if t.get("pending") or t.get("streaming")]
@@ -1773,21 +1747,11 @@ def get_conversation_jsonl_raw(
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    if session.tool == "cursor":
-        from app.services.cursor_session_reader import _find_jsonl as _find_cursor_jsonl
-        chat_sid = session.claude_session_id
-        if not chat_sid:
-            chat_sid = find_newest_cursor_session_id(session.cwd)
-        if not chat_sid:
-            raise HTTPException(status_code=404, detail="no cursor session")
-        jsonl_path = _find_cursor_jsonl(chat_sid, session.cwd)
-    else:
-        chat_sid = session.claude_session_id
-        if not chat_sid:
-            chat_sid = find_newest_claude_session_id(session.cwd)
-        if not chat_sid:
-            raise HTTPException(status_code=404, detail="no claude session")
-        jsonl_path = _find_session_jsonl(chat_sid, session.cwd)
+    adapter = get_adapter(session.tool)
+    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    if not chat_sid:
+        raise HTTPException(status_code=404, detail=f"no {session.tool} session")
+    jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd)
     if jsonl_path is None:
         raise HTTPException(status_code=404, detail="jsonl file not found")
     try:
@@ -1837,11 +1801,7 @@ def list_available_claude_sessions(session_id: str, user_id: CurrentUser) -> lis
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
-    if session.tool == "cursor":
-        raw = list_cursor_sessions(session.cwd)
-        all_sessions = [{"claude_session_id": s["cursor_session_id"], "title": s.get("title"), "mtime": s.get("mtime")} for s in raw]
-    else:
-        all_sessions = list_project_session_ids(session.cwd)
+    all_sessions = get_adapter(session.tool).list_local_sessions(session.cwd)
 
     # Collect occupied IDs: any session (other than this one) with a claude_session_id
     occupied = store.get_all_claude_session_ids(exclude_session_id=session_id)
@@ -1919,13 +1879,14 @@ def get_raw_messages(
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
-    if session.tool == "cursor":
-        from app.services.cursor_session_reader import _find_jsonl as _find_cursor_jsonl
-        chat_sid = session.claude_session_id or find_newest_cursor_session_id(session.cwd)
-        jsonl_path = _find_cursor_jsonl(chat_sid, session.cwd) if chat_sid else None
-    else:
-        chat_sid = session.claude_session_id or find_newest_claude_session_id(session.cwd)
-        jsonl_path = _find_session_jsonl(chat_sid, session.cwd) if chat_sid else None
+    adapter = get_adapter(session.tool)
+    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+
+    if session.tool == "codex" and chat_sid:
+        from app.services.codex_session_reader import get_codex_raw_messages
+        return get_codex_raw_messages(chat_sid, session.cwd, tail=tail)
+
+    jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd) if chat_sid else None
 
     if jsonl_path is None:
         return {"messages": [], "total": 0}
@@ -2144,13 +2105,14 @@ def get_raw_messages_all(
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
 
-    if session.tool == "cursor":
-        from app.services.cursor_session_reader import _find_jsonl as _find_cursor_jsonl
-        chat_sid = session.claude_session_id or find_newest_cursor_session_id(session.cwd)
-        jsonl_path = _find_cursor_jsonl(chat_sid, session.cwd) if chat_sid else None
-    else:
-        chat_sid = session.claude_session_id or find_newest_claude_session_id(session.cwd)
-        jsonl_path = _find_session_jsonl(chat_sid, session.cwd) if chat_sid else None
+    adapter = get_adapter(session.tool)
+    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+
+    if session.tool == "codex" and chat_sid:
+        from app.services.codex_session_reader import get_codex_raw_messages
+        return get_codex_raw_messages(chat_sid, session.cwd, tail=None)
+
+    jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd) if chat_sid else None
 
     if jsonl_path is None:
         return {"messages": [], "total": 0}

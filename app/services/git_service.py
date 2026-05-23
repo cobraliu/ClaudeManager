@@ -589,10 +589,25 @@ def git_list_branches(cwd: str) -> dict:
     """
     current = git_current_branch(cwd)
     local_res = subprocess.run(
-        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        ["git", "for-each-ref", "--format=%(refname:short)%09%(committerdate:unix)", "refs/heads/"],
         cwd=cwd, capture_output=True, text=True, encoding="utf-8",
     )
-    local = [b.strip() for b in (local_res.stdout if local_res.returncode == 0 else "").splitlines() if b.strip()]
+    local: list[str] = []
+    local_with_dates: list[dict] = []
+    if local_res.returncode == 0:
+        for line in local_res.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            name, _, ts = line.partition("\t")
+            name = name.strip()
+            if not name:
+                continue
+            local.append(name)
+            try:
+                local_with_dates.append({"name": name, "committerdate": int(ts)})
+            except (ValueError, TypeError):
+                local_with_dates.append({"name": name, "committerdate": 0})
 
     remote_res = subprocess.run(
         ["git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"],
@@ -611,7 +626,12 @@ def git_list_branches(cwd: str) -> dict:
             name = ref[len("origin/"):]
             if name and name not in local_set:
                 remote_only.append(name)
-    return {"current": current, "local": local, "remote_only": remote_only}
+    return {
+        "current": current,
+        "local": local,
+        "local_with_dates": local_with_dates,
+        "remote_only": remote_only,
+    }
 
 
 def git_checkout_remote_branch(cwd: str, branch: str, stash: bool = False) -> dict:

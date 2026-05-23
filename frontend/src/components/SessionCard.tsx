@@ -396,6 +396,10 @@ export function SessionCard({
             <span style={{ fontSize: 9, background: "#4c1d95", color: "#c4b5fd", padding: "1px 5px", borderRadius: 3, fontWeight: 600 }}>
               CURSOR
             </span>
+          ) : s.tool === "codex" ? (
+            <span style={{ fontSize: 9, background: "#064e3b", color: "#6ee7b7", padding: "1px 5px", borderRadius: 3, fontWeight: 600 }}>
+              CODEX
+            </span>
           ) : (
             <span style={{ fontSize: 9, background: "#78350f", color: "#fcd34d", padding: "1px 5px", borderRadius: 3, fontWeight: 600 }}>
               CLAUDE

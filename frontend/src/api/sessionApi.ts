@@ -27,7 +27,7 @@ export interface SessionMeta {
   scheduled_tasks: ScheduledTask[];
   git_auto_commit: boolean;
   git_repo_url: string | null;
-  tool: "claude" | "cursor";
+  tool: "claude" | "cursor" | "codex";
 }
 
 export interface SessionListResponse {
@@ -205,6 +205,8 @@ export function setUserIsAdmin(username: string, is_admin: boolean): Promise<Use
 // Config
 export type ProxyMode = "tap_upstream" | "real";
 
+export type FileViewerMode = "unlimited" | "lines" | "bytes";
+
 export interface ConfigView {
   workspace: string;
   claude_bin: string;
@@ -214,6 +216,9 @@ export interface ConfigView {
   terminal_font: string;
   term_idle_grace_seconds: number;
   term_standby_grace_seconds: number;
+  file_viewer_mode: FileViewerMode;
+  file_viewer_max_lines: number;
+  file_viewer_max_bytes: number;
 }
 
 export interface FontInfo {
@@ -274,6 +279,17 @@ export function setTermLifecycle(
   return request("/api/config/term-lifecycle", {
     method: "PUT",
     body: JSON.stringify({ idle_grace_seconds, standby_grace_seconds }),
+  });
+}
+
+export function setFileViewer(
+  mode: FileViewerMode,
+  max_lines: number,
+  max_bytes: number,
+): Promise<ConfigView> {
+  return request("/api/config/file-viewer", {
+    method: "PUT",
+    body: JSON.stringify({ mode, max_lines, max_bytes }),
   });
 }
 
@@ -363,7 +379,7 @@ export function createSession(body: {
   model?: string;
   resume_session_id?: string;
   git_repo_url?: string;
-  tool?: "claude" | "cursor";
+  tool?: "claude" | "cursor" | "codex";
 }): Promise<SessionMeta> {
   return request("/api/sessions", {
     method: "POST",
@@ -1112,6 +1128,9 @@ export interface CommitDetail {
 export interface GitBranchInfo {
   current: string;
   local: string[];
+  /** Per-branch last-commit Unix timestamps. Aligned with `local`; backend
+   * may omit this field on older deployments (treat as absent → no recency). */
+  local_with_dates?: { name: string; committerdate: number }[];
   remote_only?: string[];
   dirty?: boolean;
 }
@@ -1260,6 +1279,28 @@ export interface ChangedFile {
   status: "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflict";
   added?: number;
   removed?: number;
+  /** Set when the entry stands in for a collapsed-but-skipped untracked dir
+   *  (see ChangedFilesWarning). The frontend renders it as a non-expandable
+   *  row so the user knows changes exist but isn't allowed to drill in. */
+  is_skipped_dir?: boolean;
+}
+
+export interface ChangedFilesWarning {
+  /** "large_untracked_dir": dir exceeded size/file-count probe threshold.
+   *  "bare_git_repo": dir looks like a bare git repository (HEAD+objects+refs).
+   */
+  kind: "large_untracked_dir" | "bare_git_repo";
+  path: string;
+  file_count?: number;
+  approx_size_bytes?: number;
+  is_bare_repo?: boolean;
+  /** A line to append to .gitignore that would suppress this warning. */
+  suggested_ignore: string;
+}
+
+export interface ChangedFilesResponse {
+  files: ChangedFile[];
+  warnings: ChangedFilesWarning[];
 }
 
 export interface FileData {
@@ -1269,6 +1310,8 @@ export interface FileData {
   added_lines: number[];
   removed_lines: number[];
   truncated: boolean;
+  truncated_by?: "lines" | "bytes" | null;
+  displayed_lines?: number;
   diff_raw?: string;
   is_binary?: boolean;
   size?: number;
@@ -1284,7 +1327,7 @@ export interface TreeNode {
   children?: TreeNode[] | null;
 }
 
-export function getCodeChangedFiles(sessionId: string): Promise<ChangedFile[]> {
+export function getCodeChangedFiles(sessionId: string): Promise<ChangedFilesResponse> {
   return request(`/api/sessions/${sessionId}/code/changed-files`);
 }
 
@@ -1411,6 +1454,10 @@ export function browseExternalSessions(): Promise<ExternalSessionGroup[]> {
 
 export function browseCursorSessions(): Promise<ExternalSessionGroup[]> {
   return request<ExternalSessionGroup[]>("/api/sessions/external-cursor");
+}
+
+export function browseCodexSessions(): Promise<ExternalSessionGroup[]> {
+  return request<ExternalSessionGroup[]>("/api/sessions/external-codex");
 }
 
 export interface ExternalPreview {

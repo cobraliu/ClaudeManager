@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.config import (
+    FILE_VIEWER_MODE_BYTES,
+    FILE_VIEWER_MODE_LINES,
+    get_file_viewer_max_bytes,
+    get_file_viewer_max_lines,
+    get_file_viewer_mode,
+)
 from app.security import CurrentUser
 from app.services.session_store import SessionStore
 
@@ -126,23 +134,118 @@ def _build_tree(path: Path, root: Path, depth: int, max_depth: int) -> dict:
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
+# Limits for the cheap probe of collapsed untracked dirs in changed-files.
+# An untracked directory whose subtree exceeds EITHER threshold is treated as
+# "too large to expand" — we surface a warning + suggested .gitignore line
+# instead of feeding it through `-uall` (which would unfold thousands of
+# entries and trigger a per-file read loop below).
+_UNTRACKED_DIR_MAX_FILES = 500
+_UNTRACKED_DIR_MAX_BYTES = 50 * 1024 * 1024     # 50 MB
+
+# Per-file cap for the untracked line-count helper. Files above this size get
+# no line count reported (frontend shows "—"); this protects against a single
+# huge binary (e.g. git pack files in a bare repo) blowing up RSS via
+# full-file reads.
+_UNTRACKED_LINECOUNT_MAX_BYTES = 1 * 1024 * 1024  # 1 MB
+
+
+def _is_bare_git_repo(p: Path) -> bool:
+    """A bare git repo looks like `HEAD` + `objects/` + `refs/` at top level."""
+    try:
+        return (p / "HEAD").is_file() and (p / "objects").is_dir() and (p / "refs").is_dir()
+    except OSError:
+        return False
+
+
+def _probe_untracked_dir(root: Path, rel: str) -> dict:
+    """Walk `rel` under `root` with early stop.
+
+    Returns a dict {file_count, total_bytes, exceeded, is_bare_repo, truncated}.
+    `exceeded` is True as soon as either limit is hit; we stop walking then.
+    """
+    target = root / rel
+    is_bare = _is_bare_git_repo(target)
+    file_count = 0
+    total_bytes = 0
+    exceeded = False
+    stack: list[Path] = [target]
+    while stack and not exceeded:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for ent in it:
+                    try:
+                        if ent.is_dir(follow_symlinks=False):
+                            stack.append(Path(ent.path))
+                        elif ent.is_file(follow_symlinks=False):
+                            file_count += 1
+                            try:
+                                total_bytes += ent.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                pass
+                            if file_count >= _UNTRACKED_DIR_MAX_FILES or total_bytes >= _UNTRACKED_DIR_MAX_BYTES:
+                                exceeded = True
+                                break
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return {
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "exceeded": exceeded,
+        "is_bare_repo": is_bare,
+    }
+
+
+def _count_lines_bounded(fp: Path) -> int | None:
+    """Stream-count newlines in `fp`. Returns None if the file is over the
+    size cap (we don't even open it)."""
+    try:
+        if fp.stat().st_size > _UNTRACKED_LINECOUNT_MAX_BYTES:
+            return None
+    except OSError:
+        return None
+    try:
+        n = 0
+        with fp.open("rb") as f:
+            for _ in f:
+                n += 1
+        return n
+    except OSError:
+        return None
+
+
 @router.get("/{session_id}/code/changed-files")
-def get_changed_files(session_id: str, _user: CurrentUser) -> list[dict]:
-    """Return files changed relative to HEAD (or untracked)."""
+def get_changed_files(session_id: str, _user: CurrentUser) -> dict:
+    """Return files changed relative to HEAD (or untracked).
+
+    Response shape:
+        {
+          "files":    [{path, status, added?, removed?}, ...],
+          "warnings": [{kind, path, file_count?, approx_size_bytes?,
+                        is_bare_repo?, suggested_ignore}, ...],
+        }
+
+    Untracked DIRECTORIES are not expanded blindly. We first run
+    `git status --porcelain` (no `-uall`, so untracked dirs stay collapsed as
+    `?? path/`). For each collapsed dir we do a cheap early-stopping size
+    probe; if it exceeds the file-count or byte threshold we emit a warning
+    with a suggested `.gitignore` line and skip expansion. Small dirs get
+    re-queried with `-uall -- path` so their individual files still appear.
+    """
     store = _get_store()
     session = store.get(session_id)
     if session is None:
         raise HTTPException(status_code=404)
 
     cwd = session.cwd
-    # -uall: list every untracked file individually instead of collapsing
-    # whole untracked directories into a single "dir/" entry (default
-    # -unormal behavior).  Without this, the changes tree shows a folder
-    # with an unnamed file row underneath, and the user can't see which
-    # files inside the directory are new.
-    out = _git(cwd, "status", "--porcelain", "-uall")
+    cwd_path = Path(cwd)
+
+    # Cheap probe: -unormal collapses untracked dirs to a single `?? dir/` line.
+    out = _git(cwd, "status", "--porcelain")
     if not out:
-        return []
+        return {"files": [], "warnings": []}
 
     # Collect diff stats (tracked modified/added/deleted files only)
     numstat: dict[str, tuple[int, int]] = {}
@@ -163,7 +266,18 @@ def get_changed_files(session_id: str, _user: CurrentUser) -> list[dict]:
                 except ValueError:
                     pass
 
-    files = []
+    status_map = {
+        "M": "modified", "A": "added", "D": "deleted",
+        "R": "renamed", "C": "copied", "U": "conflict",
+        "?": "untracked",
+    }
+
+    files: list[dict] = []
+    warnings: list[dict] = []
+    # Defer expansion of safe untracked dirs to a second pass so we can issue
+    # one `git status` per dir instead of one per file.
+    safe_dirs_to_expand: list[str] = []
+
     for line in out.splitlines():
         if len(line) < 4:
             continue
@@ -173,13 +287,33 @@ def get_changed_files(session_id: str, _user: CurrentUser) -> list[dict]:
             path = path.split(" -> ")[-1]
         path = path.strip().strip('"')
 
-        status_map = {
-            "M": "modified", "A": "added", "D": "deleted",
-            "R": "renamed", "C": "copied", "U": "conflict",
-            "?": "untracked",
-        }
         status_char = xy.strip()[0] if xy.strip() else "?"
         status = status_map.get(status_char, "modified")
+
+        # Collapsed untracked directory entry: `?? codes/`
+        if status == "untracked" and path.endswith("/"):
+            rel = path.rstrip("/")
+            probe = _probe_untracked_dir(cwd_path, rel)
+            if probe["exceeded"] or probe["is_bare_repo"]:
+                kind = "bare_git_repo" if probe["is_bare_repo"] else "large_untracked_dir"
+                warnings.append({
+                    "kind": kind,
+                    "path": rel,
+                    "file_count": probe["file_count"],
+                    "approx_size_bytes": probe["total_bytes"],
+                    "is_bare_repo": probe["is_bare_repo"],
+                    "suggested_ignore": rel + "/",
+                })
+                # Surface a single placeholder entry so the user sees that the
+                # dir has changes, even though we won't enumerate them.
+                files.append({
+                    "path": path,
+                    "status": "untracked",
+                    "is_skipped_dir": True,
+                })
+                continue
+            safe_dirs_to_expand.append(rel)
+            continue
 
         entry: dict = {"path": path, "status": status}
         if path in numstat:
@@ -188,16 +322,41 @@ def get_changed_files(session_id: str, _user: CurrentUser) -> list[dict]:
             entry["removed"] = r
         elif status == "untracked":
             try:
-                fp = Path(cwd) / path
+                fp = cwd_path / path
                 if fp.is_file():
-                    line_count = len(fp.read_text(errors="replace").splitlines())
-                    entry["added"] = line_count
-                    entry["removed"] = 0
+                    lc = _count_lines_bounded(fp)
+                    if lc is not None:
+                        entry["added"] = lc
+                        entry["removed"] = 0
             except OSError:
                 pass
         files.append(entry)
 
-    return files
+    # Second pass: expand safe untracked dirs one at a time. Each call is
+    # scoped via `-- path`, so the cost is bounded by that dir's contents
+    # (already probed under the threshold).
+    for rel in safe_dirs_to_expand:
+        sub = _git(cwd, "status", "--porcelain", "--untracked-files=all", "--", rel) or ""
+        for line in sub.splitlines():
+            if len(line) < 4 or not line.startswith("?? "):
+                continue
+            p = line[3:].strip().strip('"')
+            if p.endswith("/"):
+                # Shouldn't happen under -uall, but skip defensively.
+                continue
+            entry: dict = {"path": p, "status": "untracked"}
+            try:
+                fp = cwd_path / p
+                if fp.is_file():
+                    lc = _count_lines_bounded(fp)
+                    if lc is not None:
+                        entry["added"] = lc
+                        entry["removed"] = 0
+            except OSError:
+                pass
+            files.append(entry)
+
+    return {"files": files, "warnings": warnings}
 
 
 @router.get("/{session_id}/code/file")
@@ -268,16 +427,33 @@ def get_file(
     except OSError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Total line count BEFORE truncation — caller may show "1234 lines (showing first 3000)".
+    # Admin-configurable truncation: limit by lines, by bytes, or unlimited.
+    # We always compute total_lines from the FULL file so the header can show
+    # "showing N of M".
+    mode = get_file_viewer_mode()
     all_lines = content.splitlines()
     total_lines = len(all_lines)
-    truncated = total_lines > 3000
-    # `lines` is the slice we actually render — same as `all_lines` for small
-    # files, capped at 3000 for huge ones. The untracked-file branch below
+    truncated = False
+    truncated_by: str | None = None
+    if mode == FILE_VIEWER_MODE_LINES:
+        max_lines = get_file_viewer_max_lines()
+        if total_lines > max_lines:
+            truncated = True
+            truncated_by = "lines"
+            all_lines = all_lines[:max_lines]
+            content = "\n".join(all_lines)
+    elif mode == FILE_VIEWER_MODE_BYTES:
+        max_bytes = get_file_viewer_max_bytes()
+        encoded = content.encode("utf-8", errors="replace")
+        if len(encoded) > max_bytes:
+            truncated = True
+            truncated_by = "bytes"
+            content = encoded[:max_bytes].decode("utf-8", errors="replace")
+            all_lines = content.splitlines()
+    # `lines` is the slice we actually render. The untracked-file branch below
     # references it unconditionally, so we must assign in both cases.
-    lines = all_lines[:3000] if truncated else all_lines
-    if truncated:
-        content = "\n".join(lines)
+    lines = all_lines
+    displayed_lines = len(lines)
 
     language = _EXT_LANG.get(target.suffix.lower(), "plaintext")
 
@@ -306,6 +482,8 @@ def get_file(
         "added_lines": sorted(added),
         "removed_lines": sorted(removed),
         "truncated": truncated,
+        "truncated_by": truncated_by,
+        "displayed_lines": displayed_lines,
         "diff_raw": diff_out,
         "size": st.st_size,
         "mtime": st.st_mtime,
