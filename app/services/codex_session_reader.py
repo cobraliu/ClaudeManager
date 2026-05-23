@@ -155,6 +155,7 @@ def enrich_codex_session(session_id: str, cwd: str) -> dict:
         return {}
 
     user_msgs: list[str] = []
+    user_timestamps: list[str] = []
     try:
         with open(rollout, "r", encoding="utf-8") as f:
             for line in f:
@@ -170,6 +171,9 @@ def enrich_codex_session(session_id: str, cwd: str) -> dict:
                 msg = (p.get("message") or "").strip()
                 if msg:
                     user_msgs.append(msg)
+                    ts = d.get("timestamp")
+                    if isinstance(ts, str) and ts:
+                        user_timestamps.append(ts)
     except OSError:
         return {}
 
@@ -185,7 +189,11 @@ def enrich_codex_session(session_id: str, cwd: str) -> dict:
         prompts = [user_msgs[0], user_msgs[-2], user_msgs[-1]]
     prompts = [p[:120] for p in prompts]
 
-    result = {"title": title, "prompts": prompts}
+    result = {
+        "title": title,
+        "prompts": prompts,
+        "last_user_input_at": user_timestamps[-1] if user_timestamps else None,
+    }
     with _cache_lock:
         _cache[cache_key] = (now, result)
     return result
