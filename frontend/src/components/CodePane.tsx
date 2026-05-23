@@ -1848,7 +1848,7 @@ export function FileViewerPane({ sessionId, path, viewMode: initViewMode = "full
   };
 
   return (
-    <div style={{ display: "flex", flex: 1, flexDirection: "column", minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
+    <div data-str-menu-auto style={{ display: "flex", flex: 1, flexDirection: "column", minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
       <ViewerHeader
         path={path}
         selectedChanged={selectedChanged}

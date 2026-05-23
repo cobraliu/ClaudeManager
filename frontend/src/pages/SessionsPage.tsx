@@ -382,6 +382,13 @@ function FileCentricViewerColumn(props: {
                 key={t.id}
                 ref={(el) => { tabElRefs.current[t.id] = el; }}
                 onClick={() => onActivate(t.id)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setMenuPos({ top: r.bottom + 2, right: Math.max(4, window.innerWidth - r.right) });
+                  setMenuTabId(t.id);
+                }}
                 title={titleFor(t)}
                 style={{
                   position: "relative",
@@ -580,6 +587,7 @@ function FileCentricViewerColumn(props: {
           }}
         >
           {([
+            { key: "self", label: "Close" },
             { key: "saved", label: "Close Saved" },
             { key: "others", label: "Close Others" },
             { key: "right", label: "Close to the Right" },
@@ -587,7 +595,15 @@ function FileCentricViewerColumn(props: {
           ] as const).map(item => (
             <div
               key={item.key}
-              onClick={() => requestClose(item.key, menuTabId)}
+              onClick={() => {
+                if (item.key === "self") {
+                  setMenuTabId(null);
+                  setMenuPos(null);
+                  requestSingleClose(menuTabId);
+                } else {
+                  requestClose(item.key, menuTabId);
+                }
+              }}
               style={{ padding: "5px 10px", cursor: "pointer", borderRadius: 3 }}
               onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
               onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
