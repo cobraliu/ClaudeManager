@@ -62,7 +62,8 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
     return () => { cancelled = true; clearTimeout(handle); };
   }, [sessionId, source, target]);
 
-  // Default target to main/master; leave source empty (user must pick).
+  // Default target to main/master; default source to the most-recently-
+  // committed branch other than main/master (often what the user just worked on).
   useEffect(() => {
     if (target || !branches.local.length) return;
     const def = branches.local.includes("main")
@@ -72,6 +73,23 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
         : branches.current || branches.local[0];
     setTarget(def);
   }, [target, branches]);
+
+  useEffect(() => {
+    if (source || !branches.local.length) return;
+    const dated = branches.local_with_dates ?? [];
+    const candidates = dated
+      .filter(b => b.name !== "main" && b.name !== "master")
+      .sort((a, b) => b.committerdate - a.committerdate);
+    const def = candidates[0]?.name
+      ?? branches.local.find(b => b !== "main" && b !== "master")
+      ?? "";
+    if (def) setSource(def);
+  }, [source, branches]);
+
+  const handleSwap = () => {
+    setSource(target);
+    setTarget(source);
+  };
 
   const handleStart = async () => {
     if (!source || !target) return;
@@ -144,6 +162,22 @@ export function MergeTab({ sessionId, branches, setMsg, onCompleted }: Props) {
               <option value="">— select source —</option>
               {allBranches.map(b => <option key={b} value={b}>{b}</option>)}
             </select>
+            <button
+              type="button"
+              onClick={handleSwap}
+              disabled={!source && !target}
+              title="Swap source and target"
+              style={{
+                background: "var(--bg-surface)",
+                color: "var(--text-body)",
+                border: "1px solid var(--text-faintest)",
+                borderRadius: 4,
+                padding: "2px 8px",
+                fontSize: 12,
+                cursor: source || target ? "pointer" : "default",
+                opacity: source || target ? 1 : 0.5,
+              }}
+            >⇄</button>
             <span style={{ color: "var(--text-faint)" }}>→</span>
             <label style={{ fontSize: 12, color: "var(--text-muted)" }}>Target:</label>
             <select value={target} onChange={(e) => setTarget(e.target.value)} style={selectStyle}>

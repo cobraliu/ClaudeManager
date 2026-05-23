@@ -1112,6 +1112,9 @@ export interface CommitDetail {
 export interface GitBranchInfo {
   current: string;
   local: string[];
+  /** Per-branch last-commit Unix timestamps. Aligned with `local`; backend
+   * may omit this field on older deployments (treat as absent → no recency). */
+  local_with_dates?: { name: string; committerdate: number }[];
   remote_only?: string[];
   dirty?: boolean;
 }
