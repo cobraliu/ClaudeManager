@@ -220,3 +220,54 @@ def get_term_standby_grace_seconds() -> int:
 
 def set_term_standby_grace_seconds(value: int) -> None:
     _set("term_standby_grace_seconds", str(max(5, int(value))))
+
+
+# ── File viewer truncation tuning ─────────────────────────────────────────────
+# Admin can cap how much of a file the code-viewer endpoint returns. Three modes:
+#   "unlimited" — return the entire file (use with care; huge files may OOM)
+#   "lines"     — cap by line count (default 3000)
+#   "bytes"     — cap by byte count (default 1 MiB)
+
+FILE_VIEWER_MODE_UNLIMITED = "unlimited"
+FILE_VIEWER_MODE_LINES = "lines"
+FILE_VIEWER_MODE_BYTES = "bytes"
+_FILE_VIEWER_MODES = {FILE_VIEWER_MODE_UNLIMITED, FILE_VIEWER_MODE_LINES, FILE_VIEWER_MODE_BYTES}
+_DEFAULT_FILE_VIEWER_MODE = FILE_VIEWER_MODE_LINES
+_DEFAULT_FILE_VIEWER_MAX_LINES = 3000
+_DEFAULT_FILE_VIEWER_MAX_BYTES = 1024 * 1024  # 1 MiB
+
+
+def get_file_viewer_mode() -> str:
+    raw = _get("file_viewer_mode") or _DEFAULT_FILE_VIEWER_MODE
+    return raw if raw in _FILE_VIEWER_MODES else _DEFAULT_FILE_VIEWER_MODE
+
+
+def set_file_viewer_mode(value: str) -> None:
+    v = value if value in _FILE_VIEWER_MODES else _DEFAULT_FILE_VIEWER_MODE
+    _set("file_viewer_mode", v)
+
+
+def get_file_viewer_max_lines() -> int:
+    raw = _get("file_viewer_max_lines")
+    try:
+        v = int(raw) if raw else _DEFAULT_FILE_VIEWER_MAX_LINES
+    except ValueError:
+        v = _DEFAULT_FILE_VIEWER_MAX_LINES
+    return max(100, v)
+
+
+def set_file_viewer_max_lines(value: int) -> None:
+    _set("file_viewer_max_lines", str(max(100, int(value))))
+
+
+def get_file_viewer_max_bytes() -> int:
+    raw = _get("file_viewer_max_bytes")
+    try:
+        v = int(raw) if raw else _DEFAULT_FILE_VIEWER_MAX_BYTES
+    except ValueError:
+        v = _DEFAULT_FILE_VIEWER_MAX_BYTES
+    return max(4096, v)
+
+
+def set_file_viewer_max_bytes(value: int) -> None:
+    _set("file_viewer_max_bytes", str(max(4096, int(value))))

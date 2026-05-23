@@ -205,6 +205,8 @@ export function setUserIsAdmin(username: string, is_admin: boolean): Promise<Use
 // Config
 export type ProxyMode = "tap_upstream" | "real";
 
+export type FileViewerMode = "unlimited" | "lines" | "bytes";
+
 export interface ConfigView {
   workspace: string;
   claude_bin: string;
@@ -214,6 +216,9 @@ export interface ConfigView {
   terminal_font: string;
   term_idle_grace_seconds: number;
   term_standby_grace_seconds: number;
+  file_viewer_mode: FileViewerMode;
+  file_viewer_max_lines: number;
+  file_viewer_max_bytes: number;
 }
 
 export interface FontInfo {
@@ -274,6 +279,17 @@ export function setTermLifecycle(
   return request("/api/config/term-lifecycle", {
     method: "PUT",
     body: JSON.stringify({ idle_grace_seconds, standby_grace_seconds }),
+  });
+}
+
+export function setFileViewer(
+  mode: FileViewerMode,
+  max_lines: number,
+  max_bytes: number,
+): Promise<ConfigView> {
+  return request("/api/config/file-viewer", {
+    method: "PUT",
+    body: JSON.stringify({ mode, max_lines, max_bytes }),
   });
 }
 
@@ -1272,6 +1288,8 @@ export interface FileData {
   added_lines: number[];
   removed_lines: number[];
   truncated: boolean;
+  truncated_by?: "lines" | "bytes" | null;
+  displayed_lines?: number;
   diff_raw?: string;
   is_binary?: boolean;
   size?: number;

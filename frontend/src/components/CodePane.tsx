@@ -533,7 +533,9 @@ function CodeViewer({ data, scrollToFirst, diffOnly, noDiff }: { data: FileData;
     >
       {data.truncated && (
         <div style={{ padding: "4px 12px", background: "var(--bg-deep)", color: "var(--text-secondary)", fontSize: 11, borderBottom: "1px solid var(--border)" }}>
-          File truncated to 3000 lines
+          {data.truncated_by === "bytes"
+            ? `File truncated — showing first ${(data.displayed_lines ?? 0).toLocaleString()} lines (size cap)`
+            : `File truncated — showing first ${(data.displayed_lines ?? 0).toLocaleString()} lines`}
         </div>
       )}
       <table style={{ borderCollapse: "collapse", minWidth: "100%" }}>
@@ -1084,7 +1086,7 @@ function ViewerHeader({
   const isTextFile = !!fileData && !fileData.is_binary && !showImage && !showSqlite;
   const linesText = isTextFile && fileData?.total_lines != null
     ? (fileData.truncated
-        ? `${fileData.total_lines.toLocaleString()} lines (showing first 3000)`
+        ? `${fileData.total_lines.toLocaleString()} lines (showing first ${(fileData.displayed_lines ?? 0).toLocaleString()})`
         : `${fileData.total_lines.toLocaleString()} lines`)
     : null;
   return (

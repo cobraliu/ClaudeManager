@@ -6,6 +6,13 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.config import (
+    FILE_VIEWER_MODE_BYTES,
+    FILE_VIEWER_MODE_LINES,
+    get_file_viewer_max_bytes,
+    get_file_viewer_max_lines,
+    get_file_viewer_mode,
+)
 from app.security import CurrentUser
 from app.services.session_store import SessionStore
 
@@ -268,16 +275,33 @@ def get_file(
     except OSError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Total line count BEFORE truncation — caller may show "1234 lines (showing first 3000)".
+    # Admin-configurable truncation: limit by lines, by bytes, or unlimited.
+    # We always compute total_lines from the FULL file so the header can show
+    # "showing N of M".
+    mode = get_file_viewer_mode()
     all_lines = content.splitlines()
     total_lines = len(all_lines)
-    truncated = total_lines > 3000
-    # `lines` is the slice we actually render — same as `all_lines` for small
-    # files, capped at 3000 for huge ones. The untracked-file branch below
+    truncated = False
+    truncated_by: str | None = None
+    if mode == FILE_VIEWER_MODE_LINES:
+        max_lines = get_file_viewer_max_lines()
+        if total_lines > max_lines:
+            truncated = True
+            truncated_by = "lines"
+            all_lines = all_lines[:max_lines]
+            content = "\n".join(all_lines)
+    elif mode == FILE_VIEWER_MODE_BYTES:
+        max_bytes = get_file_viewer_max_bytes()
+        encoded = content.encode("utf-8", errors="replace")
+        if len(encoded) > max_bytes:
+            truncated = True
+            truncated_by = "bytes"
+            content = encoded[:max_bytes].decode("utf-8", errors="replace")
+            all_lines = content.splitlines()
+    # `lines` is the slice we actually render. The untracked-file branch below
     # references it unconditionally, so we must assign in both cases.
-    lines = all_lines[:3000] if truncated else all_lines
-    if truncated:
-        content = "\n".join(lines)
+    lines = all_lines
+    displayed_lines = len(lines)
 
     language = _EXT_LANG.get(target.suffix.lower(), "plaintext")
 
@@ -306,6 +330,8 @@ def get_file(
         "added_lines": sorted(added),
         "removed_lines": sorted(removed),
         "truncated": truncated,
+        "truncated_by": truncated_by,
+        "displayed_lines": displayed_lines,
         "diff_raw": diff_out,
         "size": st.st_size,
         "mtime": st.st_mtime,

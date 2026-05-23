@@ -8,11 +8,17 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from app.config import (
+    FILE_VIEWER_MODE_BYTES,
+    FILE_VIEWER_MODE_LINES,
+    FILE_VIEWER_MODE_UNLIMITED,
     PROXY_MODE_REAL,
     PROXY_MODE_TAP_UPSTREAM,
     get_claude_bin,
     get_cursor_bin,
     get_default_workspace,
+    get_file_viewer_max_bytes,
+    get_file_viewer_max_lines,
+    get_file_viewer_mode,
     get_proxy,
     get_proxy_mode,
     get_term_idle_grace_seconds,
@@ -21,6 +27,9 @@ from app.config import (
     set_claude_bin,
     set_cursor_bin,
     set_default_workspace,
+    set_file_viewer_max_bytes,
+    set_file_viewer_max_lines,
+    set_file_viewer_mode,
     set_proxy,
     set_proxy_mode,
     set_term_idle_grace_seconds,
@@ -44,6 +53,15 @@ class ConfigView(BaseModel):
     terminal_font: str
     term_idle_grace_seconds: int = 600
     term_standby_grace_seconds: int = 30
+    file_viewer_mode: str = FILE_VIEWER_MODE_LINES  # "unlimited" | "lines" | "bytes"
+    file_viewer_max_lines: int = 3000
+    file_viewer_max_bytes: int = 1024 * 1024
+
+
+class FileViewerRequest(BaseModel):
+    mode: str = Field(..., description="unlimited | lines | bytes")
+    max_lines: int = Field(default=3000, ge=100, le=1_000_000)
+    max_bytes: int = Field(default=1024 * 1024, ge=4096, le=1024 * 1024 * 1024)
 
 
 class WorkspaceUpdateRequest(BaseModel):
@@ -84,6 +102,9 @@ def _full_config() -> ConfigView:
         terminal_font=get_terminal_font(),
         term_idle_grace_seconds=get_term_idle_grace_seconds(),
         term_standby_grace_seconds=get_term_standby_grace_seconds(),
+        file_viewer_mode=get_file_viewer_mode(),
+        file_viewer_max_lines=get_file_viewer_max_lines(),
+        file_viewer_max_bytes=get_file_viewer_max_bytes(),
     )
 
 
@@ -175,6 +196,18 @@ def update_terminal_font(body: TerminalFontRequest, _admin: AdminUser) -> Config
 def update_term_lifecycle(body: TermLifecycleRequest, _admin: AdminUser) -> ConfigView:
     set_term_idle_grace_seconds(body.idle_grace_seconds)
     set_term_standby_grace_seconds(body.standby_grace_seconds)
+    return _full_config()
+
+
+@router.put("/file-viewer")
+def update_file_viewer(body: FileViewerRequest, _admin: AdminUser) -> ConfigView:
+    mode = body.mode.strip()
+    if mode not in (FILE_VIEWER_MODE_UNLIMITED, FILE_VIEWER_MODE_LINES, FILE_VIEWER_MODE_BYTES):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"invalid file_viewer mode: {mode}")
+    set_file_viewer_mode(mode)
+    set_file_viewer_max_lines(body.max_lines)
+    set_file_viewer_max_bytes(body.max_bytes)
     return _full_config()
 
 
