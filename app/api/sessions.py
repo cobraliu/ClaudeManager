@@ -1226,7 +1226,7 @@ def post_codex_message(
 
 
 class CodexAuqResolveRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=10_000)
+    answers: dict[str, list[str]] = Field(default_factory=dict)
 
 
 @router.post("/{session_id}/codex-auq")
@@ -1237,7 +1237,7 @@ def post_codex_auq_resolve(
     _require_codex_appserver(session_id, user_id)
     from app.services import codex_appserver_manager as csm
     try:
-        csm.resolve_auq(session_id, body.text)
+        csm.resolve_auq(session_id, body.answers)
     except KeyError:
         raise HTTPException(status_code=409, detail="no pending AUQ for this session")
     return {"ok": True}

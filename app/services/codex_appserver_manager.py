@@ -382,8 +382,19 @@ def resolve_approval(
     _runner.submit(_send_response(), timeout=5.0)
 
 
-def resolve_auq(session_id: str, text: str) -> None:
-    """Respond to a pending tool/requestUserInput ServerRequest with text."""
+def resolve_auq(session_id: str, answers: dict[str, list[str]]) -> None:
+    """Respond to a pending tool/requestUserInput ServerRequest.
+
+    `answers` is keyed by `question.id` (from the original request's
+    `params.questions[].id`). Each value is the list of selected/typed
+    strings for that question.
+
+    Codex's ToolRequestUserInputResponse shape is:
+        {"answers": {<qid>: {"answers": [<str>, ...]}, ...}}
+    — a dict of question ids to a wrapper object whose `answers` is a
+    string array. Sending the wrong shape causes codex to parse `answers`
+    as `{}` and report empty answers to the model.
+    """
     with _state_lock:
         state = _sessions.get(session_id)
         pending = state.pending_auq if state is not None else None
@@ -392,9 +403,17 @@ def resolve_auq(session_id: str, text: str) -> None:
     if state is None or pending is None:
         raise KeyError(f"no pending AUQ for {session_id}")
 
+    payload = {
+        "answers": {
+            qid: {"answers": [s for s in (vals or []) if isinstance(s, str)]}
+            for qid, vals in (answers or {}).items()
+            if isinstance(qid, str)
+        }
+    }
+
     async def _send_response() -> None:
         await state.client._write_line(  # noqa: SLF001
-            {"jsonrpc": "2.0", "id": pending.request_id, "result": {"text": text}}
+            {"jsonrpc": "2.0", "id": pending.request_id, "result": payload}
         )
 
     _runner.submit(_send_response(), timeout=5.0)

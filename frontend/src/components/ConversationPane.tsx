@@ -1126,7 +1126,7 @@ function AskUserQuestionDisplay({ questions, answer }: {
 // ── AskUserQuestion interactive block ────────────────────────────────────────
 
 interface AskOption { label: string; description?: string; preview?: string }
-interface AskQuestion { header?: string; question: string; multiSelect?: boolean; options: AskOption[] }
+interface AskQuestion { id?: string; header?: string; question: string; multiSelect?: boolean; options: AskOption[] }
 
 // Persist dismissed block IDs in sessionStorage so page refreshes don't re-show
 // answered questions while Claude Code is still processing the response.
@@ -3518,8 +3518,10 @@ interface PendingAuqData {
   multiSelect?: boolean;
   allowFreeform?: boolean;
   options?: { label: string; description?: string }[];
-  // Hook format (raw tool_input from Claude Code)
+  // Hook format (raw tool_input from Claude Code) + codex request_user_input
+  // (codex sets `id` per question; Claude's hook does not).
   questions?: Array<{
+    id?: string;
     question: string;
     options?: Array<string | { label?: string; value?: string; description?: string; preview?: string }>;
     multiSelect?: boolean;
@@ -3527,43 +3529,49 @@ interface PendingAuqData {
   }>;
 }
 
-function formatCodexAuqAnswer(answers: unknown[], questions: AskQuestion[]): string {
-  // codex.request_user_input replies are a single text string. Map our
-  // structured answer-per-question array into a human-readable line per
-  // question. Single question → just the answer; multi-question → "Q: A".
-  const parts: string[] = [];
-  for (let i = 0; i < answers.length; i++) {
-    const a = answers[i];
+function extractCodexAuqAnswers(
+  answers: unknown[],
+  questions: AskQuestion[],
+): Record<string, string[]> {
+  // codex's ToolRequestUserInputResponse is keyed by question.id, value is
+  // a string array of selected labels / typed text. AskUserQuestionBlock's
+  // buildAnswer produces either a plain string (single-select) or an array
+  // of {type, click?, value?} items (multi-select). Convert each per-question
+  // entry into the string[] codex expects.
+  const out: Record<string, string[]> = {};
+  for (let i = 0; i < questions.length; i++) {
     const q = questions[i];
-    let text = "";
+    if (!q.id) continue;  // codex always sets question.id; skip if missing
+    const a = answers[i];
+    const picks: string[] = [];
     if (typeof a === "string") {
-      text = a;
+      if (a) picks.push(a);
     } else if (Array.isArray(a)) {
-      const picks: string[] = [];
-      for (let j = 0; j < a.length; j++) {
-        const item = a[j] as { type?: string; click?: boolean; value?: string };
-        if (item?.type === "option" && item?.click && q?.options[j]) {
-          picks.push(q.options[j].label);
-        } else if (item?.type === "type_something" && typeof item.value === "string" && item.value.trim()) {
-          picks.push(item.value.trim());
+      let optIdx = 0;
+      for (const raw of a as Array<{ type?: string; click?: boolean; value?: string }>) {
+        if (raw?.type === "option") {
+          if (raw.click && q.options[optIdx]) picks.push(q.options[optIdx].label);
+          optIdx++;
+        } else if (
+          raw?.type === "type_something" &&
+          typeof raw.value === "string" &&
+          raw.value.trim()
+        ) {
+          picks.push(raw.value.trim());
         }
       }
-      text = picks.join(", ");
     } else if (a != null) {
-      text = String(a);
+      picks.push(String(a));
     }
-    if (questions.length > 1 && q?.question) {
-      parts.push(`${q.question}: ${text}`);
-    } else {
-      parts.push(text);
-    }
+    out[q.id] = picks;
   }
-  return parts.join("\n");
+  return out;
 }
 
 function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
   if (data.questions && data.questions.length > 0) {
     return data.questions.map(q => ({
+      id: (q as { id?: string }).id,
       question: q.question ?? "",
       header: q.header,
       multiSelect: q.multiSelect,
@@ -4647,10 +4655,11 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
             questions={stickyAuq.questions}
             onSubmitAnswers={(answers) => {
               if (isCodexAppServer) {
-                // codex's request_user_input ServerRequest expects {text}; flatten
-                // the structured answers into a single string the model can read.
-                const text = formatCodexAuqAnswer(answers, stickyAuq.questions);
-                resolveCodexAuq(sessionId, text).catch((err) => {
+                // codex expects {answers: {<qid>: {answers: [<str>, ...]}}};
+                // collapse our per-question structured answers into the
+                // string-array shape keyed by question.id.
+                const byId = extractCodexAuqAnswers(answers, stickyAuq.questions);
+                resolveCodexAuq(sessionId, byId).catch((err) => {
                   console.error("codex AUQ resolve failed", err);
                 });
               } else {

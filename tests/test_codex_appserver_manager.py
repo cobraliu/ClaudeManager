@@ -312,24 +312,58 @@ def _ask_fake_to_send_server_request_async(
 def test_auq_server_request_is_cached_without_responding():
     mgr.start("s1", cwd=os.getcwd())
     try:
+        params = {
+            "questions": [
+                {"id": "name", "header": "Identity", "question": "Your name?"},
+            ],
+        }
         fut = _ask_fake_to_send_server_request_async(
-            "s1", "item/tool/requestUserInput", {"prompt": "your name?"}
+            "s1", "item/tool/requestUserInput", params
         )
         # Cache should populate quickly
         assert _wait_until(lambda: mgr.get_pending_auq("s1") is not None)
         auq = mgr.get_pending_auq("s1")
         assert auq is not None
         assert auq["method"] == "item/tool/requestUserInput"
-        assert auq["params"] == {"prompt": "your name?"}
+        assert auq["params"] == params
         # The fake's send_server_request future should NOT be done yet —
         # we never replied.
         assert not fut.done()
-        # Resolve and verify the fake receives our reply
-        mgr.resolve_auq("s1", "Codex")
+        # Resolve and verify the fake receives our reply in codex's expected
+        # shape: {answers: {<qid>: {answers: [<str>...]}}}.
+        mgr.resolve_auq("s1", {"name": ["Codex"]})
         roundtrip = fut.result(timeout=3.0)
-        assert roundtrip["client_reply"] == {"text": "Codex"}
+        assert roundtrip["client_reply"] == {
+            "answers": {"name": {"answers": ["Codex"]}}
+        }
         # After resolve, pending cleared
         assert mgr.get_pending_auq("s1") is None
+    finally:
+        mgr.stop("s1")
+
+
+def test_resolve_auq_filters_non_string_entries():
+    """Defensive: only string answers per question survive; bogus keys/values
+    are dropped so we never send malformed JSON to codex."""
+    mgr.start("s1", cwd=os.getcwd())
+    try:
+        fut = _ask_fake_to_send_server_request_async(
+            "s1",
+            "item/tool/requestUserInput",
+            {"questions": [{"id": "q1", "header": "h", "question": "q?"}]},
+        )
+        assert _wait_until(lambda: mgr.get_pending_auq("s1") is not None)
+        mgr.resolve_auq(
+            "s1",
+            {
+                "q1": ["yes", 42, None, "also"],  # type: ignore[list-item]
+                123: ["nope"],  # type: ignore[dict-item]
+            },
+        )
+        roundtrip = fut.result(timeout=3.0)
+        assert roundtrip["client_reply"] == {
+            "answers": {"q1": {"answers": ["yes", "also"]}}
+        }
     finally:
         mgr.stop("s1")
 
