@@ -180,10 +180,24 @@ def start(
             if model:
                 ts_params["model"] = model
             resp = await client.send_request("thread/start", ts_params, timeout=15.0)
+            # codex 0.130.0 returns {thread: {id, sessionId, ...}, model, ...}.
+            # Older shapes (top-level threadId) are still tolerated as fallbacks.
+            tid: str | None = None
             if isinstance(resp, dict):
-                tid = resp.get("threadId") or resp.get("thread_id")
-                if isinstance(tid, str):
-                    state.thread_id = tid
+                thread = resp.get("thread")
+                if isinstance(thread, dict):
+                    cand = thread.get("id") or thread.get("sessionId")
+                    if isinstance(cand, str):
+                        tid = cand
+                if tid is None:
+                    cand = resp.get("threadId") or resp.get("thread_id")
+                    if isinstance(cand, str):
+                        tid = cand
+            if tid is None:
+                raise RuntimeError(
+                    f"codex thread/start response missing thread id: {resp!r}"
+                )
+            state.thread_id = tid
         except Exception:
             logger.exception(
                 "codex app-server: thread/start failed for session %s", session_id
