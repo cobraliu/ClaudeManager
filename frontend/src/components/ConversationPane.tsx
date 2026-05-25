@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMe
 import { createPortal } from "react-dom";
 import hljs from "highlight.js/lib/common";
 import { marked, renderMarkdown } from "../lib/markdown";
-import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
+import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
 
 const POLL_MS = 1500;
@@ -1491,13 +1491,27 @@ function _planPersist(set: Set<string>) {
 }
 const _dismissedPlan = _planLoadDismissed();
 
-function PlanHistoryBlock({ planText, approved, feedback }: {
+function PlanHistoryBlock({ planText, planPath, approved, feedback }: {
   planText?: string;
+  planPath?: string;
   approved: boolean;
   feedback?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const hasPlan = !!planText;
+  const [fetched, setFetched] = useState<string | undefined>(undefined);
+  // If the tool input didn't carry plan text, lazy-fetch from disk via the
+  // file path captured when Claude wrote the plan. Fetch on first expand so
+  // collapsed history rows don't fan out N requests.
+  useEffect(() => {
+    if (planText || fetched || !planPath || !expanded) return;
+    let cancelled = false;
+    readClaudePlan(planPath)
+      .then(r => { if (!cancelled) setFetched(r.content); })
+      .catch(() => { if (!cancelled) setFetched(""); });
+    return () => { cancelled = true; };
+  }, [planText, planPath, expanded, fetched]);
+  const body = planText ?? fetched;
+  const hasPlan = !!planText || !!planPath;
 
   return (
     <div style={{ margin: "2px 16px", border: `1px solid ${approved ? "#166534" : "#7f1d1d"}`, borderRadius: 8, overflow: "hidden", background: "var(--bg-surface)" }}>
@@ -1516,12 +1530,18 @@ function PlanHistoryBlock({ planText, approved, feedback }: {
         {feedback && <span style={{ fontSize: 11, color: "var(--text-muted)", fontStyle: "italic", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 200 }}>{feedback}</span>}
         {hasPlan && <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{expanded ? "▲" : "▼"}</span>}
       </button>
-      {expanded && planText && (
-        <div
-          className="conv-markdown"
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(planText) }}
-          style={{ padding: "12px 16px", maxHeight: "55vh", overflowY: "auto", fontSize: 13, lineHeight: 1.65, borderTop: `1px solid ${approved ? "#166534" : "#7f1d1d"}` }}
-        />
+      {expanded && (
+        body ? (
+          <div
+            className="conv-markdown"
+            dangerouslySetInnerHTML={{ __html: renderMarkdown(body) }}
+            style={{ padding: "12px 16px", maxHeight: "55vh", overflowY: "auto", fontSize: 13, lineHeight: 1.65, borderTop: `1px solid ${approved ? "#166534" : "#7f1d1d"}` }}
+          />
+        ) : (
+          <div style={{ padding: "10px 16px", fontSize: 12, color: "var(--text-muted)", fontStyle: "italic", borderTop: `1px solid ${approved ? "#166534" : "#7f1d1d"}` }}>
+            {planPath ? "Loading plan…" : "Plan body unavailable"}
+          </div>
+        )
       )}
     </div>
   );
@@ -1615,15 +1635,35 @@ function ToolApprovalBlock({ sessionId, toolName, toolInput, onDone }: {
   );
 }
 
-function PlanApprovalBlock({ blockId, planText, onSubmit }: {
+function PlanApprovalBlock({ blockId, planText, planPath, onSubmit }: {
   blockId: string;
   planText?: string;
+  planPath?: string;
   onSubmit: (text: string) => void;
 }) {
   const [dismissed, setDismissed] = useState(false);
   type Mode = "normal" | "edit" | "reject";
   const [mode, setMode] = useState<Mode>("normal");
+  const [fetched, setFetched] = useState<string | undefined>(undefined);
+  const [fetchError, setFetchError] = useState<string | undefined>(undefined);
+  // Fetch the plan body from disk when the tool input lacks it. This is the
+  // common case now — ExitPlanMode no longer ships the plan text in its
+  // arguments; the file path is the only handle.
+  useEffect(() => {
+    if (planText || fetched || !planPath) return;
+    let cancelled = false;
+    readClaudePlan(planPath)
+      .then(r => { if (!cancelled) setFetched(r.content); })
+      .catch(e => { if (!cancelled) setFetchError(String(e?.message ?? e)); });
+    return () => { cancelled = true; };
+  }, [planText, planPath, fetched]);
+  const body = planText ?? fetched;
   const [editedPlan, setEditedPlan] = useState(planText ?? "");
+  // Once the fetch resolves, seed the edit textarea with the real plan so
+  // "Edit → Approve" doesn't silently send an empty string upstream.
+  useEffect(() => {
+    if (!editedPlan && body) setEditedPlan(body);
+  }, [body, editedPlan]);
   const [feedback, setFeedback] = useState("");
 
   if (dismissed || _dismissedPlan.has(blockId)) return null;
@@ -1647,13 +1687,24 @@ function PlanApprovalBlock({ blockId, planText, onSubmit }: {
         <span style={{ fontWeight: 600, fontSize: 13, color: "#c4b5fd" }}>Plan ready for approval</span>
         <span style={{ fontSize: 10, color: "#6d28d9", marginLeft: "auto", fontFamily: "monospace" }}>ExitPlanMode</span>
       </div>
-      {/* Plan content (only show if planText is provided and not in edit mode) */}
-      {planText && mode !== "edit" && (
+      {/* Plan content (rendered when not in edit mode). The body resolves
+          from the tool input (legacy) or, when absent, from the on-disk plan
+          file fetched via planPath. */}
+      {body && mode !== "edit" && (
         <div
           className="conv-markdown"
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(planText) }}
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(body) }}
           style={{ padding: "12px 16px", maxHeight: "55vh", overflowY: "auto", fontSize: 13, lineHeight: 1.65, borderBottom: "1px solid #2a1f3d" }}
         />
+      )}
+      {!body && mode !== "edit" && (
+        <div style={{ padding: "10px 14px", fontSize: 12, color: "var(--text-muted)", fontStyle: "italic", borderBottom: "1px solid #2a1f3d" }}>
+          {fetchError
+            ? `Could not load plan file: ${fetchError}`
+            : planPath
+              ? "Loading plan…"
+              : "Plan body not available — approve to view via tool result"}
+        </div>
       )}
       {/* Edit mode: editable textarea */}
       {mode === "edit" && (
@@ -1693,7 +1744,7 @@ function PlanApprovalBlock({ blockId, planText, onSubmit }: {
         {mode === "normal" && (
           <>
             <button onClick={() => setMode("reject")} style={{ ...baseBtn, background: "#3a1a1a", color: "#f87171", borderColor: "#7f1d1d" }}>Reject</button>
-            {planText && <button onClick={() => setMode("edit")} style={{ ...baseBtn, background: "#1e0f44", color: "#c4b5fd", borderColor: "#4c1d95" }}>Edit</button>}
+            {body && <button onClick={() => setMode("edit")} style={{ ...baseBtn, background: "#1e0f44", color: "#c4b5fd", borderColor: "#4c1d95" }}>Edit</button>}
             <button onClick={() => dismiss("Approved")} style={{ ...baseBtn, background: "#1a3a1a", color: "#4ade80", borderColor: "#166534" }}>Approve ✓</button>
           </>
         )}
@@ -3207,6 +3258,7 @@ function MessageEntry({
   chatOnly = false,
   hideAuqDisplay = false,
   hideExitPlanBlock = false,
+  planPathByExitBlockId,
   onRewindMessage,
 }: {
   entry: RawMessage;
@@ -3220,6 +3272,7 @@ function MessageEntry({
   chatOnly?: boolean;
   hideAuqDisplay?: boolean;
   hideExitPlanBlock?: boolean;
+  planPathByExitBlockId?: Map<string, string>;
   onRewindMessage?: (uuid: string) => void;
 }) {
   // compact_boundary system entry
@@ -3413,8 +3466,9 @@ function MessageEntry({
             const approved = !result.content.toLowerCase().includes("reject");
             const planInput = (b.input as Record<string, unknown>) || {};
             const planText = planInput.plan ? String(planInput.plan) : undefined;
+            const planPath = b.id ? planPathByExitBlockId?.get(b.id) : undefined;
             const feedback = !approved ? result.content.trim() : undefined;
-            segments.push(<PlanHistoryBlock key={i} planText={planText} approved={approved} feedback={feedback} />);
+            segments.push(<PlanHistoryBlock key={i} planText={planText} planPath={planPath} approved={approved} feedback={feedback} />);
           } else if (!hideExitPlanBlock) {
             // Pending and we're NOT already showing PlanApprovalBlock below — show a neutral indicator
             segments.push(
@@ -3773,6 +3827,31 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
       const text = getTextFromContent(m.message.content as RawContentBlock[] | string);
       if (isCompactSummaryText(text)) {
         map.set(m.parentUuid, text);
+      }
+    }
+    return map;
+  }, [messages]);
+
+  // Pair each ExitPlanMode tool_use with the most recent Write/Edit to a
+  // `.claude/plans/*.md` file (the plan body the user is about to approve).
+  // The current ExitPlanMode tool no longer carries the plan text in its
+  // input — the body lives only on disk — so we look it up by file path.
+  const planPathByExitBlockId = useMemo(() => {
+    const map = new Map<string, string>();
+    const PLAN_PATH_RE = /\/\.claude\/plans\/[^/]+\.md$/;
+    let lastPlanPath: string | undefined;
+    for (const m of messages) {
+      if (m.type !== "assistant" || !m.message) continue;
+      const content = m.message.content as RawContentBlock[] | string;
+      if (typeof content === "string") continue;
+      for (const b of content) {
+        if (b.type !== "tool_use") continue;
+        if (b.name === "Write" || b.name === "Edit" || b.name === "MultiEdit") {
+          const fp = String((b.input as Record<string, unknown>)?.file_path ?? "");
+          if (PLAN_PATH_RE.test(fp)) lastPlanPath = fp;
+        } else if (b.name === "ExitPlanMode" && b.id && lastPlanPath) {
+          map.set(b.id, lastPlanPath);
+        }
       }
     }
     return map;
@@ -4394,6 +4473,7 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
                         subagentsByDesc={subagentsByDesc}
                         chatOnly={chatOnly}
                         hideAuqDisplay
+                        planPathByExitBlockId={planPathByExitBlockId}
                         onRewindMessage={handleRewindMessage}
                       />
                     );
@@ -4405,6 +4485,7 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
                 if (exitPlanBlock && !chatOnly) {
                   const planInput = (exitPlanBlock.input as Record<string, unknown>) || {};
                   const planText = planInput.plan ? String(planInput.plan) : undefined;
+                  const planPath = exitPlanBlock.id ? planPathByExitBlockId.get(exitPlanBlock.id) : undefined;
                   return (
                     <React.Fragment key={uid}>
                       {/* hideExitPlanBlock=true: PlanApprovalBlock below handles the UI */}
@@ -4418,11 +4499,13 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
                         subagentsByDesc={subagentsByDesc}
                         chatOnly={chatOnly}
                         hideExitPlanBlock
+                        planPathByExitBlockId={planPathByExitBlockId}
                         onRewindMessage={handleRewindMessage}
                       />
                       <PlanApprovalBlock
                         blockId={exitPlanBlock.id!}
                         planText={planText}
+                        planPath={planPath}
                         onSubmit={sendAnswer}
                       />
                     </React.Fragment>
@@ -4444,6 +4527,7 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
                         sessionId={sessionId}
                         subagentsByDesc={subagentsByDesc}
                         chatOnly={chatOnly}
+                        planPathByExitBlockId={planPathByExitBlockId}
                         onRewindMessage={handleRewindMessage}
                       />
                       <QAReplyBlock
@@ -4466,6 +4550,7 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
                   sessionId={sessionId}
                   subagentsByDesc={subagentsByDesc}
                   chatOnly={chatOnly}
+                  planPathByExitBlockId={planPathByExitBlockId}
                   onRewindMessage={handleRewindMessage}
                 />
               );

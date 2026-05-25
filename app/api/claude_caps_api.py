@@ -423,6 +423,40 @@ def get_version_content(
     return {"content": content}
 
 
+@router.get("/plan")
+def read_plan(
+    path: str = Query(..., max_length=512),
+    _user: CurrentUser = None,  # type: ignore[assignment]
+) -> dict:
+    """Read a Claude plan file from ~/.claude/plans/*.md.
+
+    Used by the chat-mode plan-approval UI so the user can see the plan body
+    BEFORE clicking Approve. The current ExitPlanMode tool input no longer
+    carries the plan text (it's only on disk), so the frontend grabs the
+    Write tool's file_path and fetches via this endpoint.
+    """
+    plans_root = (_GLOBAL_ROOT / "plans").resolve()
+    try:
+        target = Path(path).resolve()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, f"invalid path: {exc}") from exc
+    try:
+        target.relative_to(plans_root)
+    except ValueError as exc:
+        raise HTTPException(403, "path outside plans directory") from exc
+    if target.suffix != ".md":
+        raise HTTPException(415, "must be a .md file")
+    if not target.is_file():
+        raise HTTPException(404, "plan file not found")
+    if target.stat().st_size > 512 * 1024:
+        raise HTTPException(413, "plan file too large (>512KB)")
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return {"path": str(target), "content": content}
+
+
 @router.post("/rollback", status_code=204)
 def rollback_version(body: RollbackRequest, _user: CurrentUser = None) -> None:  # type: ignore[assignment]
     hist = _history_dir(body.scope, body.cwd, body.relpath)
