@@ -231,9 +231,10 @@ def test_resume_falls_back_to_start_when_no_rollout(monkeypatch):
 
 
 def test_thread_start_sends_sandbox_and_approval_overrides(monkeypatch):
-    """start() must pin sandbox=workspace-write + approvalPolicy=on-request on
-    fresh threads. Without this, codex's compiled-in default falls to read-only
-    in any untrusted cwd, which silently hangs request_user_input turns."""
+    """start() must pin sandbox=danger-full-access + approvalPolicy=never on
+    fresh threads (parity with Claude TUI --dangerously-skip-permissions).
+    Without these overrides, codex's compiled-in default falls back to
+    read-only and gates shell-redirect writes behind an approval prompt."""
     real_send = CodexAppServerClient.send_request
     captured: dict[str, dict] = {}
 
@@ -250,17 +251,18 @@ def test_thread_start_sends_sandbox_and_approval_overrides(monkeypatch):
     mgr.start("s1", cwd=os.getcwd())
     try:
         params = captured["thread/start"]
-        assert params["sandbox"] == "workspace-write"
-        assert params["approvalPolicy"] == "on-request"
+        assert params["sandbox"] == "danger-full-access"
+        assert params["approvalPolicy"] == "never"
         assert params["cwd"] == os.getcwd()
     finally:
         mgr.stop("s1")
 
 
 def test_thread_resume_sends_sandbox_and_approval_overrides(monkeypatch):
-    """thread/resume must also pin sandbox/approvalPolicy — codex applies the
-    same trust-based default at resume time, so a stale read-only would still
-    bite when the user returns to an existing session."""
+    """thread/resume must also pin sandbox/approvalPolicy — codex re-applies
+    the trust-based default at resume time, so without overrides a session
+    that started in dangerous mode would silently drop to read-only on the
+    next backend restart."""
     real_send = CodexAppServerClient.send_request
     captured: dict[str, dict] = {}
 
@@ -278,8 +280,8 @@ def test_thread_resume_sends_sandbox_and_approval_overrides(monkeypatch):
     try:
         params = captured["thread/resume"]
         assert params["threadId"] == "prior-tid"
-        assert params["sandbox"] == "workspace-write"
-        assert params["approvalPolicy"] == "on-request"
+        assert params["sandbox"] == "danger-full-access"
+        assert params["approvalPolicy"] == "never"
     finally:
         mgr.stop("s1")
 

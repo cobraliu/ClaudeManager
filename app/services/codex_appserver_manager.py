@@ -607,21 +607,21 @@ def _intercept_server_requests(session_id: str, state: _SessionState) -> None:
 def _default_thread_overrides() -> dict[str, Any]:
     """Force `sandbox` + `approvalPolicy` on every thread/start and thread/resume.
 
-    codex's compiled-in defaults pick `read-only` for any cwd that isn't in
-    `~/.codex/config.toml`'s `projects.*.trust_level = "trusted"` list. With
-    `read-only` we observe a 175s silent hang on tool-use turns (the model
-    receives a degraded tool catalog and never emits a function_call). The
-    ClaudeManager UI also has no way to surface a sandbox-escape prompt, so a
-    silent denial is the worst possible UX.
+    Mirrors Claude TUI's `--dangerously-skip-permissions`: full filesystem
+    access, no approval prompts. The user opted into trust by creating a
+    ClaudeManager session against this cwd; per-command approval is friction.
 
-    Behavior we want: same as `codex` TUI in a trusted directory — read+write
-    inside cwd, approval prompt for anything that needs escalation. The user
-    already opted into this directory by creating the ClaudeManager session
-    against it, so we treat that as authorization.
+    Why not `workspace-write` + `on-request`: codex's `workspace-write` only
+    covers its built-in apply_patch / write_file tools. Shell redirection
+    (e.g. `cat > docs/PRD.md`) trips the command-execution sandbox and
+    triggers an approval ServerRequest even for paths inside cwd.
+
+    AUQ (request_user_input) is unaffected — that's a separate channel for
+    the model to ask the user something, not a sandbox escalation prompt.
     """
     return {
-        "sandbox": "workspace-write",
-        "approvalPolicy": "on-request",
+        "sandbox": "danger-full-access",
+        "approvalPolicy": "never",
     }
 
 
