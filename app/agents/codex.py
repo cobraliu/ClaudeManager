@@ -133,7 +133,7 @@ class CodexAdapter:
             return WaitingState(
                 kind="approve",
                 hint=f"Codex: {approval['method']}",
-                raw=approval,
+                raw=_codex_approval_to_tui_shape(approval),
             )
         auq = csm.get_pending_auq(session_id)
         if auq is not None:
@@ -154,6 +154,28 @@ class CodexAdapter:
 
     def list_models(self) -> list[dict[str, Any]]:
         return CODEX_MODELS
+
+
+def _codex_approval_to_tui_shape(approval: dict) -> dict:
+    """Map a codex approval ServerRequest to the {tool_name, tool_input} shape
+    the ToolApprovalBlock widget expects (same as Claude hook output).
+
+    Codex methods come in several flavors; we lower the full method into a
+    short tool_name and surface the params dict as tool_input verbatim. If
+    params is missing we substitute {} so Object.values never sees undefined.
+    """
+    method = str(approval.get("method") or "")
+    params = approval.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    tool_name = {
+        "item/commandExecution/requestApproval": "Bash",
+        "item/fileChange/requestApproval": "Edit",
+        "item/permissions/requestApproval": "Permission",
+        "execCommandApproval": "Bash",
+        "applyPatchApproval": "Edit",
+    }.get(method, method.rsplit("/", 1)[-1] or "Tool")
+    return {"tool_name": tool_name, "tool_input": params}
 
 
 _INSTANCE: CodexAdapter | None = None
