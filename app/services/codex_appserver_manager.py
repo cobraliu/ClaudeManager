@@ -315,7 +315,9 @@ def send_user_message(
         state = _sessions.get(session_id)
     if state is None:
         raise KeyError(session_id)
-    params: dict = {"items": [{"type": "text", "text": text}]}
+    # codex 0.130.0 turn/start expects `input` (list of content items); older
+    # versions used `items`. threadId is required.
+    params: dict = {"input": [{"type": "text", "text": text}]}
     if state.thread_id:
         params["threadId"] = state.thread_id
     return _runner.submit(
