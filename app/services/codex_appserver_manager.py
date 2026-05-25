@@ -149,7 +149,17 @@ def start(
         # notification that may arrive interleaved with the initialize reply.
         _attach_handlers(session_id, state)
         try:
-            await client.send_request("initialize", {}, timeout=10.0)
+            await client.send_request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "ClaudeManager",
+                        "title": "ClaudeManager",
+                        "version": "0.1.0",
+                    },
+                },
+                timeout=10.0,
+            )
         except Exception:
             logger.exception(
                 "codex app-server: initialize failed for session %s", session_id
