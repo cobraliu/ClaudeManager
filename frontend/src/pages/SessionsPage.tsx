@@ -51,6 +51,7 @@ import { downloadConversationHtml } from "../lib/exportChat";
 import { SessionSideDock } from "../components/SessionSideDock";
 import { UserConfigModal } from "../components/UserConfigModal";
 import { EmbeddedTerminalPanel } from "../components/EmbeddedTerminalPanel";
+import CodexChatInput from "../components/CodexChatInput";
 import { TextSelectionMenu } from "../components/TextSelectionMenu";
 import { AsciiflowModal } from "../components/AsciiflowModal";
 import { useUserConfig, type LayoutScheme } from "../hooks/useUserConfig";
@@ -705,7 +706,7 @@ function NewSessionModal({
 }: {
   workspaceBase: string;
   loading: boolean;
-  onSubmit: (p: { project: string; cwd?: string; git_repo_url?: string; tool: "claude" | "cursor" | "codex" }) => void;
+  onSubmit: (p: { project: string; cwd?: string; git_repo_url?: string; tool: "claude" | "cursor" | "codex"; codex_transport?: "tui" | "app_server" }) => void;
   onClose: () => void;
 }) {
   // Always read username from the current JWT to stay in sync with actual token
@@ -714,6 +715,7 @@ function NewSessionModal({
 
   const [project, setProject] = useState("");
   const [tool, setTool] = useState<"claude" | "cursor" | "codex">("claude");
+  const [codexTransport, setCodexTransport] = useState<"tui" | "app_server">("tui");
 
   // suffix is the editable part after the fixed prefix
   const [suffix, setSuffix] = useState("");
@@ -819,6 +821,39 @@ function NewSessionModal({
             ))}
           </div>
         </div>
+        {tool === "codex" && (
+          <div>
+            <label style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+              Transport
+            </label>
+            <div style={{ display: "flex", gap: 6 }}>
+              {(["tui", "app_server"] as const).map((k) => (
+                <button
+                  key={k}
+                  onClick={() => setCodexTransport(k)}
+                  style={{
+                    flex: 1,
+                    padding: "5px 8px",
+                    fontSize: 12,
+                    borderRadius: 5,
+                    border: "1px solid " + (codexTransport === k ? "var(--accent-blue)" : "var(--border)"),
+                    background: codexTransport === k ? "rgba(88,166,255,0.15)" : "var(--bg-main)",
+                    color: codexTransport === k ? "var(--text-body)" : "var(--text-secondary)",
+                    fontWeight: codexTransport === k ? 600 : 400,
+                    cursor: "pointer",
+                  }}
+                >
+                  {k === "tui" ? "TUI (default)" : "App-server (experimental)"}
+                </button>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 4 }}>
+              {codexTransport === "tui"
+                ? "Interactive terminal — full chat + paste support."
+                : "Programmatic JSON-RPC — chat in the app, live AUQ/approval state. No xterm UI."}
+            </div>
+          </div>
+        )}
         <div>
           <label style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
             Working Directory
@@ -936,7 +971,13 @@ function NewSessionModal({
           <button
             disabled={loading || extracting || !project.trim() || (!!archiveFile && archiveFile.size > ARCHIVE_MAX_MB * 1024 * 1024)}
             onClick={async () => {
-              const params = { project: project.trim(), cwd: suffix.trim() ? fullCwd : undefined, git_repo_url: gitRepoUrl.trim() || undefined, tool };
+              const params = {
+                project: project.trim(),
+                cwd: suffix.trim() ? fullCwd : undefined,
+                git_repo_url: gitRepoUrl.trim() || undefined,
+                tool,
+                ...(tool === "codex" ? { codex_transport: codexTransport } : {}),
+              };
               if (archiveFile && suffix.trim()) {
                 setExtracting(true);
                 try {
@@ -1861,6 +1902,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     cwd?: string;
     git_repo_url?: string;
     tool: "claude" | "cursor" | "codex";
+    codex_transport?: "tui" | "app_server";
   }) => {
     setLoading(true);
     try {
@@ -2411,46 +2453,71 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               minHeight: 0, display: "flex", flexDirection: "row", overflow: "clip",
             }}>
             <div style={{ flex: 1, minWidth: isFileCentric ? 320 : 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-            {!chatOnlyMode && (
-              <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "terminal" ? "flex" : "none", flexDirection: "column" }}>
-                <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-                  <TuiPane
-                    key={active.session_id + active.ws_token + (terminalFont || "")}
-                    wsUrl={active.ws_url}
-                    theme={theme}
-                    scrollToBottomRef={tuiScrollToBottomRef}
-                    fontFamily={terminalFont}
-                    useTmuxScroll={activeSessionMeta?.tool === "codex"}
-                  />
-                </div>
-              </div>
-            )}
-            <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "bubble" ? "flex" : "none", flexDirection: "column" }}>
-              {(() => {
-                // Gate every tui-derived prop on the freshness check: the
-                // value must have been polled for THIS session id, otherwise
-                // we pass nulls. Without this gate a newly-mounted
-                // ConversationPane (key changes on session switch) would
-                // observe the previous session's AUQ for one render and
-                // pin it into its stickyAuq.
-                const fresh = tuiOwnerSessionId === active.session_id;
-                return (
-                  <ConversationPane
-                    key={active.session_id + active.ws_token}
-                    sessionId={active.session_id}
-                    tool={activeSessionMeta?.tool}
-                    isStreaming={activeSessionMeta?.is_streaming}
-                    isCompacting={fresh ? isCompacting : false}
-                    compactingProgress={fresh ? compactingProgress : null}
-                    chatOnly={chatOnlyMode}
-                    isWaitingForAuq={fresh && !!tuiHint?.includes("asking a question")}
-                    pendingAuqData={fresh ? tuiAuqData : null}
-                    pendingApproveData={fresh ? tuiApproveData : null}
-                    refreshRef={convRefreshRef}
-                  />
-                );
-              })()}
-            </div>
+            {(() => {
+              const isCodexAppServer =
+                activeSessionMeta?.tool === "codex" &&
+                activeSessionMeta?.codex_transport === "app_server";
+              return (
+                <>
+                  {!chatOnlyMode && (
+                    <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "terminal" ? "flex" : "none", flexDirection: "column" }}>
+                      {isCodexAppServer ? (
+                        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 12, padding: 24, textAlign: "center" }}>
+                          Codex app-server transport — no terminal. Switch to the chat view to send messages.
+                        </div>
+                      ) : (
+                        <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+                          <TuiPane
+                            key={active.session_id + active.ws_token + (terminalFont || "")}
+                            wsUrl={active.ws_url}
+                            theme={theme}
+                            scrollToBottomRef={tuiScrollToBottomRef}
+                            fontFamily={terminalFont}
+                            useTmuxScroll={activeSessionMeta?.tool === "codex"}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <div style={{ flex: 1, minHeight: 0, display: !inlineView && !codeFileView && rightMode === "bubble" ? "flex" : "none", flexDirection: "column" }}>
+                    {(() => {
+                      // Gate every tui-derived prop on the freshness check: the
+                      // value must have been polled for THIS session id, otherwise
+                      // we pass nulls. Without this gate a newly-mounted
+                      // ConversationPane (key changes on session switch) would
+                      // observe the previous session's AUQ for one render and
+                      // pin it into its stickyAuq.
+                      const fresh = tuiOwnerSessionId === active.session_id;
+                      return (
+                        <>
+                          <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+                            <ConversationPane
+                              key={active.session_id + active.ws_token}
+                              sessionId={active.session_id}
+                              tool={activeSessionMeta?.tool}
+                              isStreaming={activeSessionMeta?.is_streaming}
+                              isCompacting={fresh ? isCompacting : false}
+                              compactingProgress={fresh ? compactingProgress : null}
+                              chatOnly={chatOnlyMode}
+                              isWaitingForAuq={fresh && !!tuiHint?.includes("asking a question")}
+                              pendingAuqData={fresh ? tuiAuqData : null}
+                              pendingApproveData={fresh ? tuiApproveData : null}
+                              refreshRef={convRefreshRef}
+                            />
+                          </div>
+                          {isCodexAppServer && !chatOnlyMode && (
+                            <CodexChatInput
+                              sessionId={active.session_id}
+                              onSent={() => convRefreshRef.current?.()}
+                            />
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+                </>
+              );
+            })()}
             {codeFileView && (
               <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
                 <FileViewerPane
