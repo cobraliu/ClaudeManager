@@ -182,10 +182,13 @@ def start(
         try:
             if resume_thread_id:
                 method = "thread/resume"
-                ts_params: dict[str, Any] = {"threadId": resume_thread_id}
+                ts_params: dict[str, Any] = {
+                    "threadId": resume_thread_id,
+                    **_default_thread_overrides(),
+                }
             else:
                 method = "thread/start"
-                ts_params = {"cwd": cwd}
+                ts_params = {"cwd": cwd, **_default_thread_overrides()}
                 if model:
                     ts_params["model"] = model
             try:
@@ -203,7 +206,7 @@ def start(
                         resume_thread_id,
                     )
                     method = "thread/start"
-                    ts_params = {"cwd": cwd}
+                    ts_params = {"cwd": cwd, **_default_thread_overrides()}
                     if model:
                         ts_params["model"] = model
                     resp = await client.send_request(method, ts_params, timeout=15.0)
@@ -492,6 +495,27 @@ def _intercept_server_requests(session_id: str, state: _SessionState) -> None:
         original_dispatch(msg)
 
     client._dispatch = _wrapped  # type: ignore[attr-defined]
+
+
+def _default_thread_overrides() -> dict[str, Any]:
+    """Force `sandbox` + `approvalPolicy` on every thread/start and thread/resume.
+
+    codex's compiled-in defaults pick `read-only` for any cwd that isn't in
+    `~/.codex/config.toml`'s `projects.*.trust_level = "trusted"` list. With
+    `read-only` we observe a 175s silent hang on tool-use turns (the model
+    receives a degraded tool catalog and never emits a function_call). The
+    ClaudeManager UI also has no way to surface a sandbox-escape prompt, so a
+    silent denial is the worst possible UX.
+
+    Behavior we want: same as `codex` TUI in a trusted directory — read+write
+    inside cwd, approval prompt for anything that needs escalation. The user
+    already opted into this directory by creating the ClaudeManager session
+    against it, so we treat that as authorization.
+    """
+    return {
+        "sandbox": "workspace-write",
+        "approvalPolicy": "on-request",
+    }
 
 
 def _is_no_rollout_error(exc: CodexAppServerError) -> bool:

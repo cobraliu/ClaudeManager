@@ -155,6 +155,64 @@ def test_resume_falls_back_to_start_when_no_rollout(monkeypatch):
         mgr.stop("s1")
 
 
+def test_thread_start_sends_sandbox_and_approval_overrides(monkeypatch):
+    """start() must pin sandbox=workspace-write + approvalPolicy=on-request on
+    fresh threads. Without this, codex's compiled-in default falls to read-only
+    in any untrusted cwd, which silently hangs request_user_input turns."""
+    from app.services.codex_appserver_client import CodexAppServerClient
+
+    real_send = CodexAppServerClient.send_request
+    captured: dict[str, dict] = {}
+
+    async def _capture_send(self, method, params=None, *, timeout=30.0):
+        if method == "initialize":
+            return {}
+        if method == "thread/start":
+            captured["thread/start"] = dict(params or {})
+            return {"thread": {"id": "tid-fresh"}}
+        return await real_send(self, method, params, timeout=timeout)
+
+    monkeypatch.setattr(CodexAppServerClient, "send_request", _capture_send)
+
+    mgr.start("s1", cwd=os.getcwd())
+    try:
+        params = captured["thread/start"]
+        assert params["sandbox"] == "workspace-write"
+        assert params["approvalPolicy"] == "on-request"
+        assert params["cwd"] == os.getcwd()
+    finally:
+        mgr.stop("s1")
+
+
+def test_thread_resume_sends_sandbox_and_approval_overrides(monkeypatch):
+    """thread/resume must also pin sandbox/approvalPolicy — codex applies the
+    same trust-based default at resume time, so a stale read-only would still
+    bite when the user returns to an existing session."""
+    from app.services.codex_appserver_client import CodexAppServerClient
+
+    real_send = CodexAppServerClient.send_request
+    captured: dict[str, dict] = {}
+
+    async def _capture_send(self, method, params=None, *, timeout=30.0):
+        if method == "initialize":
+            return {}
+        if method == "thread/resume":
+            captured["thread/resume"] = dict(params or {})
+            return {"thread": {"id": "tid-resumed"}}
+        return await real_send(self, method, params, timeout=timeout)
+
+    monkeypatch.setattr(CodexAppServerClient, "send_request", _capture_send)
+
+    mgr.start("s1", cwd=os.getcwd(), resume_thread_id="prior-tid")
+    try:
+        params = captured["thread/resume"]
+        assert params["threadId"] == "prior-tid"
+        assert params["sandbox"] == "workspace-write"
+        assert params["approvalPolicy"] == "on-request"
+    finally:
+        mgr.stop("s1")
+
+
 def test_resume_propagates_other_errors(monkeypatch):
     """Errors other than 'no rollout' must NOT trigger the fallback."""
     from app.services.codex_appserver_client import (
