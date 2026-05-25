@@ -1569,3 +1569,8 @@ export function readCapVersionContent(scope: "global" | "project", relpath: stri
   return request<{ content: string }>(`/api/claude-caps/version-content?${params}`);
 }
 
+export function readClaudePlan(path: string): Promise<{ path: string; content: string }> {
+  const params = new URLSearchParams({ path });
+  return request<{ path: string; content: string }>(`/api/claude-caps/plan?${params}`);
+}
+
