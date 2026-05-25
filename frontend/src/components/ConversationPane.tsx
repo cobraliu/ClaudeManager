@@ -3555,6 +3555,11 @@ function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
 interface Props {
   sessionId: string;
   tool?: "claude" | "cursor" | "codex";
+  /** Codex transport, only meaningful when tool === "codex". "app_server" sessions
+   *  have no tmux pane — the parent owns message submission via /codex-message and
+   *  this pane must skip its terminal WS attach and hide its own textarea to avoid
+   *  rendering a second, broken input alongside CodexChatInput. */
+  codexTransport?: "tui" | "app_server";
   isStreaming?: boolean;
   /** True while claude is running its compaction pass — drives the bottom banner's compacting variant. */
   isCompacting?: boolean;
@@ -3648,7 +3653,12 @@ function _cleanupExpiredDrafts(): void {
   } catch { /* ignore */ }
 }
 
-export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+export function ConversationPane({ sessionId, tool, codexTransport, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+  // Codex app-server transport: no tmux, no terminal WS. The parent (SessionsPage)
+  // owns input via CodexChatInput → POST /codex-message. We must short-circuit the
+  // WS attach effect AND the internal textarea or the user sees two input bars
+  // and the WS-based one attaches to a nonexistent tmux pane.
+  const isCodexAppServer = tool === "codex" && codexTransport === "app_server";
   const agentDisplayName = tool === "cursor" ? "Cursor" : tool === "codex" ? "Codex" : "Claude";
   const [messages, setMessages] = useState<RawMessage[]>([]);
   const [tail, setTail] = useState(DEFAULT_TAIL);
@@ -4203,6 +4213,7 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
 
   useEffect(() => {
     if (chatOnly) return; // terminated sessions: no WS needed
+    if (isCodexAppServer) return; // app-server transport: no tmux WS to attach to
     let ws: WsClient | null = null;
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4279,7 +4290,7 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
       ws?.close();
       wsRef.current = null;
     };
-  }, [sessionId]);
+  }, [sessionId, isCodexAppServer]);
 
   // ── Input draft persistence ───────────────────────────────────────────────
 
@@ -4608,8 +4619,10 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
         </div>
       )}
 
-      {/* Status banner – three states: compacting (orange + progress) / responding (stop button) / idle (faint). */}
-      {!chatOnly && wsStatus === "connected" && (() => {
+      {/* Status banner – three states: compacting (orange + progress) / responding (stop button) / idle (faint).
+          Codex app-server mode has no terminal WS, so we gate on transport too — liveness is
+          owned elsewhere (status poll + codex_appserver_manager). */}
+      {!chatOnly && (wsStatus === "connected" || isCodexAppServer) && (() => {
         if (isStreaming && isCompacting) {
           const pctNum = compactingProgress ? parseInt(compactingProgress, 10) : NaN;
           const hasPct = Number.isFinite(pctNum) && pctNum >= 0 && pctNum <= 100;
@@ -4682,8 +4695,9 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
         );
       })()}
 
-      {/* Input bar – hidden in read-only chat mode */}
-      {!chatOnly && <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)", background: "var(--bg-surface)" }}>
+      {/* Input bar – hidden in read-only chat mode AND in codex app-server mode
+          (the parent renders CodexChatInput against /codex-message instead). */}
+      {!chatOnly && !isCodexAppServer && <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)", background: "var(--bg-surface)" }}>
         {/* Top grip: drag up to enlarge the input. The textarea sits at the bottom of
             the page, so resizing must extend upward, not from a corner. */}
         <div

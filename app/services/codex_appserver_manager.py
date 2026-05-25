@@ -140,7 +140,15 @@ def start(
     with _state_lock:
         if session_id in _sessions:
             raise RuntimeError(f"codex app-server already running for {session_id}")
-    client = CodexAppServerClient(cwd=cwd, env=env, codex_bin=codex_bin)
+    # Enable the `request_user_input` tool in Default collaboration mode.
+    # Why: codex's default mode normally hides this tool ("request_user_input is
+    # unavailable in Default mode") and only allows free-text questions. The
+    # ClaudeManager UI surfaces structured AUQ via this RPC, so we opt into the
+    # `default_mode_request_user_input` feature for every app-server session.
+    extra_args = ["--enable", "default_mode_request_user_input"]
+    client = CodexAppServerClient(
+        cwd=cwd, env=env, codex_bin=codex_bin, extra_args=extra_args
+    )
     state = _SessionState(client=client)
 
     async def _setup() -> int:
