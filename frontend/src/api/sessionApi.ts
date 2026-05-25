@@ -28,6 +28,7 @@ export interface SessionMeta {
   git_auto_commit: boolean;
   git_repo_url: string | null;
   tool: "claude" | "cursor" | "codex";
+  codex_transport?: "tui" | "app_server";
 }
 
 export interface SessionListResponse {
@@ -380,10 +381,36 @@ export function createSession(body: {
   resume_session_id?: string;
   git_repo_url?: string;
   tool?: "claude" | "cursor" | "codex";
+  codex_transport?: "tui" | "app_server";
 }): Promise<SessionMeta> {
   return request("/api/sessions", {
     method: "POST",
     body: JSON.stringify(body),
+  });
+}
+
+export function sendCodexMessage(sessionId: string, text: string): Promise<{ ok: boolean; result?: unknown }> {
+  return request(`/api/sessions/${sessionId}/codex-message`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
+}
+
+export function resolveCodexAuq(sessionId: string, text: string): Promise<{ ok: boolean }> {
+  return request(`/api/sessions/${sessionId}/codex-auq`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
+}
+
+export function resolveCodexApproval(
+  sessionId: string,
+  allow: boolean,
+  feedback?: string | null
+): Promise<{ ok: boolean }> {
+  return request(`/api/sessions/${sessionId}/codex-approve`, {
+    method: "POST",
+    body: JSON.stringify({ allow, feedback: feedback ?? null }),
   });
 }
 

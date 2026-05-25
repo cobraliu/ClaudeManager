@@ -5,10 +5,8 @@ Operating procedure for the two Codex-related flows in ClaudeManager:
 1. **Create a new Codex session**
 2. **Load an existing Codex session** (from rollout JSONL on disk)
 
-Scope: Phase 2 — interactive Codex TUI launched inside tmux, with history
-sourced from `~/.codex/sessions/**/rollout-*.jsonl`. App-server JSON-RPC
-integration (live AUQ / plan / approval state) is Phase 3 and not covered
-here.
+Scope: two transport modes coexist as of Phase 3 — see the
+"Codex transport modes" section below for which to pick.
 
 ---
 
@@ -123,3 +121,58 @@ When you do test, the minimum-confidence path is:
 If any step fails, check the browser console + `uvicorn` log; the most
 likely culprit is `get_adapter` falling back to Claude (means `tool`
 wasn't persisted as `"codex"` in the DB row).
+
+---
+
+## Codex transport modes
+
+Each Codex session picks a `codex_transport` at creation time, stored on
+the session row. The default is `"tui"`. The selector is only visible
+when the create modal's tool picker is set to `codex`.
+
+### `tui` (default)
+
+- Codex runs inside a tmux window, identical to the Phase-2 flow.
+- xterm.js in the right panel attaches directly to that tmux session.
+- Live waiting-state (AUQ / plan / approval) is **not surfaced**:
+  `CodexAdapter.get_waiting_state` returns `None`. Approvals must be
+  answered inside the TUI.
+- Resume from external rollout uses `codex resume <UUID>` (see Flow B).
+
+### `app_server` (experimental)
+
+- Backend spawns `codex app-server` directly (not in tmux) via
+  `codex_appserver_manager.start(session_id, ...)`. The manager owns
+  one `CodexAppServerClient` per session, talking JSON-RPC 2.0 over
+  stdio.
+- No xterm.js: the terminal tab shows a placeholder. The chat tab
+  pins a `CodexChatInput` below `ConversationPane`. Sending a
+  message hits `POST /api/sessions/{id}/codex-message`, which calls
+  `turn/start` on the app-server.
+- Live waiting-state **is** surfaced: the manager subscribes to
+  `turn/plan/updated` + `thread/compacted` notifications and
+  intercepts the six AUQ / approval `ServerRequest` methods listed in
+  `codex_appserver_manager.py`. The pending request stays cached
+  until the user resolves it via:
+    - `POST /api/sessions/{id}/codex-auq`   `{text}`
+    - `POST /api/sessions/{id}/codex-approve` `{allow, feedback}`
+- Lifecycle: `terminate_session` calls `csm.stop(session_id)` instead
+  of `tmux.terminate(...)`. `delete_session` calls `csm.stop()` as a
+  belt-and-suspenders cleanup for crash cases.
+
+### Which mode to pick
+
+- **Use TUI** when you need interactive paste, ANSI rendering, or
+  expect to operate Codex like a terminal app.
+- **Use app-server** when you need live AUQ/approval state in the
+  SessionCard, want to drive Codex programmatically, or are running
+  on a host where tmux is unavailable.
+
+### Switching modes
+
+Modes are per-session. To switch, terminate the existing session and
+create a new one with the desired transport — there is no in-place
+mode swap. Resume-from-external (Flow B) currently always creates a
+TUI session; app-server resume by thread id is not yet wired through
+the create endpoint.
+

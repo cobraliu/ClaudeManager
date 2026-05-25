@@ -101,11 +101,14 @@ class AgentAdapter(Protocol):
         agent_session_id: Optional[str],
         agent_pid: Optional[int],
         cwd: str,
+        session_id: Optional[str] = None,
     ) -> Optional[WaitingState]:
-        """None for adapters that have no waiting-state mechanism (Cursor).
+        """Return live AUQ/approval/compacting state, or None.
 
-        Claude reads PID file + hook JSONL; Codex queries its app-server's
-        pending requests table.
+        `session_id` is the ClaudeManager session id — distinct from
+        `agent_session_id`. Codex's app-server transport indexes its client
+        by ClaudeManager session id, so the adapter needs both. Claude and
+        Cursor ignore `session_id`.
         """
 
     # ── Models ──────────────────────────────────────────────────────────────

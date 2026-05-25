@@ -103,6 +103,8 @@ class SessionStore:
             ("git_repo_url", "TEXT"),
             ("last_turn_at", "TEXT"),
             ("tool", "TEXT NOT NULL DEFAULT 'claude'"),
+            ("codex_transport", "TEXT NOT NULL DEFAULT 'tui'"),
+            ("codex_appserver_pid", "INTEGER"),
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {coltype}")
@@ -144,6 +146,8 @@ class SessionStore:
             git_commit_msg_count=int(row["git_commit_msg_count"]),
             git_repo_url=row["git_repo_url"],
             tool=row["tool"] if "tool" in row.keys() else "claude",
+            codex_transport=(row["codex_transport"] if "codex_transport" in row.keys() else "tui") or "tui",
+            codex_appserver_pid=row["codex_appserver_pid"] if "codex_appserver_pid" in row.keys() else None,
         )
 
     def _now(self) -> str:
@@ -156,8 +160,8 @@ class SessionStore:
                    (id, owner_id, name, project, cwd, env, model, status,
                     created_at, updated_at, attached_clients, last_output_offset,
                     last_activity_at, ws_token, tmux_session_name, resume_session_id,
-                    agent_session_id, git_repo_url, tool)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    agent_session_id, git_repo_url, tool, codex_transport, codex_appserver_pid)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     session.id,
                     session.owner_id,
@@ -178,6 +182,8 @@ class SessionStore:
                     session.agent_session_id,
                     session.git_repo_url,
                     session.tool,
+                    session.codex_transport,
+                    session.codex_appserver_pid,
                 ),
             )
             self._conn.commit()
@@ -316,6 +322,15 @@ class SessionStore:
                 (exclude_session_id or "",),
             ).fetchall()
             return {r[0] for r in rows}
+
+    def update_codex_appserver_pid(self, session_id: str, pid: int | None) -> None:
+        with self._lock:
+            now = self._now()
+            self._conn.execute(
+                "UPDATE sessions SET codex_appserver_pid = ?, updated_at = ? WHERE id = ?",
+                (pid, now, session_id),
+            )
+            self._conn.commit()
 
     def clear_agent_session_id(self, session_id: str) -> None:
         with self._lock:

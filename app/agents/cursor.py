@@ -112,6 +112,7 @@ class CursorAdapter:
         agent_session_id: Optional[str],
         agent_pid: Optional[int],
         cwd: str,
+        session_id: Optional[str] = None,
     ) -> Optional[WaitingState]:
         return None  # Cursor has no waiting-state mechanism we can observe.
 
