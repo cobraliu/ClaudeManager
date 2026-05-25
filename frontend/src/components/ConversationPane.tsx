@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMe
 import { createPortal } from "react-dom";
 import hljs from "highlight.js/lib/common";
 import { marked, renderMarkdown } from "../lib/markdown";
-import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
+import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
 
 const POLL_MS = 1500;
@@ -3527,6 +3527,40 @@ interface PendingAuqData {
   }>;
 }
 
+function formatCodexAuqAnswer(answers: unknown[], questions: AskQuestion[]): string {
+  // codex.request_user_input replies are a single text string. Map our
+  // structured answer-per-question array into a human-readable line per
+  // question. Single question → just the answer; multi-question → "Q: A".
+  const parts: string[] = [];
+  for (let i = 0; i < answers.length; i++) {
+    const a = answers[i];
+    const q = questions[i];
+    let text = "";
+    if (typeof a === "string") {
+      text = a;
+    } else if (Array.isArray(a)) {
+      const picks: string[] = [];
+      for (let j = 0; j < a.length; j++) {
+        const item = a[j] as { type?: string; click?: boolean; value?: string };
+        if (item?.type === "option" && item?.click && q?.options[j]) {
+          picks.push(q.options[j].label);
+        } else if (item?.type === "type_something" && typeof item.value === "string" && item.value.trim()) {
+          picks.push(item.value.trim());
+        }
+      }
+      text = picks.join(", ");
+    } else if (a != null) {
+      text = String(a);
+    }
+    if (questions.length > 1 && q?.question) {
+      parts.push(`${q.question}: ${text}`);
+    } else {
+      parts.push(text);
+    }
+  }
+  return parts.join("\n");
+}
+
 function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
   if (data.questions && data.questions.length > 0) {
     return data.questions.map(q => ({
@@ -4612,7 +4646,16 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
             blockId={stickyAuq.blockId}
             questions={stickyAuq.questions}
             onSubmitAnswers={(answers) => {
-              submitAuqAnswers(sessionId, answers, stickyAuq.questions);
+              if (isCodexAppServer) {
+                // codex's request_user_input ServerRequest expects {text}; flatten
+                // the structured answers into a single string the model can read.
+                const text = formatCodexAuqAnswer(answers, stickyAuq.questions);
+                resolveCodexAuq(sessionId, text).catch((err) => {
+                  console.error("codex AUQ resolve failed", err);
+                });
+              } else {
+                submitAuqAnswers(sessionId, answers, stickyAuq.questions);
+              }
               setStickyAuq(null);
             }}
           />
