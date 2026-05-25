@@ -1571,14 +1571,14 @@ function ToolApprovalBlock({ sessionId, toolName, toolInput, onDone }: {
   };
   const icon = toolIcons[toolName] ?? "🔧";
 
-  // Format the key detail for display
   const detail = (() => {
-    if (toolName === "Bash") return String(toolInput.command ?? "");
-    if (toolName === "Write" || toolName === "Read") return String(toolInput.file_path ?? "");
-    if (toolName === "Edit" || toolName === "MultiEdit") return String(toolInput.file_path ?? "");
-    if (toolName === "WebFetch") return String(toolInput.url ?? "");
-    if (toolName === "WebSearch") return String(toolInput.query ?? "");
-    const first = Object.values(toolInput)[0];
+    const input = (toolInput && typeof toolInput === "object") ? toolInput : {};
+    if (toolName === "Bash") return String(input.command ?? "");
+    if (toolName === "Write" || toolName === "Read") return String(input.file_path ?? "");
+    if (toolName === "Edit" || toolName === "MultiEdit") return String(input.file_path ?? "");
+    if (toolName === "WebFetch") return String(input.url ?? "");
+    if (toolName === "WebSearch") return String(input.query ?? "");
+    const first = Object.values(input)[0];
     return first != null ? String(first) : "";
   })();
 
