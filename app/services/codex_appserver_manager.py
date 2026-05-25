@@ -188,7 +188,27 @@ def start(
                 ts_params = {"cwd": cwd}
                 if model:
                     ts_params["model"] = model
-            resp = await client.send_request(method, ts_params, timeout=15.0)
+            try:
+                resp = await client.send_request(method, ts_params, timeout=15.0)
+            except CodexAppServerError as exc:
+                # thread/resume requires an on-disk rollout JSONL. If the previous
+                # spawn died before writing one (e.g. crashed at startup), codex
+                # answers "no rollout found". Fall back to a fresh thread/start so
+                # the user can keep using the ClaudeManager session; the caller
+                # will pick up the new thread id via get_thread_id and update DB.
+                if method == "thread/resume" and _is_no_rollout_error(exc):
+                    logger.warning(
+                        "codex app-server: thread/resume found no rollout for %s; "
+                        "falling back to thread/start",
+                        resume_thread_id,
+                    )
+                    method = "thread/start"
+                    ts_params = {"cwd": cwd}
+                    if model:
+                        ts_params["model"] = model
+                    resp = await client.send_request(method, ts_params, timeout=15.0)
+                else:
+                    raise
             # codex 0.130.0 returns {thread: {id, sessionId, ...}, model, ...}.
             # Older shapes (top-level threadId) are still tolerated as fallbacks.
             tid: str | None = None
@@ -472,6 +492,17 @@ def _intercept_server_requests(session_id: str, state: _SessionState) -> None:
         original_dispatch(msg)
 
     client._dispatch = _wrapped  # type: ignore[attr-defined]
+
+
+def _is_no_rollout_error(exc: CodexAppServerError) -> bool:
+    """Detect the codex 'no rollout found for thread id <X>' error.
+
+    codex uses generic -32600 (Invalid Request) for this, so we match on the
+    message text instead of the code. The phrasing has been stable across
+    0.130.x but we keep the check loose to survive small wording tweaks.
+    """
+    msg = (exc.message or "").lower()
+    return "no rollout" in msg or "rollout not found" in msg
 
 
 def _build_approval_response(method: str, *, allow: bool, feedback: str | None) -> dict:

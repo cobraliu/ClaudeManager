@@ -43,7 +43,10 @@ def _patch_client_for_fake(monkeypatch):
 
     real_cls = CodexAppServerClient
 
-    def _make(*, cwd, env=None, codex_bin="codex"):
+    def _make(*, cwd, env=None, codex_bin="codex", extra_args=None):
+        # extra_args is accepted (and ignored) so the manager can pass --enable
+        # default_mode_request_user_input — the fake server doesn't care about
+        # codex CLI feature flags.
         return real_cls(
             cwd=cwd,
             env=env,
@@ -59,8 +62,13 @@ def _patch_client_for_fake(monkeypatch):
     real_send = real_cls.send_request
 
     async def _patched_send(self, method, params=None, *, timeout=30.0):
-        if method in ("initialize", "thread/start"):
-            return {}  # fake doesn't implement these
+        if method == "initialize":
+            return {}  # fake doesn't implement initialize
+        if method == "thread/start":
+            # Manager reads {thread: {id|sessionId}} or top-level {threadId}.
+            return {"thread": {"id": "fake-thread-id"}}
+        if method == "thread/resume":
+            return {"thread": {"id": params.get("threadId", "fake-thread-id") if params else "fake-thread-id"}}
         return await real_send(self, method, params, timeout=timeout)
 
     monkeypatch.setattr(CodexAppServerClient, "send_request", _patched_send)
@@ -106,6 +114,70 @@ def test_start_twice_same_session_raises():
             mgr.start("s1", cwd=os.getcwd())
     finally:
         mgr.stop("s1")
+
+
+def test_resume_falls_back_to_start_when_no_rollout(monkeypatch):
+    """If thread/resume reports 'no rollout found', start() should retry
+    with thread/start and end up alive with the new thread id."""
+    from app.services.codex_appserver_client import (
+        CodexAppServerClient,
+        CodexAppServerError,
+    )
+
+    real_send = CodexAppServerClient.send_request
+    new_thread_id = "fresh-thread-after-fallback"
+
+    async def _no_rollout_then_start(self, method, params=None, *, timeout=30.0):
+        if method == "initialize":
+            return {}
+        if method == "thread/resume":
+            raise CodexAppServerError(
+                -32600,
+                "no rollout found for thread id 019e5e49-d65a-7a53-8dad-a6dc820f33c0",
+            )
+        if method == "thread/start":
+            return {"thread": {"id": new_thread_id}}
+        return await real_send(self, method, params, timeout=timeout)
+
+    monkeypatch.setattr(CodexAppServerClient, "send_request", _no_rollout_then_start)
+
+    pid = mgr.start(
+        "s1",
+        cwd=os.getcwd(),
+        resume_thread_id="019e5e49-d65a-7a53-8dad-a6dc820f33c0",
+    )
+    try:
+        assert isinstance(pid, int) and pid > 0
+        assert mgr.is_alive("s1") is True
+        # Manager must surface the NEW thread id so the caller can update DB.
+        assert mgr.get_thread_id("s1") == new_thread_id
+    finally:
+        mgr.stop("s1")
+
+
+def test_resume_propagates_other_errors(monkeypatch):
+    """Errors other than 'no rollout' must NOT trigger the fallback."""
+    from app.services.codex_appserver_client import (
+        CodexAppServerClient,
+        CodexAppServerError,
+    )
+
+    real_send = CodexAppServerClient.send_request
+
+    async def _other_error(self, method, params=None, *, timeout=30.0):
+        if method == "initialize":
+            return {}
+        if method == "thread/resume":
+            raise CodexAppServerError(-32603, "internal server error")
+        if method == "thread/start":
+            pytest.fail("fallback should not run for non-rollout errors")
+        return await real_send(self, method, params, timeout=timeout)
+
+    monkeypatch.setattr(CodexAppServerClient, "send_request", _other_error)
+
+    with pytest.raises(CodexAppServerError):
+        mgr.start("s1", cwd=os.getcwd(), resume_thread_id="some-id")
+    assert mgr.is_alive("s1") is False
 
 
 def test_list_sessions_reflects_state():
