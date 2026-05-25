@@ -119,6 +119,7 @@ import { downloadConversationHtml } from "../lib/exportChat";
 import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
 import { GitGraph } from "../components/GitGraph";
 import { FileIcon, NewFolderIcon } from "../components/FileIcon";
+import { HtmlViewer } from "../components/HtmlViewer";
 import type { DirInfoResponse } from "../api/sessionApi";
 
 const MOBILE_PAGE_SIZE = 10;
@@ -3427,13 +3428,14 @@ function mobileFormatSize(bytes: number): string {
   return `${(bytes/1048576).toFixed(1)}M`;
 }
 
-type MobileFileKind = "code" | "markdown" | "csv" | "sqlite" | "pdf" | "image" | "text";
+type MobileFileKind = "code" | "markdown" | "csv" | "sqlite" | "pdf" | "image" | "html" | "text";
 function getMobileFileKind(entry: FileEntry): MobileFileKind {
   if (entry.is_sqlite) return "sqlite";
   const ext = entry.name.split(".").pop()?.toLowerCase() || "";
   if (ext === "pdf") return "pdf";
   if (ext === "csv" || ext === "tsv") return "csv";
   if (ext === "md" || ext === "markdown") return "markdown";
+  if (ext === "html" || ext === "htm") return "html";
   if (["png","jpg","jpeg","gif","webp","bmp","ico","svg","avif","tiff","tif","heic","heif"].includes(ext)) return "image";
   if (FILE_CODE_EXTS.has(ext)) return "code";
   return "text";
@@ -4212,6 +4214,9 @@ function MobileFileBrowserPanel({
                     : <div style={{ color: "var(--text-muted)" }}>Loading…</div>
                   }
                 </div>
+              )}
+              {kind === "html" && (
+                <HtmlViewer sessionId={sessionId} path={previewEntry.path} initialContent={fileContent} />
               )}
             </>
           )}
