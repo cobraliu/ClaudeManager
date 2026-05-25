@@ -1,7 +1,18 @@
-"""Async JSON-RPC 2.0 client for `codex app-server` over stdio.
+"""Async JSON-RPC 2.0 client for `codex app-server` over WebSockets.
 
-The codex app-server protocol is full bidirectional JSON-RPC 2.0, line-delimited
-(one JSON object per line on stdin/stdout). Three message kinds:
+Codex's `app-server` subcommand can listen on three transports: `stdio://`
+(default), `unix://`, and `ws://IP:PORT`. We pick **ws** because:
+
+  * the codex process survives our backend restarts — it doesn't share our
+    process group and isn't bound by the parent-child stdin link
+  * we can spawn it once and reconnect after backend redeploys
+  * codex's bubblewrap sandbox preflight is fatal in `--listen unix://` mode
+    but only logs in ws mode (same forgiving behavior as stdio)
+  * codex exposes `/readyz` and `/healthz` on the same port, so the manager
+    can health-check without owning the JSON-RPC connection
+
+This client speaks the same JSON-RPC 2.0 framing as before but over a
+websocket frame instead of a stdout line. Three message kinds:
 
   * outbound request   → server returns response by id (resolved via Future)
   * outbound notification → no response
@@ -10,19 +21,18 @@ The codex app-server protocol is full bidirectional JSON-RPC 2.0, line-delimited
   * inbound request    (ServerRequest, e.g. approval prompts)
        → server expects a response by the same id
 
-This client handles the framing; it has zero knowledge of codex-specific
-method names. The manager layer (codex_appserver_manager.py) sits on top
-and maps notifications + server requests onto Claude-parity state slots
-(pending AUQ / pending approval / plan / compaction).
+Subprocess management lives in the manager. This client is pure transport.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+import websockets
+from websockets import WebSocketClientProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -38,31 +48,18 @@ class CodexAppServerError(Exception):
 
 
 class CodexAppServerClient:
-    """One client = one `codex app-server` subprocess.
+    """One client = one websocket connection to a `codex app-server` process.
 
     Not thread-safe; expected to be driven from a single asyncio loop. All
     `async` methods must be awaited on that loop. `subscribe` and
-    `set_server_request_handler` are sync setters; call them before `spawn`
-    or while the client is idle.
+    `set_server_request_handler` are sync setters; call them before
+    `connect` or while the client is idle.
     """
 
-    def __init__(
-        self,
-        *,
-        cwd: str,
-        env: dict[str, str] | None = None,
-        codex_bin: str = "codex",
-        subcommand: list[str] | tuple[str, ...] = ("app-server",),
-        extra_args: list[str] | None = None,
-    ) -> None:
-        self._cwd = cwd
-        self._env = env
-        self._codex_bin = codex_bin
-        self._subcommand = list(subcommand)
-        self._extra_args = list(extra_args) if extra_args else []
-        self._proc: asyncio.subprocess.Process | None = None
+    def __init__(self, *, ws_url: str) -> None:
+        self._ws_url = ws_url
+        self._ws: WebSocketClientProtocol | None = None
         self._reader_task: asyncio.Task | None = None
-        self._stderr_task: asyncio.Task | None = None
         self._next_id = 1
         self._pending: dict[int, asyncio.Future] = {}
         self._notification_handlers: dict[
@@ -75,31 +72,26 @@ class CodexAppServerClient:
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
-    async def spawn(self) -> int:
-        """Start the subprocess; return its PID."""
-        if self._proc is not None:
-            raise RuntimeError("already spawned")
-        args = [self._codex_bin, *self._subcommand, *self._extra_args]
-        # Pass env explicitly so callers can scope HOME/CODEX_HOME per session.
-        env = {**os.environ, **self._env} if self._env else None
-        self._proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=self._cwd,
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    @property
+    def ws_url(self) -> str:
+        return self._ws_url
+
+    async def connect(self, *, timeout: float = 5.0) -> None:
+        """Open the websocket and start the reader loop."""
+        if self._ws is not None:
+            raise RuntimeError("already connected")
+        if self._closed:
+            raise RuntimeError("client is closed")
+        self._ws = await asyncio.wait_for(
+            websockets.connect(self._ws_url, ping_interval=None),
+            timeout=timeout,
         )
         self._reader_task = asyncio.create_task(
-            self._read_loop(), name="codex-appserver-reader"
+            self._read_loop(), name="codex-appserver-ws-reader"
         )
-        self._stderr_task = asyncio.create_task(
-            self._stderr_loop(), name="codex-appserver-stderr"
-        )
-        return self._proc.pid
 
     async def close(self, *, timeout: float = 3.0) -> None:
-        """Terminate subprocess and cancel reader tasks. Idempotent."""
+        """Close the websocket and cancel reader. Idempotent."""
         if self._closed:
             return
         self._closed = True
@@ -110,42 +102,25 @@ class CodexAppServerClient:
                     CodexAppServerError(-32000, "client closed before response")
                 )
         self._pending.clear()
-        proc = self._proc
-        if proc is not None and proc.returncode is None:
+        ws = self._ws
+        if ws is not None:
             try:
-                if proc.stdin is not None and not proc.stdin.is_closing():
-                    proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=timeout)
+                await asyncio.wait_for(ws.close(), timeout=timeout)
             except asyncio.TimeoutError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-            except ProcessLookupError:
+                logger.warning("codex app-server: ws close timed out, forcing")
+            except Exception:
+                logger.debug("codex app-server: ws close error", exc_info=True)
+        task = self._reader_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
                 pass
-        for task in (self._reader_task, self._stderr_task):
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
 
     def is_alive(self) -> bool:
-        return (
-            self._proc is not None
-            and self._proc.returncode is None
-            and not self._closed
-        )
-
-    @property
-    def pid(self) -> int | None:
-        return self._proc.pid if self._proc is not None else None
+        ws = self._ws
+        return ws is not None and not ws.closed and not self._closed
 
     # ── outgoing ─────────────────────────────────────────────────────────
 
@@ -160,9 +135,9 @@ class CodexAppServerClient:
 
         Raises CodexAppServerError if the server returned an error object,
         TimeoutError if the response doesn't arrive in `timeout` seconds,
-        or RuntimeError if the client is closed / not spawned.
+        or RuntimeError if the client is closed / not connected.
         """
-        if self._proc is None or self._closed:
+        if self._ws is None or self._closed:
             raise RuntimeError("client not running")
         req_id = self._next_id
         self._next_id += 1
@@ -182,7 +157,7 @@ class CodexAppServerClient:
 
     async def send_notification(self, method: str, params: dict | None = None) -> None:
         """Fire-and-forget notification (no id, no response)."""
-        if self._proc is None or self._closed:
+        if self._ws is None or self._closed:
             raise RuntimeError("client not running")
         payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
         await self._write_line(payload)
@@ -206,38 +181,35 @@ class CodexAppServerClient:
         ServerRequests. The signature is `(method, params, request_id) -> result_dict`.
 
         If unset, the client responds with method-not-found for every
-        ServerRequest, which is the correct default until C3 wires up
-        approval semantics.
+        ServerRequest, which is the correct default until the manager
+        wires up approval / AUQ semantics.
         """
         self._server_request_handler = handler
 
     # ── internal ─────────────────────────────────────────────────────────
 
     async def _write_line(self, payload: dict) -> None:
-        assert self._proc is not None and self._proc.stdin is not None
-        line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-        self._proc.stdin.write(line)
+        assert self._ws is not None
         try:
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            logger.warning("codex app-server stdin closed: %s", exc)
+            await self._ws.send(json.dumps(payload, ensure_ascii=False))
+        except websockets.ConnectionClosed as exc:
+            logger.warning("codex app-server ws closed during send: %s", exc)
             raise
 
     async def _read_loop(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
-        stdout = self._proc.stdout
+        assert self._ws is not None
+        ws = self._ws
         try:
-            while True:
-                line = await stdout.readline()
-                if not line:
-                    break  # EOF — subprocess exited
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
                 try:
-                    msg = json.loads(line)
+                    msg = json.loads(raw)
                 except json.JSONDecodeError as exc:
                     logger.warning(
-                        "codex app-server: malformed JSON line: %s — %r",
+                        "codex app-server: malformed JSON frame: %s — %r",
                         exc,
-                        line[:200],
+                        raw[:200],
                     )
                     continue
                 try:
@@ -246,6 +218,8 @@ class CodexAppServerClient:
                     logger.exception("codex app-server: dispatch error for %r", msg)
         except asyncio.CancelledError:
             raise
+        except websockets.ConnectionClosed:
+            logger.info("codex app-server: ws connection closed")
         except Exception:
             logger.exception("codex app-server: reader crashed")
         finally:
@@ -253,27 +227,9 @@ class CodexAppServerClient:
             for fut in list(self._pending.values()):
                 if not fut.done():
                     fut.set_exception(
-                        CodexAppServerError(-32001, "subprocess exited")
+                        CodexAppServerError(-32001, "ws connection closed")
                     )
             self._pending.clear()
-
-    async def _stderr_loop(self) -> None:
-        assert self._proc is not None and self._proc.stderr is not None
-        stderr = self._proc.stderr
-        try:
-            while True:
-                line = await stderr.readline()
-                if not line:
-                    break
-                logger.info(
-                    "codex-appserver[%s]: %s",
-                    self._proc.pid,
-                    line.decode("utf-8", errors="replace").rstrip(),
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("codex app-server: stderr reader crashed")
 
     def _dispatch(self, msg: dict) -> None:
         msg_id = msg.get("id")

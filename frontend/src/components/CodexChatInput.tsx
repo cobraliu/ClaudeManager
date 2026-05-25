@@ -6,8 +6,57 @@ type Props = {
   onSent?: () => void;
 };
 
+// Per-session input draft cache. Mirrors ConversationPane.tsx's pattern so
+// Codex app-server sessions get the same draft-survives-refresh behavior as
+// Claude/Cursor sessions. Different prefix so the two caches don't collide.
+const _codexInputDrafts = new Map<string, string>();
+
+const DRAFT_PREFIX = "codexInputDraft:v1:";
+const DRAFT_TTL_MS = 10 * 60 * 1000;
+const DRAFT_MAX_BYTES = 4096;
+const DRAFT_HEARTBEAT_MS = 60 * 1000;
+
+function _draftKey(sessionId: string): string { return DRAFT_PREFIX + sessionId; }
+
+function _loadDraft(sessionId: string): string {
+  try {
+    const raw = localStorage.getItem(_draftKey(sessionId));
+    if (!raw) return "";
+    const obj = JSON.parse(raw);
+    if (typeof obj?.text !== "string" || typeof obj?.updatedAt !== "number") return "";
+    if (Date.now() - obj.updatedAt > DRAFT_TTL_MS) {
+      try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
+      return "";
+    }
+    return obj.text;
+  } catch { return ""; }
+}
+
+function _saveDraft(sessionId: string, text: string): void {
+  if (!text) { _clearDraft(sessionId); return; }
+  let bytes: number;
+  try { bytes = new TextEncoder().encode(text).length; } catch { bytes = text.length * 4; }
+  if (bytes > DRAFT_MAX_BYTES) {
+    try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
+    return;
+  }
+  try {
+    localStorage.setItem(_draftKey(sessionId), JSON.stringify({ text, updatedAt: Date.now() }));
+  } catch { /* quota or disabled — ignore */ }
+}
+
+function _clearDraft(sessionId: string): void {
+  try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
+}
+
 export default function CodexChatInput({ sessionId, onSent }: Props) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => {
+    const inMem = _codexInputDrafts.get(sessionId);
+    if (inMem !== undefined) return inMem;
+    const persisted = _loadDraft(sessionId);
+    if (persisted) _codexInputDrafts.set(sessionId, persisted);
+    return persisted;
+  });
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -19,6 +68,14 @@ export default function CodexChatInput({ sessionId, onSent }: Props) {
     ta.style.height = Math.min(ta.scrollHeight, 240) + "px";
   }, [text]);
 
+  // Heartbeat: refresh updatedAt while the user stares at a draft so a
+  // long-running compose doesn't get reaped at 10min boundary.
+  useEffect(() => {
+    if (!text) return;
+    const id = setInterval(() => { _saveDraft(sessionId, text); }, DRAFT_HEARTBEAT_MS);
+    return () => clearInterval(id);
+  }, [sessionId, text]);
+
   const submit = async () => {
     const t = text.trim();
     if (!t || sending) return;
@@ -27,6 +84,8 @@ export default function CodexChatInput({ sessionId, onSent }: Props) {
     try {
       await sendCodexMessage(sessionId, t);
       setText("");
+      _codexInputDrafts.delete(sessionId);
+      _clearDraft(sessionId);
       onSent?.();
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
@@ -39,6 +98,17 @@ export default function CodexChatInput({ sessionId, onSent }: Props) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       submit();
+    }
+  };
+
+  const onChange = (val: string) => {
+    setText(val);
+    if (val) {
+      _codexInputDrafts.set(sessionId, val);
+      _saveDraft(sessionId, val);
+    } else {
+      _codexInputDrafts.delete(sessionId);
+      _clearDraft(sessionId);
     }
   };
 
@@ -60,7 +130,7 @@ export default function CodexChatInput({ sessionId, onSent }: Props) {
         <textarea
           ref={taRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKey}
           placeholder="Message Codex (Ctrl/⌘+Enter to send)…"
           rows={2}

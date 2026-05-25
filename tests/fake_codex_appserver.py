@@ -1,76 +1,88 @@
-"""Minimal JSON-RPC 2.0 over stdio fake — stands in for `codex app-server`
-in test_codex_appserver_client.py. Speaks the same line-delimited framing.
+"""Minimal JSON-RPC 2.0 over websockets — stands in for `codex app-server`
+in test_codex_appserver_client.py.
+
+Speaks the same JSON-RPC framing the real codex ws transport uses: each
+frame is one JSON object. The methods below mirror what the old stdio fake
+exposed; see test_codex_appserver_client.py for usage.
 
 Supported test methods (all called by CodexAppServerClient.send_request):
   - echo                  → returns params
   - delayed_echo          → returns params after `ms` ms
   - explode               → returns an error response using params.code/message
   - blackhole             → never responds
-  - blackhole_then_exit   → never responds; meanwhile awaits exit_now
   - emit_notification     → sends a ServerNotification with given method/params,
                             then returns {}
   - send_server_request   → sends a ServerRequest to the client, waits for its
                             response, then returns {client_reply: ..., client_error: ...}
-  - write_garbage_then_echo → writes a garbage non-JSON line, then returns params
-  - exit_now              → notification: causes the process to exit
+  - write_garbage_then_echo → writes a garbage non-JSON frame, then returns params
+  - exit_now              → server closes the websocket
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import sys
+from contextlib import asynccontextmanager
 from typing import Any
 
+import websockets
+from websockets import WebSocketServerProtocol
 
-def _write(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload) + "\n")
-    sys.stdout.flush()
+
+class _MethodError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(f"[{code}] {message}")
+        self.code = code
+        self.message = message
 
 
 class FakeServer:
-    def __init__(self) -> None:
+    """Per-connection JSON-RPC handler."""
+
+    def __init__(self, ws: WebSocketServerProtocol) -> None:
+        self._ws = ws
         self._next_server_request_id = 1_000_000  # avoid collision w/ client ids
         self._pending_client_responses: dict[int, asyncio.Future] = {}
-        self._stop = asyncio.Event()
+        self._close = asyncio.Event()
 
     async def run(self) -> None:
-        loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
         try:
-            while not self._stop.is_set():
-                line = await reader.readline()
-                if not line:
-                    return
+            async for raw in self._ws:
+                if self._close.is_set():
+                    break
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
                 try:
-                    msg = json.loads(line)
+                    msg = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
                 asyncio.create_task(self._handle(msg))
-        finally:
-            sys.stdout.flush()
+        except websockets.ConnectionClosed:
+            pass
+
+    async def _write(self, payload: dict) -> None:
+        await self._ws.send(json.dumps(payload))
 
     async def _handle(self, msg: dict) -> None:
         msg_id = msg.get("id")
         method = msg.get("method")
         params = msg.get("params") or {}
         if method is None and msg_id is not None:
-            # This is the client's response to one of OUR ServerRequests
+            # client's response to one of OUR ServerRequests
             fut = self._pending_client_responses.pop(int(msg_id), None)
             if fut and not fut.done():
                 fut.set_result(msg)
             return
         if method == "exit_now":
-            self._stop.set()
-            sys.exit(0)
+            self._close.set()
+            await self._ws.close()
+            return
         try:
             result = await self._dispatch_method(method, params)
             if msg_id is not None:
-                _write({"jsonrpc": "2.0", "id": msg_id, "result": result})
+                await self._write({"jsonrpc": "2.0", "id": msg_id, "result": result})
         except _MethodError as exc:
             if msg_id is not None:
-                _write(
+                await self._write(
                     {
                         "jsonrpc": "2.0",
                         "id": msg_id,
@@ -79,7 +91,7 @@ class FakeServer:
                 )
         except Exception as exc:
             if msg_id is not None:
-                _write(
+                await self._write(
                     {
                         "jsonrpc": "2.0",
                         "id": msg_id,
@@ -102,11 +114,8 @@ class FakeServer:
         if method == "blackhole":
             await asyncio.Event().wait()  # never returns
             return None
-        if method == "blackhole_then_exit":
-            await self._stop.wait()
-            return None
         if method == "emit_notification":
-            _write(
+            await self._write(
                 {
                     "jsonrpc": "2.0",
                     "method": params.get("method", "noop"),
@@ -119,7 +128,7 @@ class FakeServer:
             self._next_server_request_id += 1
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
             self._pending_client_responses[req_id] = fut
-            _write(
+            await self._write(
                 {
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -127,7 +136,6 @@ class FakeServer:
                     "params": params.get("params") or {},
                 }
             )
-            # Wait for the client to respond
             resp = await asyncio.wait_for(fut, timeout=3.0)
             out = {"client_reply": None, "client_error": None}
             if "result" in resp:
@@ -136,25 +144,21 @@ class FakeServer:
                 out["client_error"] = resp["error"]
             return out
         if method == "write_garbage_then_echo":
-            # Write a non-JSON line on stdout first
-            sys.stdout.write("this is not json at all\n")
-            sys.stdout.flush()
+            await self._ws.send("this is not json at all")
             return params
         raise _MethodError(-32601, f"method not found: {method}")
 
 
-class _MethodError(Exception):
-    def __init__(self, code: int, message: str) -> None:
-        super().__init__(f"[{code}] {message}")
-        self.code = code
-        self.message = message
+@asynccontextmanager
+async def serve_fake(host: str = "127.0.0.1", port: int = 0):
+    """Run the fake server on an ephemeral port; yield its ws URL."""
+    async def _handler(ws: WebSocketServerProtocol):
+        await FakeServer(ws).run()
 
-
-def main() -> None:
-    # Note: codex_appserver_client passes ["app-server", ...extras] as argv.
-    # We ignore argv entirely; we're just being a JSON-RPC server.
-    asyncio.run(FakeServer().run())
-
-
-if __name__ == "__main__":
-    main()
+    server = await websockets.serve(_handler, host, port)
+    actual_port = server.sockets[0].getsockname()[1]
+    try:
+        yield f"ws://{host}:{actual_port}/"
+    finally:
+        server.close()
+        await server.wait_closed()
