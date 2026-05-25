@@ -83,6 +83,11 @@ if user_store.is_empty():
     user_store.create_user(admin_cfg["username"], admin_cfg["password"], UserRole.ADMIN)
     user_store.set_is_admin(admin_cfg["username"], True)
 
+# Configure logging *before* the startup reconciliation loop runs, so the loop's
+# logger.info/exception calls (e.g. codex app-server reattach status) land in
+# the rotating log file instead of the default root logger.
+configure_logging()
+
 # Sync session state with actual tmux processes on startup
 for s in session_store.all():
     if s.status in (SessionStatus.RUNNING, SessionStatus.CREATING, SessionStatus.DETACHED):
@@ -149,8 +154,6 @@ terminal_ws.configure(session_store, tmux)
 shell_ws.configure(tmux, sessions_api._shell_tokens)
 term_ws.configure(tmux, term_mgr)
 terminals_api.configure(session_store, term_mgr)
-
-configure_logging()
 
 
 def _startup_ensure_bypass_accepted() -> None:
