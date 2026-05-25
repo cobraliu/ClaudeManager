@@ -192,11 +192,11 @@ def test_codex_get_jsonl_path_returns_none_for_unknown_id():
 
 def test_codex_list_local_sessions_returns_normalized_shape():
     """The /available-claude-sessions endpoint expects each entry to have
-    claude_session_id / title / mtime keys (frontend renders these directly)."""
+    agent_session_id / title / mtime keys (frontend renders these directly)."""
     from app.agents.codex import CodexAdapter
     rows = CodexAdapter().list_local_sessions("/nonexistent-cwd-xyz")
     # Either empty or has the expected keys
     for r in rows:
-        assert "claude_session_id" in r
+        assert "agent_session_id" in r
         assert "title" in r
         assert "mtime" in r

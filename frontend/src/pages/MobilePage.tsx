@@ -292,11 +292,11 @@ function MobileSessionPreviewModal({
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    getExternalPreview(session.claude_session_id, session.cwd, tool)
+    getExternalPreview(session.agent_session_id, session.cwd, tool)
       .then(setPreview)
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [session.claude_session_id, session.cwd, tool]);
+  }, [session.agent_session_id, session.cwd, tool]);
 
   const turns = preview?.turns ?? [];
   const splitAt = preview && preview.truncated_before > 0 ? 100 : turns.length;
@@ -467,9 +467,9 @@ function MobileBrowseExternalPanel({
               {/* Sessions under this dir */}
               {!isCollapsed && g.sessions.map((s) => {
                 const canLoad = g.dir_exists;
-                const isLoadingThis = loadingId === s.claude_session_id;
+                const isLoadingThis = loadingId === s.agent_session_id;
                 return (
-                  <div key={s.claude_session_id} style={{ padding: "10px 14px 10px 28px", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "flex-start", gap: 10, background: "var(--bg-base)" }}>
+                  <div key={s.agent_session_id} style={{ padding: "10px 14px 10px 28px", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "flex-start", gap: 10, background: "var(--bg-base)" }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 500 }}>
                         {s.title || <span style={{ color: "var(--text-faint)", fontStyle: "italic" }}>No title</span>}
@@ -482,12 +482,12 @@ function MobileBrowseExternalPanel({
                       <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2, display: "flex", gap: 8, alignItems: "center" }}>
                         <span>{relativeTime(s.mtime)}</span>
                         <span
-                          title={s.claude_session_id}
+                          title={s.agent_session_id}
                           style={{ fontFamily: "var(--font-mono, monospace)", color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                         >
-                          {s.claude_session_id.length > 18
-                            ? `${s.claude_session_id.slice(0, 8)}…${s.claude_session_id.slice(-5)}`
-                            : s.claude_session_id}
+                          {s.agent_session_id.length > 18
+                            ? `${s.agent_session_id.slice(0, 8)}…${s.agent_session_id.slice(-5)}`
+                            : s.agent_session_id}
                         </span>
                       </div>
                     </div>
@@ -507,7 +507,7 @@ function MobileBrowseExternalPanel({
                         onPointerDown={(e) => e.preventDefault()}
                         onClick={async () => {
                           if (!canLoad) return;
-                          setLoadingId(s.claude_session_id);
+                          setLoadingId(s.agent_session_id);
                           try { await onLoad(s, tool); } finally { setLoadingId(null); }
                         }}
                         style={{
@@ -795,7 +795,7 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
           onClose={() => setShowImport(false)}
           onLoad={async (ext, tool) => {
             const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
-            const newSession = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id, tool });
+            const newSession = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.agent_session_id, tool });
             setShowImport(false);
             onOpen(newSession);
           }}
@@ -2906,7 +2906,7 @@ function MobileResumeSelectPanel({
     setBusy(true);
     setErr("");
     try {
-      await setClaudeSessionId(sessionId, item.claude_session_id);
+      await setClaudeSessionId(sessionId, item.agent_session_id);
       await terminateSession(sessionId);
       const resumed = await resumeSession(sessionId);
       onDone(resumed);
@@ -2930,7 +2930,7 @@ function MobileResumeSelectPanel({
         {err && <div style={{ color: "var(--accent-red)", fontSize: 13, marginBottom: 8 }}>{err}</div>}
         {items.map((item) => (
           <button
-            key={item.claude_session_id}
+            key={item.agent_session_id}
             disabled={busy}
             onClick={() => handleSelect(item)}
             style={{
@@ -2941,10 +2941,10 @@ function MobileResumeSelectPanel({
             }}
           >
             <div style={{ fontSize: 13, color: "var(--text-primary)", marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {item.title || item.claude_session_id}
+              {item.title || item.agent_session_id}
             </div>
             <div style={{ fontSize: 11, color: "var(--text-muted)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {item.claude_session_id}
+              {item.agent_session_id}
             </div>
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
               {new Date(item.mtime * 1000).toLocaleString()}
@@ -5179,7 +5179,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
               onClick: async () => { try { await downloadConversationHtml(session); } catch (e) { alert(String(e)); } },
               color: iconMuted, bg: "transparent",
             },
-            ...(session.claude_session_id ? [{
+            ...(session.agent_session_id ? [{
               icon: <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: -0.3 }}>JSON</span>,
               title: "Preview conversation.jsonl",
               onClick: () => setShowJsonl(true),
@@ -5417,7 +5417,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
           onClose={() => setShowImport(false)}
           onLoad={async (ext, tool) => {
             const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
-            const s = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.claude_session_id, tool });
+            const s = await createSession({ project: dirName, cwd: ext.cwd, resume_session_id: ext.agent_session_id, tool });
             setShowImport(false); setSession(s);
           }}
         />

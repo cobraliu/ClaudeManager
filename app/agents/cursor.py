@@ -99,7 +99,7 @@ class CursorAdapter:
         raw = cursor_session_reader.list_cursor_sessions(cwd)
         return [
             {
-                "claude_session_id": s["cursor_session_id"],
+                "agent_session_id": s["cursor_session_id"],
                 "title": s.get("title"),
                 "mtime": s.get("mtime"),
             }

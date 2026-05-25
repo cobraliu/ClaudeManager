@@ -121,7 +121,7 @@ def run_once(store: SessionStore) -> None:
     if not CACHE_ROOT.is_dir():
         return
 
-    live_csids = store.get_all_claude_session_ids() or set()
+    live_csids = store.get_all_agent_session_ids() or set()
     total_caught_up = 0
     total_orphan_dirs = 0
 

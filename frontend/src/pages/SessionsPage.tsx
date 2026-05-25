@@ -984,11 +984,11 @@ function SessionPreviewModal({
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    getExternalPreview(session.claude_session_id, session.cwd, tool)
+    getExternalPreview(session.agent_session_id, session.cwd, tool)
       .then(setPreview)
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [session.claude_session_id, session.cwd]);
+  }, [session.agent_session_id, session.cwd]);
 
   return (
     <div style={{
@@ -1264,10 +1264,10 @@ function BrowseExternalPanel({
                 </div>
                 {activeGroup.sessions.map((s) => {
                   const canLoad = activeGroup.dir_exists;
-                  const isLoadingThis = loadingId === s.claude_session_id;
+                  const isLoadingThis = loadingId === s.agent_session_id;
                   return (
                     <div
-                      key={s.claude_session_id}
+                      key={s.agent_session_id}
                       style={{
                         padding: "8px 14px",
                         borderBottom: "1px solid var(--bg-hover)",
@@ -1286,12 +1286,12 @@ function BrowseExternalPanel({
                         <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 2, display: "flex", gap: 8, alignItems: "center" }}>
                           <span>{relativeTime(s.mtime)}</span>
                           <span
-                            title={s.claude_session_id}
+                            title={s.agent_session_id}
                             style={{ fontFamily: "var(--font-mono, monospace)", color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                           >
-                            {s.claude_session_id.length > 18
-                              ? `${s.claude_session_id.slice(0, 8)}…${s.claude_session_id.slice(-5)}`
-                              : s.claude_session_id}
+                            {s.agent_session_id.length > 18
+                              ? `${s.agent_session_id.slice(0, 8)}…${s.agent_session_id.slice(-5)}`
+                              : s.agent_session_id}
                           </span>
                         </div>
                       </div>
@@ -1313,7 +1313,7 @@ function BrowseExternalPanel({
                         title={canLoad ? "Load session" : "Directory does not exist"}
                         onClick={async () => {
                           if (!canLoad) return;
-                          setLoadingId(s.claude_session_id);
+                          setLoadingId(s.agent_session_id);
                           try { await onLoad(tool, s); } finally { setLoadingId(null); }
                         }}
                         style={{
@@ -1950,7 +1950,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     const newSession = await createSession({
       project: dirName,
       cwd: ext.cwd,
-      resume_session_id: ext.claude_session_id,
+      resume_session_id: ext.agent_session_id,
     });
     await refresh();
     const res = await attachSession(newSession.id);
@@ -1965,7 +1965,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     const newSession = await createSession({
       project: dirName,
       cwd: ext.cwd,
-      resume_session_id: ext.claude_session_id,
+      resume_session_id: ext.agent_session_id,
       tool: "cursor",
     });
     await refresh();
@@ -1981,7 +1981,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     const newSession = await createSession({
       project: dirName,
       cwd: ext.cwd,
-      resume_session_id: ext.claude_session_id,
+      resume_session_id: ext.agent_session_id,
       tool: "codex",
     });
     await refresh();
@@ -2648,7 +2648,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   📥 HTML
                 </button>
               )}
-              {activeSessionMeta && activeSessionMeta.claude_session_id && (
+              {activeSessionMeta && activeSessionMeta.agent_session_id && (
                 <button
                   onClick={() => {
                     if (inlineView === "jsonl") {

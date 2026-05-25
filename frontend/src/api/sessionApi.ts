@@ -18,7 +18,7 @@ export interface SessionMeta {
   attached_clients: number;
   model: string | null;
   resume_session_id: string | null;
-  claude_session_id: string | null;
+  agent_session_id: string | null;
   claude_title: string | null;
   prompts: string[];
   last_user_input_at?: string | null;
@@ -407,7 +407,7 @@ export function resumeSession(sessionId: string): Promise<SessionMeta> {
 }
 
 export interface AvailableClaudeSession {
-  claude_session_id: string;
+  agent_session_id: string;
   mtime: number;
   title: string | null;
 }
@@ -416,10 +416,10 @@ export function listAvailableClaudeSessions(sessionId: string): Promise<Availabl
   return request(`/api/sessions/${sessionId}/available-claude-sessions`);
 }
 
-export function setClaudeSessionId(sessionId: string, claudeSessionId: string): Promise<void> {
+export function setClaudeSessionId(sessionId: string, agentSessionId: string): Promise<void> {
   return request(`/api/sessions/${sessionId}/claude-session-id`, {
     method: "PUT",
-    body: JSON.stringify({ claude_session_id: claudeSessionId }),
+    body: JSON.stringify({ agent_session_id: agentSessionId }),
   });
 }
 
@@ -1434,7 +1434,7 @@ export function getSubAgentLines(sessionId: string, agentId: string, fromLine = 
 }
 
 export interface ExternalSession {
-  claude_session_id: string;
+  agent_session_id: string;
   mtime: number;
   title: string | null;
   prompts: string[];
@@ -1466,9 +1466,9 @@ export interface ExternalPreview {
   truncated_before: number;
 }
 
-export function getExternalPreview(claude_session_id: string, cwd: string, tool = "claude"): Promise<ExternalPreview> {
+export function getExternalPreview(agent_session_id: string, cwd: string, tool = "claude"): Promise<ExternalPreview> {
   return request<ExternalPreview>(
-    `/api/sessions/external-preview?claude_session_id=${encodeURIComponent(claude_session_id)}&cwd=${encodeURIComponent(cwd)}&tool=${encodeURIComponent(tool)}`
+    `/api/sessions/external-preview?agent_session_id=${encodeURIComponent(agent_session_id)}&cwd=${encodeURIComponent(cwd)}&tool=${encodeURIComponent(tool)}`
   );
 }
 

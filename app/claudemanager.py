@@ -387,17 +387,17 @@ def _try_resolve_claude_sid_from_files(cwd: str) -> str | None:
 def _sync_turn_ts(s) -> None:
     """Detect new turn_duration in JSONL and persist it to last_turn_at in the DB.
     Runs for all sessions regardless of git_auto_commit setting."""
-    if not s.claude_session_id:
+    if not s.agent_session_id:
         return
     if s.tool == "cursor":
         # Cursor has no turn markers; use file mtime as a proxy
         from app.services.cursor_session_reader import _find_jsonl as _find_cursor_jsonl
-        p = _find_cursor_jsonl(s.claude_session_id, s.cwd)
+        p = _find_cursor_jsonl(s.agent_session_id, s.cwd)
         if p is None:
             return
         latest_ts = p.stat().st_mtime
     else:
-        info = get_latest_turn_info(s.claude_session_id, s.cwd, since_ts=0.0)
+        info = get_latest_turn_info(s.agent_session_id, s.cwd, since_ts=0.0)
         latest_ts = info["turn_ts"]
         if latest_ts == 0.0:
             return
@@ -415,7 +415,7 @@ def _maybe_auto_commit(s) -> None:
     """
     if not is_git_repo(s.cwd):
         return
-    if not s.claude_session_id:
+    if not s.agent_session_id:
         return
 
     prev_ts = _last_committed_turn_ts.get(s.id)
@@ -428,7 +428,7 @@ def _maybe_auto_commit(s) -> None:
             _last_committed_turn_ts[s.id] = persisted
 
     # Pass prev_ts so the reader only returns prompts since last commit
-    info = get_latest_turn_info(s.claude_session_id, s.cwd, since_ts=prev_ts or 0.0)
+    info = get_latest_turn_info(s.agent_session_id, s.cwd, since_ts=prev_ts or 0.0)
     latest_ts = info["turn_ts"]
 
     if latest_ts == 0.0:
@@ -509,7 +509,7 @@ def _lookup_session_id_by_pid(pid: int) -> str | None:
 
 def _sync_session_states() -> None:
     """Check running/detached sessions against actual tmux processes.
-    Also try to resolve missing claude_session_id, and detect new output
+    Also try to resolve missing agent_session_id, and detect new output
     in sessions that have no attached WS clients."""
     for s in session_store.all():
         if s.status in (SessionStatus.RUNNING, SessionStatus.CREATING, SessionStatus.DETACHED):
@@ -520,13 +520,13 @@ def _sync_session_states() -> None:
                     pass
             else:
                 if s.status == SessionStatus.RUNNING:
-                    # Re-resolve claude_session_id every tick when the process is alive:
+                    # Re-resolve agent_session_id every tick when the process is alive:
                     # PID-based lookup is authoritative and catches the case where the
                     # session id changed (e.g. /resume created a new conversation file).
                     try:
                         sid: str | None = None
                         if s.tool == "cursor":
-                            if not s.claude_session_id:
+                            if not s.agent_session_id:
                                 sid = find_newest_cursor_session_id(s.cwd)
                         else:
                             # Try stored PID first (cheapest, authoritative when alive).
@@ -538,12 +538,12 @@ def _sync_session_states() -> None:
                                     session_store.update_claude_proc_pid(s.id, None)
                             if sid is None:
                                 # No live PID — scan the tmux pane's descendants.
-                                sid, proc_pid = tmux.resolve_claude_session_id(s.tmux_session_name, timeout=1)
+                                sid, proc_pid = tmux.resolve_agent_session_id(s.tmux_session_name, timeout=1)
                                 if proc_pid:
                                     session_store.update_claude_proc_pid(s.id, proc_pid)
-                        if sid and sid != s.claude_session_id:
-                            session_store.update_claude_session_id(s.id, sid)
-                            logger.info("watchdog updated claude_session_id for %s: %s → %s", s.id, s.claude_session_id, sid)
+                        if sid and sid != s.agent_session_id:
+                            session_store.update_agent_session_id(s.id, sid)
+                            logger.info("watchdog updated agent_session_id for %s: %s → %s", s.id, s.agent_session_id, sid)
                     except Exception:
                         pass
                 # Track turn completion for all sessions (drives has_new_output red dot)
@@ -570,16 +570,16 @@ def _sync_session_states() -> None:
                             session_store.update_activity_if_offset_changed(s.id, history_size)
                     except Exception:
                         pass
-        # For non-running sessions: check if claude_session_id is missing or stale
+        # For non-running sessions: check if agent_session_id is missing or stale
         if s.status in (SessionStatus.TERMINATED, SessionStatus.DETACHED):
             try:
                 if s.tool == "cursor":
                     newest = find_newest_cursor_session_id(s.cwd)
                 else:
                     newest = find_newest_claude_session_id(s.cwd)
-                if newest and newest != s.claude_session_id:
-                    session_store.update_claude_session_id(s.id, newest)
-                    logger.info("watchdog updated claude_session_id for %s: %s → %s", s.id, s.claude_session_id, newest)
+                if newest and newest != s.agent_session_id:
+                    session_store.update_agent_session_id(s.id, newest)
+                    logger.info("watchdog updated agent_session_id for %s: %s → %s", s.id, s.agent_session_id, newest)
             except Exception:
                 pass
 

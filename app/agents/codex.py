@@ -105,7 +105,7 @@ class CodexAdapter:
         raw = codex_session_reader.list_codex_sessions(cwd)
         return [
             {
-                "claude_session_id": s.get("codex_session_id") or s.get("session_id"),
+                "agent_session_id": s.get("codex_session_id") or s.get("session_id"),
                 "title": s.get("title"),
                 "mtime": s.get("mtime"),
             }
