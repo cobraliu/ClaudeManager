@@ -93,12 +93,12 @@ function formatTs(iso: string | undefined): string {
     const d = new Date(iso);
     const now = new Date();
     const p = (n: number) => String(n).padStart(2, "0");
-    const time = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     const isToday = d.getFullYear() === now.getFullYear()
       && d.getMonth() === now.getMonth()
       && d.getDate() === now.getDate();
-    if (isToday) return time;
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${time}`;
+    if (isToday) return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    // Non-today: drop year + seconds so the usage row fits one line on mobile.
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   } catch { return ""; }
 }
 
@@ -2678,18 +2678,18 @@ function TurnUsage({ model, usage }: { model?: string; usage?: RawUsage }) {
   const modelShort = model?.replace("claude-", "").replace(/-\d{8}$/, "") ?? "";
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "nowrap", minWidth: 0 }}>
       {modelShort && (
-        <span style={{ fontSize: 10, color: "var(--text-faintest)", fontFamily: "monospace", background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px" }}>
+        <span style={{ fontSize: 10, color: "var(--text-faintest)", fontFamily: "monospace", background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px", flexShrink: 0 }}>
           {modelShort}
         </span>
       )}
       {usage && (
-        <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "monospace" }}>
+        <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "monospace", whiteSpace: "nowrap" }}>
           <span title="input tokens">↑</span><span style={{ color: "var(--text-muted)" }}>{fmt(inp)}</span>
-          {cached > 0 && <span style={{ color: "var(--text-faintest)" }} title="cache read"> ♻{fmt(cached)}</span>}
-          {created > 0 && <span style={{ color: "var(--text-faintest)" }} title="cache write"> +{fmt(created)}</span>}
-          {" · "}<span title="output tokens">↓</span><span style={{ color: "var(--text-muted)" }}>{fmt(out)}</span>
+          {cached > 0 && <span style={{ color: "var(--text-faintest)" }} title="cache read">♻{fmt(cached)}</span>}
+          {created > 0 && <span style={{ color: "var(--text-faintest)" }} title="cache write">+{fmt(created)}</span>}
+          <span title="output tokens">·↓</span><span style={{ color: "var(--text-muted)" }}>{fmt(out)}</span>
         </span>
       )}
     </div>
@@ -3440,8 +3440,8 @@ function MessageEntry({
       <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
         {segments}
         {(msg.usage || ts) && (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "1px 16px 2px", gap: 8 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", flex: 1 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "1px 16px 2px", gap: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "nowrap", flex: 1, minWidth: 0 }}>
               {msg.usage && <TurnUsage model={msg.model} usage={msg.usage} />}
             </div>
             {ts && <span style={{ fontSize: 10, color: "var(--text-faintest)", flexShrink: 0 }}>{ts}</span>}
