@@ -339,6 +339,11 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
         if not is_git_repo(cwd):
             git_init(cwd)
 
+    # Codex app-server transport is only valid for the codex tool. Silently
+    # downgrade any stray "app_server" on non-codex sessions (frontend
+    # validates, this is defense-in-depth).
+    codex_transport = body.codex_transport if body.tool == "codex" else "tui"
+
     session = SessionMetadata(
         owner_id=user_id,
         name=tmux_name,
@@ -350,10 +355,41 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
         resume_session_id=body.resume_session_id,
         git_repo_url=body.git_repo_url if body.git_repo_url and not cwd_exists else None,
         tool=body.tool,
+        codex_transport=codex_transport,
     )
     store.create(session)
 
     is_new = not body.resume_session_id
+
+    if body.tool == "codex" and codex_transport == "app_server":
+        # App-server mode: skip tmux. Spawn `codex app-server` directly.
+        from app.services import codex_appserver_manager as csm
+        try:
+            pid = csm.start(
+                session.id,
+                cwd=cwd,
+                env=body.env or None,
+                model=body.model,
+            )
+        except Exception as exc:
+            store.transition(session.id, SessionStatus.TERMINATED)
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to start codex app-server: {exc}",
+            ) from exc
+        store.update_codex_appserver_pid(session.id, pid)
+        # Pick up thread id once it's available
+        tid = csm.get_thread_id(session.id)
+        if tid:
+            store.update_agent_session_id(session.id, tid)
+        store.transition(session.id, SessionStatus.RUNNING)
+        audit_event(
+            user_id,
+            "create",
+            session.id,
+            {"project": body.project, "tool": body.tool, "transport": "app_server"},
+        )
+        return session
 
     try:
         tmux.create_session(
@@ -573,6 +609,42 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
             )
             for t in tasks
         ]
+        # Codex app-server transport bypasses the Claude PID/hook machinery
+        # entirely. The manager owns the live AUQ/approval cache; route via
+        # the adapter so this branch stays explicit at the top.
+        if s.tool == "codex" and s.codex_transport == "app_server":
+            from app.agents import get_adapter
+            ws = None
+            if s.status == SessionStatus.RUNNING:
+                try:
+                    ws = get_adapter("codex").get_waiting_state(
+                        agent_session_id=s.agent_session_id,
+                        agent_pid=None,
+                        cwd=s.cwd,
+                        session_id=s.id,
+                    )
+                except Exception:
+                    ws = None
+            tui_auq_data = ws.get("raw") if ws and ws.get("kind") == "auq" else None
+            tui_approve_data = ws.get("raw") if ws and ws.get("kind") == "approve" else None
+            tui_hint = ws.get("hint") if ws else None
+            is_compacting = bool(ws and ws.get("kind") == "compacting")
+            views.append(
+                SessionStatusView(
+                    id=s.id,
+                    status=s.status,
+                    attached_clients=s.attached_clients,
+                    has_new_output=new_output_map.get(s.id, False),
+                    is_streaming=False,
+                    is_compacting=is_compacting,
+                    compacting_progress=None,
+                    scheduled_tasks=task_views,
+                    tui_hint=tui_hint,
+                    tui_auq_data=tui_auq_data,
+                    tui_approve_data=tui_approve_data,
+                )
+            )
+            continue
         # PID file is checked first, but Claude Code 2.1.142+ no longer reliably
         # sets waitingFor for AUQ, so we additionally consult the PreToolUse hook
         # file — it captures the AUQ call before the user answers.
@@ -844,10 +916,19 @@ def terminate_session(session_id: str, user_id: CurrentUser) -> None:
             except Exception:
                 pass
 
-    try:
-        tmux.terminate(session.tmux_session_name)
-    except TmuxError:
-        pass
+    if session.tool == "codex" and session.codex_transport == "app_server":
+        # App-server mode never spawned a tmux session — just stop the client.
+        from app.services import codex_appserver_manager as csm
+        try:
+            csm.stop(session_id)
+        except Exception:
+            pass
+        store.update_codex_appserver_pid(session_id, None)
+    else:
+        try:
+            tmux.terminate(session.tmux_session_name)
+        except TmuxError:
+            pass
     # The Claude process is now dead — clear the stale PID so the next resume's
     # watchdog doesn't try to read /proc/{dead_pid}/sessions/.
     store.update_claude_proc_pid(session_id, None)
@@ -1065,9 +1146,92 @@ def delete_session(session_id: str, user_id: CurrentUser) -> None:
         raise HTTPException(status_code=404, detail="session not found")
     if session.status != SessionStatus.TERMINATED:
         raise HTTPException(status_code=409, detail="only terminated sessions can be deleted")
+    if session.tool == "codex" and session.codex_transport == "app_server":
+        # Belt-and-suspenders: terminate already calls stop(), but if a user
+        # deletes a session that crashed without going through terminate,
+        # there may still be a live client.
+        from app.services import codex_appserver_manager as csm
+        try:
+            csm.stop(session_id)
+        except Exception:
+            pass
     store.delete_tasks_for_session(session_id)
     store.delete(session_id)
     audit_event(user_id, "delete", session_id)
+
+
+# ── Codex app-server transport ────────────────────────────────────────────
+
+
+class CodexMessageRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=200_000)
+
+
+def _require_codex_appserver(session_id: str, user_id: str) -> SessionMetadata:
+    """Common 404/409 guard for the app-server endpoints below."""
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if session.tool != "codex" or session.codex_transport != "app_server":
+        raise HTTPException(
+            status_code=400,
+            detail="endpoint only valid for codex sessions with app-server transport",
+        )
+    return session
+
+
+@router.post("/{session_id}/codex-message")
+def post_codex_message(
+    session_id: str, body: CodexMessageRequest, user_id: CurrentUser
+) -> dict:
+    """Send a user message to a codex app-server session."""
+    _require_codex_appserver(session_id, user_id)
+    from app.services import codex_appserver_manager as csm
+    try:
+        result = csm.send_user_message(session_id, body.text)
+    except KeyError:
+        raise HTTPException(status_code=409, detail="codex app-server is not running for this session")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"codex send failed: {exc}") from exc
+    return {"ok": True, "result": result}
+
+
+class CodexAuqResolveRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=10_000)
+
+
+@router.post("/{session_id}/codex-auq")
+def post_codex_auq_resolve(
+    session_id: str, body: CodexAuqResolveRequest, user_id: CurrentUser
+) -> dict:
+    """Resolve a pending tool/requestUserInput in a codex app-server session."""
+    _require_codex_appserver(session_id, user_id)
+    from app.services import codex_appserver_manager as csm
+    try:
+        csm.resolve_auq(session_id, body.text)
+    except KeyError:
+        raise HTTPException(status_code=409, detail="no pending AUQ for this session")
+    return {"ok": True}
+
+
+class CodexApprovalResolveRequest(BaseModel):
+    allow: bool
+    feedback: str | None = Field(default=None, max_length=2_000)
+
+
+@router.post("/{session_id}/codex-approve")
+def post_codex_approval_resolve(
+    session_id: str, body: CodexApprovalResolveRequest, user_id: CurrentUser
+) -> dict:
+    """Resolve a pending approval ServerRequest in a codex app-server session."""
+    _require_codex_appserver(session_id, user_id)
+    from app.services import codex_appserver_manager as csm
+    try:
+        csm.resolve_approval(session_id, allow=body.allow, feedback=body.feedback)
+    except KeyError:
+        raise HTTPException(status_code=409, detail="no pending approval for this session")
+    return {"ok": True}
 
 
 # ── Scheduled Tasks ──────────────────────────────────────────────────────────
