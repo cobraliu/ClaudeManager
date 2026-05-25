@@ -92,6 +92,7 @@ class ClaudeAdapter:
         agent_session_id: Optional[str],
         agent_pid: Optional[int],
         cwd: str,
+        session_id: Optional[str] = None,
     ) -> Optional[WaitingState]:
         result = claude_pid.get_pid_waiting_state(agent_pid)
         if not result:

@@ -118,8 +118,32 @@ class CodexAdapter:
         agent_session_id: Optional[str],
         agent_pid: Optional[int],
         cwd: str,
+        session_id: Optional[str] = None,
     ) -> Optional[WaitingState]:
-        # Phase 3: derive from app-server pending requests table. For now None.
+        """For TUI sessions this stays None (rollout JSONL has no live AUQ).
+        For app-server sessions the manager owns a live cache."""
+        if not session_id:
+            return None
+        # Avoid the import cost when no app-server session exists for this id.
+        from app.services import codex_appserver_manager as csm
+        if not csm.is_alive(session_id):
+            return None
+        approval = csm.get_pending_approval(session_id)
+        if approval is not None:
+            return WaitingState(
+                kind="approve",
+                hint=f"Codex: {approval['method']}",
+                raw=approval,
+            )
+        auq = csm.get_pending_auq(session_id)
+        if auq is not None:
+            return WaitingState(
+                kind="auq",
+                hint="Codex is asking a question",
+                raw=auq,
+            )
+        if csm.is_compacting(session_id):
+            return WaitingState(kind="compacting", hint="Codex is compacting", raw={})
         return None
 
     def list_models(self) -> list[dict[str, Any]]:
