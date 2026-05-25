@@ -1,78 +1,39 @@
 import { useState, useRef, useEffect } from "react";
 import { sendCodexMessage } from "../api/sessionApi";
+import {
+  inputDrafts,
+  loadDraft,
+  saveDraft,
+  clearDraft,
+  loadInputHeight,
+  startInputHeightDrag,
+  INPUT_HEIGHT_MIN,
+  DRAFT_HEARTBEAT_MS,
+} from "../lib/sessionInputPersist";
 
 type Props = {
   sessionId: string;
   onSent?: () => void;
 };
 
-// Per-session input draft cache. Mirrors ConversationPane.tsx's pattern so
-// Codex app-server sessions get the same draft-survives-refresh behavior as
-// Claude/Cursor sessions. Different prefix so the two caches don't collide.
-const _codexInputDrafts = new Map<string, string>();
-
-const DRAFT_PREFIX = "codexInputDraft:v1:";
-const DRAFT_TTL_MS = 10 * 60 * 1000;
-const DRAFT_MAX_BYTES = 4096;
-const DRAFT_HEARTBEAT_MS = 60 * 1000;
-
-function _draftKey(sessionId: string): string { return DRAFT_PREFIX + sessionId; }
-
-function _loadDraft(sessionId: string): string {
-  try {
-    const raw = localStorage.getItem(_draftKey(sessionId));
-    if (!raw) return "";
-    const obj = JSON.parse(raw);
-    if (typeof obj?.text !== "string" || typeof obj?.updatedAt !== "number") return "";
-    if (Date.now() - obj.updatedAt > DRAFT_TTL_MS) {
-      try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
-      return "";
-    }
-    return obj.text;
-  } catch { return ""; }
-}
-
-function _saveDraft(sessionId: string, text: string): void {
-  if (!text) { _clearDraft(sessionId); return; }
-  let bytes: number;
-  try { bytes = new TextEncoder().encode(text).length; } catch { bytes = text.length * 4; }
-  if (bytes > DRAFT_MAX_BYTES) {
-    try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
-    return;
-  }
-  try {
-    localStorage.setItem(_draftKey(sessionId), JSON.stringify({ text, updatedAt: Date.now() }));
-  } catch { /* quota or disabled — ignore */ }
-}
-
-function _clearDraft(sessionId: string): void {
-  try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
-}
-
 export default function CodexChatInput({ sessionId, onSent }: Props) {
   const [text, setText] = useState(() => {
-    const inMem = _codexInputDrafts.get(sessionId);
+    const inMem = inputDrafts.get(sessionId);
     if (inMem !== undefined) return inMem;
-    const persisted = _loadDraft(sessionId);
-    if (persisted) _codexInputDrafts.set(sessionId, persisted);
+    const persisted = loadDraft(sessionId);
+    if (persisted) inputDrafts.set(sessionId, persisted);
     return persisted;
   });
+  const [inputHeight, setInputHeight] = useState<number>(() => loadInputHeight(sessionId));
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 240) + "px";
-  }, [text]);
 
   // Heartbeat: refresh updatedAt while the user stares at a draft so a
   // long-running compose doesn't get reaped at 10min boundary.
   useEffect(() => {
     if (!text) return;
-    const id = setInterval(() => { _saveDraft(sessionId, text); }, DRAFT_HEARTBEAT_MS);
+    const id = setInterval(() => { saveDraft(sessionId, text); }, DRAFT_HEARTBEAT_MS);
     return () => clearInterval(id);
   }, [sessionId, text]);
 
@@ -84,8 +45,8 @@ export default function CodexChatInput({ sessionId, onSent }: Props) {
     try {
       await sendCodexMessage(sessionId, t);
       setText("");
-      _codexInputDrafts.delete(sessionId);
-      _clearDraft(sessionId);
+      inputDrafts.delete(sessionId);
+      clearDraft(sessionId);
       onSent?.();
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
@@ -104,11 +65,11 @@ export default function CodexChatInput({ sessionId, onSent }: Props) {
   const onChange = (val: string) => {
     setText(val);
     if (val) {
-      _codexInputDrafts.set(sessionId, val);
-      _saveDraft(sessionId, val);
+      inputDrafts.set(sessionId, val);
+      saveDraft(sessionId, val);
     } else {
-      _codexInputDrafts.delete(sessionId);
-      _clearDraft(sessionId);
+      inputDrafts.delete(sessionId);
+      clearDraft(sessionId);
     }
   };
 
@@ -117,23 +78,39 @@ export default function CodexChatInput({ sessionId, onSent }: Props) {
       style={{
         display: "flex",
         flexDirection: "column",
-        gap: 6,
-        padding: 8,
         background: "var(--bg-panel)",
         borderTop: "1px solid var(--border)",
       }}
     >
+      {/* Top grip: mirror of ConversationPane's drag-to-resize handle. */}
+      <div
+        onMouseDown={(e) => {
+          startInputHeightDrag({
+            sessionId,
+            startClientY: e.clientY,
+            startHeight: inputHeight,
+            maxHeight: window.innerHeight * 0.75,
+            onChange: setInputHeight,
+          });
+        }}
+        title="Drag to resize input"
+        style={{
+          height: 6, cursor: "ns-resize", display: "flex", alignItems: "center", justifyContent: "center",
+          background: "transparent",
+        }}
+      >
+        <div style={{ width: 40, height: 3, borderRadius: 2, background: "var(--text-faintest)" }} />
+      </div>
       {error && (
-        <div style={{ fontSize: 11, color: "#ef4444" }}>{error}</div>
+        <div style={{ fontSize: 11, color: "#ef4444", padding: "0 8px 4px" }}>{error}</div>
       )}
-      <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
+      <div style={{ display: "flex", gap: 6, alignItems: "flex-end", padding: "2px 8px 8px" }}>
         <textarea
           ref={taRef}
           value={text}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKey}
           placeholder="Message Codex (Ctrl/⌘+Enter to send)…"
-          rows={2}
           style={{
             flex: 1,
             resize: "none",
@@ -145,8 +122,8 @@ export default function CodexChatInput({ sessionId, onSent }: Props) {
             fontSize: 13,
             fontFamily: "inherit",
             outline: "none",
-            minHeight: 40,
-            maxHeight: 240,
+            height: inputHeight,
+            minHeight: INPUT_HEIGHT_MIN,
           }}
         />
         <button

@@ -4,6 +4,18 @@ import hljs from "highlight.js/lib/common";
 import { marked, renderMarkdown } from "../lib/markdown";
 import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
+import {
+  inputDrafts,
+  loadDraft,
+  saveDraft,
+  clearDraft,
+  cleanupExpiredDrafts,
+  loadInputHeight,
+  startInputHeightDrag,
+  INPUT_HEIGHT_MIN,
+  DRAFT_HEARTBEAT_MS,
+  DRAFT_CLEANUP_MS,
+} from "../lib/sessionInputPersist";
 
 const POLL_MS = 1500;
 const DEFAULT_TAIL = 100;
@@ -3628,73 +3640,6 @@ interface OptimisticMsg {
 
 type WsStatus = "connecting" | "connected" | "disconnected" | "error";
 
-// Per-session input draft cache. The in-memory Map handles fast session
-// switches within a tab; localStorage mirrors it so drafts also survive page
-// refresh and tab close, for up to DRAFT_TTL_MS of staleness.
-const _inputDrafts = new Map<string, string>();
-
-const DRAFT_PREFIX = "convInputDraft:v1:";
-const DRAFT_TTL_MS = 10 * 60 * 1000;        // 10 minutes
-const DRAFT_MAX_BYTES = 4096;               // 4 KB; oversize → skip persist
-const DRAFT_HEARTBEAT_MS = 60 * 1000;       // refresh updatedAt every 1 min
-const DRAFT_CLEANUP_MS = 60 * 1000;         // sweep expired keys every 1 min
-
-function _draftKey(sessionId: string): string { return DRAFT_PREFIX + sessionId; }
-
-function _loadDraft(sessionId: string): string {
-  try {
-    const raw = localStorage.getItem(_draftKey(sessionId));
-    if (!raw) return "";
-    const obj = JSON.parse(raw);
-    if (typeof obj?.text !== "string" || typeof obj?.updatedAt !== "number") return "";
-    if (Date.now() - obj.updatedAt > DRAFT_TTL_MS) {
-      try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
-      return "";
-    }
-    return obj.text;
-  } catch { return ""; }
-}
-
-function _saveDraft(sessionId: string, text: string): void {
-  if (!text) { _clearDraft(sessionId); return; }
-  // UTF-8 byte length; oversize → don't persist (in-memory Map still works)
-  let bytes: number;
-  try { bytes = new TextEncoder().encode(text).length; } catch { bytes = text.length * 4; }
-  if (bytes > DRAFT_MAX_BYTES) {
-    try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
-    return;
-  }
-  try {
-    localStorage.setItem(_draftKey(sessionId), JSON.stringify({ text, updatedAt: Date.now() }));
-  } catch { /* quota or disabled — ignore */ }
-}
-
-function _clearDraft(sessionId: string): void {
-  try { localStorage.removeItem(_draftKey(sessionId)); } catch { /* ignore */ }
-}
-
-function _cleanupExpiredDrafts(): void {
-  try {
-    const now = Date.now();
-    const toRemove: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (!key || !key.startsWith(DRAFT_PREFIX)) continue;
-      const raw = localStorage.getItem(key);
-      if (!raw) { toRemove.push(key); continue; }
-      try {
-        const obj = JSON.parse(raw);
-        if (typeof obj?.updatedAt !== "number" || now - obj.updatedAt > DRAFT_TTL_MS) {
-          toRemove.push(key);
-        }
-      } catch { toRemove.push(key); }  // corrupted entry
-    }
-    for (const k of toRemove) {
-      try { localStorage.removeItem(k); } catch { /* ignore */ }
-    }
-  } catch { /* ignore */ }
-}
-
 export function ConversationPane({ sessionId, tool, codexTransport, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
   // Codex app-server transport: no tmux, no terminal WS. The parent (SessionsPage)
   // owns input via CodexChatInput → POST /codex-message. We must short-circuit the
@@ -3707,10 +3652,10 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const [total, setTotal] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
   const [input, setInput] = useState(() => {
-    const inMem = _inputDrafts.get(sessionId);
+    const inMem = inputDrafts.get(sessionId);
     if (inMem !== undefined) return inMem;
-    const persisted = _loadDraft(sessionId);
-    if (persisted) _inputDrafts.set(sessionId, persisted);
+    const persisted = loadDraft(sessionId);
+    if (persisted) inputDrafts.set(sessionId, persisted);
     return persisted;
   });
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
@@ -3725,11 +3670,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const seenCompactUuidsRef = useRef<Set<string>>(new Set());
   // Input height resizable via top-edge grip (drag up to enlarge).
-  const [inputHeight, setInputHeight] = useState<number>(() => {
-    const v = parseInt(localStorage.getItem("convInputHeight") || "", 10);
-    return isFinite(v) && v >= 44 ? v : 44;
-  });
-  const inputResizeRef = useRef<{ startY: number; startH: number } | null>(null);
+  const [inputHeight, setInputHeight] = useState<number>(() => loadInputHeight(sessionId));
 
   // ── Derived data ─────────────────────────────────────────────────────────
 
@@ -4300,7 +4241,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
             // Restore the text into the input box so the user can edit/retry.
             // Don't clobber what they may have started typing in the meantime.
             setInput((cur) => cur ? cur : text);
-            if (text) { _inputDrafts.set(sessionId, text); _saveDraft(sessionId, text); }
+            if (text) { inputDrafts.set(sessionId, text); saveDraft(sessionId, text); }
           },
           onClose: () => {
             if (wsConnectTimer) { clearTimeout(wsConnectTimer); wsConnectTimer = null; }
@@ -4341,14 +4282,14 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   // TTL sweeper doesn't reap a draft the user is still composing.
   useEffect(() => {
     if (!input) return;
-    const id = setInterval(() => { _saveDraft(sessionId, input); }, DRAFT_HEARTBEAT_MS);
+    const id = setInterval(() => { saveDraft(sessionId, input); }, DRAFT_HEARTBEAT_MS);
     return () => clearInterval(id);
   }, [sessionId, input]);
 
   // Periodic sweep of expired draft keys across all sessions in this origin.
   useEffect(() => {
-    _cleanupExpiredDrafts();
-    const id = setInterval(_cleanupExpiredDrafts, DRAFT_CLEANUP_MS);
+    cleanupExpiredDrafts();
+    const id = setInterval(cleanupExpiredDrafts, DRAFT_CLEANUP_MS);
     return () => clearInterval(id);
   }, []);
 
@@ -4369,8 +4310,8 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
       { id: _randomId(), text, sentAt: Date.now() },
     ]);
     setInput("");
-    _inputDrafts.delete(sessionId);
-    _clearDraft(sessionId);
+    inputDrafts.delete(sessionId);
+    clearDraft(sessionId);
     wsRef.current.sendPrompt(text);
     stickToBottom.current = true;
     requestAnimationFrame(() => scrollToBottom(false));
@@ -4499,8 +4440,8 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                 const blocks = getBlocks(entry.message.content as RawContentBlock[] | string);
                 const sendAnswer = (text: string) => {
                   setInput("");
-                  _inputDrafts.delete(sessionId);
-                  _clearDraft(sessionId);
+                  inputDrafts.delete(sessionId);
+                  clearDraft(sessionId);
                   wsRef.current?.sendPrompt(text);
                   stickToBottom.current = true;
                   requestAnimationFrame(() => scrollToBottom(true));
@@ -4754,21 +4695,13 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
             the page, so resizing must extend upward, not from a corner. */}
         <div
           onMouseDown={(e) => {
-            inputResizeRef.current = { startY: e.clientY, startH: inputHeight };
-            const onMove = (ev: MouseEvent) => {
-              const ref = inputResizeRef.current;
-              if (!ref) return;
-              const next = Math.max(44, Math.min(window.innerHeight * 0.75, ref.startH + (ref.startY - ev.clientY)));
-              setInputHeight(next);
-            };
-            const onUp = () => {
-              inputResizeRef.current = null;
-              localStorage.setItem("convInputHeight", String(Math.round(inputHeight)));
-              window.removeEventListener("mousemove", onMove);
-              window.removeEventListener("mouseup", onUp);
-            };
-            window.addEventListener("mousemove", onMove);
-            window.addEventListener("mouseup", onUp);
+            startInputHeightDrag({
+              sessionId,
+              startClientY: e.clientY,
+              startHeight: inputHeight,
+              maxHeight: window.innerHeight * 0.75,
+              onChange: setInputHeight,
+            });
           }}
           title="Drag to resize input"
           style={{
@@ -4785,8 +4718,8 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
             onChange={(e) => {
               const val = e.target.value;
               setInput(val);
-              if (val) { _inputDrafts.set(sessionId, val); _saveDraft(sessionId, val); }
-              else { _inputDrafts.delete(sessionId); _clearDraft(sessionId); }
+              if (val) { inputDrafts.set(sessionId, val); saveDraft(sessionId, val); }
+              else { inputDrafts.delete(sessionId); clearDraft(sessionId); }
             }}
             onKeyDown={handleKeyDown}
             placeholder={
