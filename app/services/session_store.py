@@ -327,15 +327,6 @@ class SessionStore:
             ).fetchall()
             return {r[0] for r in rows}
 
-    def update_codex_appserver_pid(self, session_id: str, pid: int | None) -> None:
-        with self._lock:
-            now = self._now()
-            self._conn.execute(
-                "UPDATE sessions SET codex_appserver_pid = ?, updated_at = ? WHERE id = ?",
-                (pid, now, session_id),
-            )
-            self._conn.commit()
-
     def update_codex_appserver_endpoint(
         self, session_id: str, pid: int | None, port: int | None
     ) -> None:

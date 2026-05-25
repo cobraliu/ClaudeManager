@@ -1,19 +1,17 @@
 """Tests for codex_appserver_manager.
 
-Uses the same fake server as test_codex_appserver_client.py, with a small
-adapter that lets us spawn the manager-owned client pointed at the fake
-instead of the real `codex` binary. Two slots of the manager are not
-testable against the fake without extra protocol fixtures:
-
-  * thread/start    — the real server returns {threadId: ...}; our fake
-                       doesn't implement it. We monkeypatch the manager's
-                       start() to skip thread/start.
-  * initialize       — same; fake responds with an error. We monkeypatch to
-                       skip it too.
+Uses the same fake ws server as test_codex_appserver_client.py, with the
+manager's spawn/health helpers stubbed so we never actually launch a
+`codex` binary or bind a real port. The fake server speaks JSON-RPC over
+websockets the same way `codex app-server --listen ws://` does; one
+running server handles every per-session ws connection (each connection
+gets its own FakeServer state, so sessions don't cross-talk).
 
 What we actually verify:
 
-  * start/stop lifecycle + is_alive
+  * start/stop lifecycle + is_alive + pid/port plumbing
+  * thread/start + thread/resume sandbox/approval overrides
+  * thread/resume falls back to thread/start on "no rollout found"
   * plan + compaction notification caches
   * ServerRequest (AUQ / approval) interception → pending state cached
   * resolve_approval / resolve_auq write a response back to the server
@@ -22,59 +20,134 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
+import threading
 import time
-from pathlib import Path
 
 import pytest
+import websockets
 
 from app.services import codex_appserver_manager as mgr
 from app.services.codex_appserver_client import CodexAppServerClient
+from tests.fake_codex_appserver import FakeServer
 
 
-FAKE_SERVER = Path(__file__).parent / "fake_codex_appserver.py"
+# ── shared fake ws server (one per test, supports multiple connections) ──
+
+
+class _FakeServerHandle:
+    """A websockets.serve() running on its own thread+loop.
+
+    Tests use this instead of `serve_fake()` because the manager runs from
+    sync code and spawns multiple ws connections per test — we need the
+    server alive across all of them.
+    """
+
+    def __init__(self) -> None:
+        self.port: int = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._server = None
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._stopped = threading.Event()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name="fake-codex-appserver", daemon=True
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=5.0):
+            raise RuntimeError("fake codex app-server failed to start")
+
+    def stop(self) -> None:
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+
+        async def _handler(ws):
+            await FakeServer(ws).run()
+
+        async def _start_server():
+            self._server = await websockets.serve(_handler, "127.0.0.1", 0)
+            self.port = self._server.sockets[0].getsockname()[1]
+            self._ready.set()
+
+        loop.run_until_complete(_start_server())
+        try:
+            loop.run_forever()
+        finally:
+            if self._server is not None:
+                self._server.close()
+                loop.run_until_complete(self._server.wait_closed())
+            loop.close()
+            self._stopped.set()
 
 
 @pytest.fixture(autouse=True)
-def _patch_client_for_fake(monkeypatch):
-    """Wrap CodexAppServerClient inside the manager so it points at the fake
-    and skips initialize/thread/start (the fake doesn't speak the real
-    codex protocol). Restored after each test."""
+def _patch_manager_for_fake(monkeypatch):
+    """Stub the manager's process+port helpers so tests run against the fake.
 
-    real_cls = CodexAppServerClient
+    The fake replaces the actual `codex app-server --listen ws://...` binary.
+    The manager still goes through its real `start()` codepath; only the
+    side-effects that touch real OS resources (spawn, port bind, /readyz,
+    pid kill) are swapped for harmless stand-ins.
+    """
+    handle = _FakeServerHandle()
+    handle.start()
 
-    def _make(*, cwd, env=None, codex_bin="codex", extra_args=None):
-        # extra_args is accepted (and ignored) so the manager can pass --enable
-        # default_mode_request_user_input — the fake server doesn't care about
-        # codex CLI feature flags.
-        return real_cls(
-            cwd=cwd,
-            env=env,
-            codex_bin=sys.executable,
-            subcommand=[str(FAKE_SERVER)],
-        )
+    # Manager will use the fake's port instead of trying to bind a real one.
+    monkeypatch.setattr(mgr, "_alloc_port", lambda: handle.port)
 
-    monkeypatch.setattr(mgr, "CodexAppServerClient", _make)
+    # No subprocess — pretend the spawn returned our own pid. Our patched
+    # _terminate_pid will refuse to signal it.
+    fake_pid = os.getpid()
+    monkeypatch.setattr(
+        mgr,
+        "_spawn_detached",
+        lambda **kw: fake_pid,
+    )
 
-    # Bypass initialize / thread/start by overriding the inner setup coro.
-    # We do this by intercepting the client.send_request to no-op for those
-    # two methods.
-    real_send = real_cls.send_request
+    # The fake doesn't host /readyz; just succeed immediately.
+    async def _no_wait(port, *, timeout):
+        return None
+
+    monkeypatch.setattr(mgr, "_wait_ready", _no_wait)
+
+    # Belt-and-suspenders: never actually kill our own process.
+    monkeypatch.setattr(mgr, "_terminate_pid", lambda pid: None)
+    monkeypatch.setattr(mgr, "_pid_alive", lambda pid: True)
+
+    # Short-circuit codex-specific RPCs the fake doesn't speak (initialize,
+    # thread/start, thread/resume). Everything else (echo, emit_notification,
+    # send_server_request, blackhole, ...) still hits the fake.
+    real_send = CodexAppServerClient.send_request
 
     async def _patched_send(self, method, params=None, *, timeout=30.0):
         if method == "initialize":
-            return {}  # fake doesn't implement initialize
+            return {}
         if method == "thread/start":
-            # Manager reads {thread: {id|sessionId}} or top-level {threadId}.
             return {"thread": {"id": "fake-thread-id"}}
         if method == "thread/resume":
-            return {"thread": {"id": params.get("threadId", "fake-thread-id") if params else "fake-thread-id"}}
+            tid = (params or {}).get("threadId", "fake-thread-id")
+            return {"thread": {"id": tid}}
         return await real_send(self, method, params, timeout=timeout)
 
     monkeypatch.setattr(CodexAppServerClient, "send_request", _patched_send)
-    yield
-    # Tear down anything left behind from this test
-    mgr.shutdown_all()
+
+    try:
+        yield
+    finally:
+        # Tear down any clients this test left behind. Default
+        # terminate_process=False is harmless (our _terminate_pid is a no-op
+        # anyway) but matches production graceful-shutdown semantics.
+        mgr.shutdown_all(terminate_process=False)
+        handle.stop()
 
 
 def _wait_until(predicate, *, timeout: float = 2.0, interval: float = 0.02) -> bool:
@@ -89,12 +162,14 @@ def _wait_until(predicate, *, timeout: float = 2.0, interval: float = 0.02) -> b
 # ── lifecycle ────────────────────────────────────────────────────────────
 
 
-def test_start_returns_pid_and_marks_alive():
-    pid = mgr.start("s1", cwd=os.getcwd())
+def test_start_returns_pid_and_port_and_marks_alive():
+    pid, port = mgr.start("s1", cwd=os.getcwd())
     try:
         assert isinstance(pid, int) and pid > 0
+        assert isinstance(port, int) and port > 0
         assert mgr.is_alive("s1") is True
         assert mgr.get_pid("s1") == pid
+        assert mgr.get_port("s1") == port
     finally:
         mgr.stop("s1")
 
@@ -105,6 +180,7 @@ def test_stop_clears_state_and_is_idempotent():
     mgr.stop("s1")  # idempotent
     assert mgr.is_alive("s1") is False
     assert mgr.get_pid("s1") is None
+    assert mgr.get_port("s1") is None
 
 
 def test_start_twice_same_session_raises():
@@ -120,7 +196,6 @@ def test_resume_falls_back_to_start_when_no_rollout(monkeypatch):
     """If thread/resume reports 'no rollout found', start() should retry
     with thread/start and end up alive with the new thread id."""
     from app.services.codex_appserver_client import (
-        CodexAppServerClient,
         CodexAppServerError,
     )
 
@@ -141,7 +216,7 @@ def test_resume_falls_back_to_start_when_no_rollout(monkeypatch):
 
     monkeypatch.setattr(CodexAppServerClient, "send_request", _no_rollout_then_start)
 
-    pid = mgr.start(
+    pid, port = mgr.start(
         "s1",
         cwd=os.getcwd(),
         resume_thread_id="019e5e49-d65a-7a53-8dad-a6dc820f33c0",
@@ -159,8 +234,6 @@ def test_thread_start_sends_sandbox_and_approval_overrides(monkeypatch):
     """start() must pin sandbox=workspace-write + approvalPolicy=on-request on
     fresh threads. Without this, codex's compiled-in default falls to read-only
     in any untrusted cwd, which silently hangs request_user_input turns."""
-    from app.services.codex_appserver_client import CodexAppServerClient
-
     real_send = CodexAppServerClient.send_request
     captured: dict[str, dict] = {}
 
@@ -188,8 +261,6 @@ def test_thread_resume_sends_sandbox_and_approval_overrides(monkeypatch):
     """thread/resume must also pin sandbox/approvalPolicy — codex applies the
     same trust-based default at resume time, so a stale read-only would still
     bite when the user returns to an existing session."""
-    from app.services.codex_appserver_client import CodexAppServerClient
-
     real_send = CodexAppServerClient.send_request
     captured: dict[str, dict] = {}
 
@@ -216,7 +287,6 @@ def test_thread_resume_sends_sandbox_and_approval_overrides(monkeypatch):
 def test_resume_propagates_other_errors(monkeypatch):
     """Errors other than 'no rollout' must NOT trigger the fallback."""
     from app.services.codex_appserver_client import (
-        CodexAppServerClient,
         CodexAppServerError,
     )
 
@@ -246,6 +316,29 @@ def test_list_sessions_reflects_state():
     finally:
         mgr.stop("x1")
         assert "x1" not in mgr.list_sessions()
+
+
+# ── reconnect ────────────────────────────────────────────────────────────
+
+
+def test_reconnect_attaches_without_thread_start():
+    """reconnect() must NOT send thread/start or thread/resume — the codex
+    process still owns the in-memory thread. Only initialize + ws handshake."""
+    # First start so we have a port + pid + thread id on file.
+    pid, port = mgr.start("s1", cwd=os.getcwd())
+    thread_id = mgr.get_thread_id("s1")
+    # Detach without killing the (fake) process.
+    mgr.stop("s1", terminate_process=False)
+    assert mgr.is_alive("s1") is False
+
+    mgr.reconnect("s1", pid=pid, port=port, thread_id=thread_id)
+    try:
+        assert mgr.is_alive("s1") is True
+        assert mgr.get_pid("s1") == pid
+        assert mgr.get_port("s1") == port
+        assert mgr.get_thread_id("s1") == thread_id
+    finally:
+        mgr.stop("s1")
 
 
 # ── notification cache ───────────────────────────────────────────────────

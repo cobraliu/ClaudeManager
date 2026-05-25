@@ -365,7 +365,7 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
         # App-server mode: skip tmux. Spawn `codex app-server` directly.
         from app.services import codex_appserver_manager as csm
         try:
-            pid = csm.start(
+            pid, port = csm.start(
                 session.id,
                 cwd=cwd,
                 env=body.env or None,
@@ -377,7 +377,7 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
                 status_code=500,
                 detail=f"failed to start codex app-server: {exc}",
             ) from exc
-        store.update_codex_appserver_pid(session.id, pid)
+        store.update_codex_appserver_endpoint(session.id, pid, port)
         # Pick up thread id once it's available
         tid = csm.get_thread_id(session.id)
         if tid:
@@ -917,13 +917,14 @@ def terminate_session(session_id: str, user_id: CurrentUser) -> None:
                 pass
 
     if session.tool == "codex" and session.codex_transport == "app_server":
-        # App-server mode never spawned a tmux session — just stop the client.
+        # App-server mode never spawned a tmux session — kill the detached
+        # codex process and clear pid+port.
         from app.services import codex_appserver_manager as csm
         try:
-            csm.stop(session_id)
+            csm.stop(session_id, terminate_process=True)
         except Exception:
             pass
-        store.update_codex_appserver_pid(session_id, None)
+        store.update_codex_appserver_endpoint(session_id, None, None)
     else:
         try:
             tmux.terminate(session.tmux_session_name)
@@ -955,7 +956,7 @@ def resume_session(session_id: str, user_id: CurrentUser) -> SessionMetadata:
     if session.tool == "codex" and session.codex_transport == "app_server":
         from app.services import codex_appserver_manager as csm
         try:
-            pid = csm.start(
+            pid, port = csm.start(
                 session_id,
                 cwd=session.cwd,
                 env=session.env or None,
@@ -967,7 +968,7 @@ def resume_session(session_id: str, user_id: CurrentUser) -> SessionMetadata:
                 status_code=500,
                 detail=f"failed to resume codex app-server: {exc}",
             ) from exc
-        store.update_codex_appserver_pid(session_id, pid)
+        store.update_codex_appserver_endpoint(session_id, pid, port)
         # thread/resume preserves the id, but pick it up defensively in case
         # the underlying codex returned a forked id.
         tid = csm.get_thread_id(session_id)
