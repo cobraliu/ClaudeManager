@@ -86,13 +86,45 @@ if user_store.is_empty():
 # Sync session state with actual tmux processes on startup
 for s in session_store.all():
     if s.status in (SessionStatus.RUNNING, SessionStatus.CREATING, SessionStatus.DETACHED):
-        # Codex app-server sessions don't have a tmux session — the subprocess
-        # is a child of the previous backend process and is gone after restart.
+        # Codex app-server sessions don't run under tmux. Since we switched to
+        # detached spawn + ws transport, the codex process should outlive a
+        # backend restart. Try to reattach via the persisted (pid, port); if
+        # either is missing or the process is gone, mark terminated and clear
+        # the endpoint so the next /resume can spawn fresh.
         if s.tool == "codex" and s.codex_transport == "app_server":
-            try:
-                session_store.force_status(s.id, SessionStatus.TERMINATED)
-            except Exception:
-                pass
+            from app.services import codex_appserver_manager as csm
+            reattached = False
+            if (
+                s.codex_appserver_pid
+                and s.codex_appserver_port
+                and csm._pid_alive(s.codex_appserver_pid)  # noqa: SLF001
+            ):
+                try:
+                    csm.reconnect(
+                        s.id,
+                        pid=s.codex_appserver_pid,
+                        port=s.codex_appserver_port,
+                        thread_id=s.agent_session_id,
+                    )
+                    reattached = True
+                    logger.info(
+                        "codex app-server: reattached session %s (pid=%d port=%d)",
+                        s.id,
+                        s.codex_appserver_pid,
+                        s.codex_appserver_port,
+                    )
+                except Exception:
+                    logger.exception(
+                        "codex app-server: failed to reattach session %s; "
+                        "marking terminated",
+                        s.id,
+                    )
+            if not reattached:
+                try:
+                    session_store.force_status(s.id, SessionStatus.TERMINATED)
+                    session_store.update_codex_appserver_endpoint(s.id, None, None)
+                except Exception:
+                    pass
         elif not tmux.has_session(s.tmux_session_name):
             # tmux session gone – mark terminated
             try:
@@ -642,6 +674,14 @@ async def lifespan(app: FastAPI):
             await t
         except asyncio.CancelledError:
             pass
+    # Detach from every codex app-server WITHOUT terminating the process —
+    # this leaves them alive so the next backend restart can reconnect via
+    # the startup reconciliation block above.
+    try:
+        from app.services import codex_appserver_manager as csm
+        csm.shutdown_all(terminate_process=False)
+    except Exception:
+        logger.exception("codex app-server: shutdown_all failed")
 
 
 app = FastAPI(title="Claude Session Manager", version="0.2.0", lifespan=lifespan)
