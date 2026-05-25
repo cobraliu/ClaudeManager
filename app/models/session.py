@@ -28,6 +28,7 @@ class SessionCreateRequest(BaseModel):
     resume_session_id: str | None = Field(default=None, max_length=200)
     git_repo_url: str | None = Field(default=None, max_length=500)
     tool: Literal["claude", "cursor", "codex"] = "claude"
+    codex_transport: Literal["tui", "app_server"] = "tui"
 
 
 class SessionMetadata(BaseModel):
@@ -51,6 +52,8 @@ class SessionMetadata(BaseModel):
     resume_session_id: str | None = None
     agent_session_id: str | None = None
     claude_proc_pid: int | None = None
+    codex_transport: Literal["tui", "app_server"] = "tui"
+    codex_appserver_pid: int | None = None
     git_auto_commit: bool = False
     git_commit_msg_count: int = 0
     git_repo_url: str | None = None
