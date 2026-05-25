@@ -48,7 +48,7 @@ def list_project_session_ids(cwd: str) -> list[dict]:
                     mtime = f.stat().st_mtime
                     data = enrich_session(stem, cwd)
                     results.append({
-                        "claude_session_id": stem,
+                        "agent_session_id": stem,
                         "mtime": mtime,
                         "title": data.get("title"),
                     })
@@ -620,8 +620,8 @@ def _read_session_cwd(jsonl_path: Path) -> str | None:
 def list_all_claude_sessions_global(excluded_ids: set[str]) -> list[dict]:
     """Scan all ~/.claude/projects dirs and return sessions grouped by cwd.
 
-    Excludes sessions whose claude_session_id is in excluded_ids.
-    Returns [{"dir": cwd, "sessions": [{claude_session_id, mtime, title, prompts, cwd}]}]
+    Excludes sessions whose agent_session_id is in excluded_ids.
+    Returns [{"dir": cwd, "sessions": [{agent_session_id, mtime, title, prompts, cwd}]}]
     sorted by most-recently-active dir first.
     """
     projects_dir = Path.home() / ".claude" / "projects"
@@ -655,7 +655,7 @@ def list_all_claude_sessions_global(excluded_ids: set[str]) -> list[dict]:
             data = enrich_session(stem, cwd)
 
             entry = {
-                "claude_session_id": stem,
+                "agent_session_id": stem,
                 "mtime": mtime,
                 "title": data.get("title"),
                 "prompts": data.get("prompts", []),

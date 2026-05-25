@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     ws_token TEXT,
     tmux_session_name TEXT NOT NULL,
     resume_session_id TEXT,
-    claude_session_id TEXT
+    agent_session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
@@ -83,9 +83,19 @@ class SessionStore:
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        # Auto-migrate: rename claude_session_id → agent_session_id (column was
+        # historically tied to Claude; now reused by Cursor/Codex). Try first so
+        # the subsequent ADD COLUMN list sees the renamed column.
+        try:
+            self._conn.execute(
+                "ALTER TABLE sessions RENAME COLUMN claude_session_id TO agent_session_id"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # already renamed, or column didn't exist
         # Auto-migrate: add columns that may not exist yet
         for col, coltype in [
-            ("claude_session_id", "TEXT"),
+            ("agent_session_id", "TEXT"),
             ("claude_proc_pid", "INTEGER"),
             ("last_activity_at", "TEXT"),
             ("git_auto_commit", "INTEGER NOT NULL DEFAULT 0"),
@@ -128,7 +138,7 @@ class SessionStore:
             ws_token=row["ws_token"],
             tmux_session_name=row["tmux_session_name"],
             resume_session_id=row["resume_session_id"],
-            claude_session_id=row["claude_session_id"],
+            agent_session_id=row["agent_session_id"],
             claude_proc_pid=row["claude_proc_pid"] if "claude_proc_pid" in row.keys() else None,
             git_auto_commit=bool(row["git_auto_commit"]),
             git_commit_msg_count=int(row["git_commit_msg_count"]),
@@ -146,7 +156,7 @@ class SessionStore:
                    (id, owner_id, name, project, cwd, env, model, status,
                     created_at, updated_at, attached_clients, last_output_offset,
                     last_activity_at, ws_token, tmux_session_name, resume_session_id,
-                    claude_session_id, git_repo_url, tool)
+                    agent_session_id, git_repo_url, tool)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     session.id,
@@ -165,7 +175,7 @@ class SessionStore:
                     session.ws_token,
                     session.tmux_session_name,
                     session.resume_session_id,
-                    session.claude_session_id,
+                    session.agent_session_id,
                     session.git_repo_url,
                     session.tool,
                 ),
@@ -290,28 +300,28 @@ class SessionStore:
             )
             self._conn.commit()
 
-    def update_claude_session_id(self, session_id: str, claude_session_id: str) -> None:
+    def update_agent_session_id(self, session_id: str, agent_session_id: str) -> None:
         with self._lock:
             now = self._now()
             self._conn.execute(
-                "UPDATE sessions SET claude_session_id = ?, updated_at = ? WHERE id = ?",
-                (claude_session_id, now, session_id),
+                "UPDATE sessions SET agent_session_id = ?, updated_at = ? WHERE id = ?",
+                (agent_session_id, now, session_id),
             )
             self._conn.commit()
 
-    def get_all_claude_session_ids(self, exclude_session_id: str | None = None) -> set[str]:
+    def get_all_agent_session_ids(self, exclude_session_id: str | None = None) -> set[str]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT claude_session_id FROM sessions WHERE claude_session_id IS NOT NULL AND id != ?",
+                "SELECT agent_session_id FROM sessions WHERE agent_session_id IS NOT NULL AND id != ?",
                 (exclude_session_id or "",),
             ).fetchall()
             return {r[0] for r in rows}
 
-    def clear_claude_session_id(self, session_id: str) -> None:
+    def clear_agent_session_id(self, session_id: str) -> None:
         with self._lock:
             now = self._now()
             self._conn.execute(
-                "UPDATE sessions SET claude_session_id = NULL, updated_at = ? WHERE id = ?",
+                "UPDATE sessions SET agent_session_id = NULL, updated_at = ? WHERE id = ?",
                 (now, session_id),
             )
             self._conn.commit()

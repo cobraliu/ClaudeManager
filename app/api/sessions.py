@@ -374,18 +374,18 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
 
     # For cursor/codex sessions, resume_session_id IS the agent session UUID — store immediately.
     if body.tool in ("cursor", "codex") and body.resume_session_id:
-        store.update_claude_session_id(session.id, body.resume_session_id)
+        store.update_agent_session_id(session.id, body.resume_session_id)
 
     if body.tool == "claude":
         def _resolve():
             if is_new:
-                claude_sid, proc_pid = tmux.resolve_claude_session_id_by_inner_id(session.id, timeout=15)
+                claude_sid, proc_pid = tmux.resolve_agent_session_id_by_inner_id(session.id, timeout=15)
             else:
-                claude_sid, proc_pid = tmux.resolve_claude_session_id(tmux_name, timeout=15)
+                claude_sid, proc_pid = tmux.resolve_agent_session_id(tmux_name, timeout=15)
             if proc_pid:
                 store.update_claude_proc_pid(session.id, proc_pid)
             if claude_sid:
-                store.update_claude_session_id(session.id, claude_sid)
+                store.update_agent_session_id(session.id, claude_sid)
 
         threading.Thread(target=_resolve, daemon=True).start()
     elif body.tool == "codex" and is_new:
@@ -398,7 +398,7 @@ def create_session(body: SessionCreateRequest, user_id: CurrentUser) -> SessionM
             while time.time() < deadline:
                 sid = adapter.find_newest_session_id(cwd)
                 if sid:
-                    store.update_claude_session_id(session.id, sid)
+                    store.update_agent_session_id(session.id, sid)
                     return
                 time.sleep(1.0)
 
@@ -418,8 +418,8 @@ def _enrich(
     """Add Claude title, display prompts, new-output flag, and streaming flag."""
     from app.agents import get_adapter
     view = SessionView(**session.model_dump())
-    if session.claude_session_id:
-        data = get_adapter(session.tool).enrich(session.claude_session_id, session.cwd)
+    if session.agent_session_id:
+        data = get_adapter(session.tool).enrich(session.agent_session_id, session.cwd)
         view.claude_title = data.get("title")
         view.prompts = data.get("prompts", [])
         view.last_user_input_at = data.get("last_user_input_at")
@@ -470,7 +470,7 @@ def _filter_sessions(
         if (
             ql in s.project.lower()
             or ql in s.cwd.lower()
-            or ql in (s.claude_session_id or "").lower()
+            or ql in (s.agent_session_id or "").lower()
             or ql in s.status.value.lower()
             or ql in (s.model or "").lower()
             or ql in s.owner_id.lower()
@@ -478,7 +478,7 @@ def _filter_sessions(
             results.append(s)
             continue
         # Search full conversation text (cached)
-        if s.claude_session_id and search_conversation(s.claude_session_id, s.cwd, ql):
+        if s.agent_session_id and search_conversation(s.agent_session_id, s.cwd, ql):
             results.append(s)
     return results
 
@@ -514,7 +514,7 @@ def list_all_sessions(
 def browse_external_sessions(user_id: CurrentUser) -> list[dict]:
     """Return all Claude sessions from ~/.claude/projects not already in ClaudeManager."""
     store = _get_store()
-    occupied = store.get_all_claude_session_ids()
+    occupied = store.get_all_agent_session_ids()
     return list_all_claude_sessions_global(occupied)
 
 
@@ -522,7 +522,7 @@ def browse_external_sessions(user_id: CurrentUser) -> list[dict]:
 def browse_cursor_sessions(user_id: CurrentUser) -> list[dict]:
     """Return all Cursor agent sessions from ~/.cursor/projects not already in ClaudeManager."""
     store = _get_store()
-    occupied = store.get_all_claude_session_ids()
+    occupied = store.get_all_agent_session_ids()
     return list_all_cursor_sessions_global(occupied)
 
 
@@ -531,15 +531,15 @@ def browse_codex_sessions(user_id: CurrentUser) -> list[dict]:
     """Return all Codex sessions from ~/.codex/sessions/ not already in ClaudeManager."""
     from app.services.codex_session_reader import list_all_codex_sessions_global as _list_codex
     store = _get_store()
-    occupied = store.get_all_claude_session_ids()
+    occupied = store.get_all_agent_session_ids()
     return _list_codex(occupied)
 
 
 @router.get("/external-preview")
-def get_external_preview(claude_session_id: str, cwd: str, user_id: CurrentUser, tool: str = "claude") -> dict:
+def get_external_preview(agent_session_id: str, cwd: str, user_id: CurrentUser, tool: str = "claude") -> dict:
     """Return first 100 + last 100 turns of an external session for preview."""
     from app.agents import get_adapter
-    turns = get_adapter(tool).get_conversation(claude_session_id, cwd)
+    turns = get_adapter(tool).get_conversation(agent_session_id, cwd)
     total = len(turns)
     if total <= 200:
         preview = turns
@@ -580,7 +580,7 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
         tui_auq_data: dict | None = None
         tui_approve_data: dict | None = None
         if pid_state:
-            hook_entry = _read_session_hooks(s.claude_session_id) if s.claude_session_id else {"auq": None, "approve": None}
+            hook_entry = _read_session_hooks(s.agent_session_id) if s.agent_session_id else {"auq": None, "approve": None}
             if pid_state[1] == "auq":
                 tui_auq_data = hook_entry.get("auq")
                 if not tui_auq_data:
@@ -602,8 +602,8 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
         # Fallback path: AUQ from hooks when the PID file didn't flag waiting.
         # We only consider a hook AUQ "pending" if its tool_use_id has no
         # corresponding tool_result in the JSONL yet.
-        if tui_auq_data is None and s.status == SessionStatus.RUNNING and s.claude_session_id:
-            pending = _pending_auq_from_hooks(s.claude_session_id, s.cwd)
+        if tui_auq_data is None and s.status == SessionStatus.RUNNING and s.agent_session_id:
+            pending = _pending_auq_from_hooks(s.agent_session_id, s.cwd)
             if pending:
                 tui_auq_data = pending
         # If we have AUQ data but no formatted hint, surface the standard hint
@@ -643,8 +643,8 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
                 except Exception:
                     tui_screen_for_hook = None
 
-        if eligible and s.claude_session_id:
-            if _is_compacting_via_hook(s.claude_session_id, s.cwd, tui_screen_for_hook):
+        if eligible and s.agent_session_id:
+            if _is_compacting_via_hook(s.agent_session_id, s.cwd, tui_screen_for_hook):
                 is_compacting = True
 
         screen = tui_screen_for_hook
@@ -805,7 +805,7 @@ def terminate_session(session_id: str, user_id: CurrentUser) -> None:
     if session.status == SessionStatus.TERMINATED:
         return
 
-    if not session.claude_session_id:
+    if not session.agent_session_id:
         # Try to capture claude_session_id before killing the process.
         # Strategy 1: read the PID file written by our sh wrapper — it exists
         # as soon as sh runs (before exec claude), so it's available quickly.
@@ -823,7 +823,7 @@ def terminate_session(session_id: str, user_id: CurrentUser) -> None:
                         _data = _json.loads(_sf.read_text())
                         _sid = _data.get("sessionId")
                         if _sid:
-                            store.update_claude_session_id(session_id, _sid)
+                            store.update_agent_session_id(session_id, _sid)
                             _resolved = True
                             try:
                                 _pid_file.unlink(missing_ok=True)
@@ -836,11 +836,11 @@ def terminate_session(session_id: str, user_id: CurrentUser) -> None:
         # Strategy 2: fall back to descendant-PID scan if pid file not ready
         if not _resolved and tmux.has_session(session.tmux_session_name):
             try:
-                claude_sid, proc_pid = tmux.resolve_claude_session_id(session.tmux_session_name, timeout=2)
+                claude_sid, proc_pid = tmux.resolve_agent_session_id(session.tmux_session_name, timeout=2)
                 if proc_pid:
                     store.update_claude_proc_pid(session_id, proc_pid)
                 if claude_sid:
-                    store.update_claude_session_id(session_id, claude_sid)
+                    store.update_agent_session_id(session_id, claude_sid)
             except Exception:
                 pass
 
@@ -852,8 +852,8 @@ def terminate_session(session_id: str, user_id: CurrentUser) -> None:
     # watchdog doesn't try to read /proc/{dead_pid}/sessions/.
     store.update_claude_proc_pid(session_id, None)
     store.transition(session_id, SessionStatus.TERMINATED)
-    if session.claude_session_id:
-        _cleanup_session_hooks(session.claude_session_id)
+    if session.agent_session_id:
+        _cleanup_session_hooks(session.agent_session_id)
     audit_event(user_id, "terminate", session_id)
 
 
@@ -875,7 +875,7 @@ def resume_session(session_id: str, user_id: CurrentUser) -> SessionMetadata:
     # If we have a stored claude_session_id, hand it to `claude --resume` so the
     # conversation continues where it left off. Otherwise start fresh and let the
     # watchdog discover the new id from ~/.claude/sessions/{pid}.json.
-    resume_sid = session.claude_session_id or None
+    resume_sid = session.agent_session_id or None
 
     try:
         tmux.create_session(
@@ -903,11 +903,11 @@ def resume_session(session_id: str, user_id: CurrentUser) -> SessionMetadata:
         # overwrite it once the new process publishes its pid.json.
         store.update_claude_proc_pid(session_id, None)
         def _resolve():
-            claude_sid, proc_pid = tmux.resolve_claude_session_id(tmux_name, timeout=15)
+            claude_sid, proc_pid = tmux.resolve_agent_session_id(tmux_name, timeout=15)
             if proc_pid:
                 store.update_claude_proc_pid(session_id, proc_pid)
             if claude_sid:
-                store.update_claude_session_id(session_id, claude_sid)
+                store.update_agent_session_id(session_id, claude_sid)
         threading.Thread(target=_resolve, daemon=True).start()
 
     return store.get(session_id)  # type: ignore[return-value]
@@ -930,10 +930,10 @@ def rewind_session(session_id: str, body: _RewindBody, user_id: CurrentUser) -> 
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    if not session.claude_session_id:
+    if not session.agent_session_id:
         raise HTTPException(status_code=400, detail="no claude session attached")
 
-    jsonl_path = _find_session_jsonl(session.claude_session_id, session.cwd)
+    jsonl_path = _find_session_jsonl(session.agent_session_id, session.cwd)
     if not jsonl_path:
         raise HTTPException(status_code=404, detail="session JSONL not found")
 
@@ -962,7 +962,7 @@ def rewind_session(session_id: str, body: _RewindBody, user_id: CurrentUser) -> 
         raise HTTPException(status_code=404, detail="message UUID not found in JSONL")
 
     # Restore files from snapshot
-    file_history_dir = _Path.home() / ".claude" / "file-history" / session.claude_session_id
+    file_history_dir = _Path.home() / ".claude" / "file-history" / session.agent_session_id
     restored: list[str] = []
     for rel_path, info in snapshot_backups.items():
         if not isinstance(info, dict):
@@ -1000,7 +1000,7 @@ def rewind_session(session_id: str, body: _RewindBody, user_id: CurrentUser) -> 
             cwd=session.cwd,
             env=session.env or {},
             claude_model=session.model,
-            resume_session_id=session.claude_session_id,
+            resume_session_id=session.agent_session_id,
         )
     except TmuxError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1011,13 +1011,13 @@ def rewind_session(session_id: str, body: _RewindBody, user_id: CurrentUser) -> 
     audit_event(user_id, "rewind", session_id)
 
     # Resolve new inner claude_session_id asynchronously (--resume gives a new ID)
-    store.clear_claude_session_id(session_id)
+    store.clear_agent_session_id(session_id)
     def _resolve_new_sid():
-        sid, proc_pid = tmux.resolve_claude_session_id(tmux_name, timeout=20)
+        sid, proc_pid = tmux.resolve_agent_session_id(tmux_name, timeout=20)
         if proc_pid:
             store.update_claude_proc_pid(session_id, proc_pid)
         if sid:
-            store.update_claude_session_id(session_id, sid)
+            store.update_agent_session_id(session_id, sid)
     threading.Thread(target=_resolve_new_sid, daemon=True).start()
 
     return {"ok": True, "restored_files": restored, "kept_lines": len(truncated)}
@@ -1141,9 +1141,9 @@ def list_goals(session_id: str, user_id: CurrentUser) -> dict:
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    if not session.claude_session_id:
+    if not session.agent_session_id:
         return {"active": None, "history": []}
-    return read_goals(session.claude_session_id, session.cwd)
+    return read_goals(session.agent_session_id, session.cwd)
 
 
 # ── Todos (TodoWrite from JSONL) ──────────────────────────────────────────────
@@ -1155,9 +1155,9 @@ def list_session_todos(session_id: str, user_id: CurrentUser) -> dict:
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    if not session.claude_session_id:
+    if not session.agent_session_id:
         return {"active": [], "history": []}
-    return get_todo_plans(session.claude_session_id, session.cwd)
+    return get_todo_plans(session.agent_session_id, session.cwd)
 
 
 # ── AUQ history ───────────────────────────────────────────────────────────────
@@ -1169,9 +1169,9 @@ def list_session_auqs(session_id: str, user_id: CurrentUser) -> list[dict]:
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    if not session.claude_session_id:
+    if not session.agent_session_id:
         return []
-    return list_auqs(session.claude_session_id, session.cwd)
+    return list_auqs(session.agent_session_id, session.cwd)
 
 
 # ── Shell sessions (ephemeral bash terminals) ─────────────────────────────────
@@ -1605,8 +1605,8 @@ def manual_git_commit(session_id: str, body: GitManualCommitRequest, user_id: Cu
     if not is_git_repo(session.cwd):
         raise HTTPException(status_code=400, detail="not a git repo")
     msg = body.message
-    if not msg and session.claude_session_id:
-        info = get_latest_turn_info(session.claude_session_id, session.cwd)
+    if not msg and session.agent_session_id:
+        info = get_latest_turn_info(session.agent_session_id, session.cwd)
         if info["last_summary"]:
             msg = make_commit_message(info["prompts_since"], info["last_summary"])
         else:
@@ -1720,7 +1720,7 @@ def get_session_conversation(
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
     adapter = get_adapter(session.tool)
-    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    chat_sid = session.agent_session_id or adapter.find_newest_session_id(session.cwd)
     if not chat_sid:
         return []
     turns = adapter.get_conversation(chat_sid, session.cwd, from_ts=from_ts)
@@ -1748,7 +1748,7 @@ def get_conversation_jsonl_raw(
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
     adapter = get_adapter(session.tool)
-    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    chat_sid = session.agent_session_id or adapter.find_newest_session_id(session.cwd)
     if not chat_sid:
         raise HTTPException(status_code=404, detail=f"no {session.tool} session")
     jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd)
@@ -1803,14 +1803,14 @@ def list_available_claude_sessions(session_id: str, user_id: CurrentUser) -> lis
 
     all_sessions = get_adapter(session.tool).list_local_sessions(session.cwd)
 
-    # Collect occupied IDs: any session (other than this one) with a claude_session_id
-    occupied = store.get_all_claude_session_ids(exclude_session_id=session_id)
-    # Also exclude the current session's own claude_session_id from results
-    current_sid = session.claude_session_id
+    # Collect occupied IDs: any session (other than this one) with an agent_session_id
+    occupied = store.get_all_agent_session_ids(exclude_session_id=session_id)
+    # Also exclude the current session's own agent_session_id from results
+    current_sid = session.agent_session_id
 
     return [
         s for s in all_sessions
-        if s["claude_session_id"] not in occupied and s["claude_session_id"] != current_sid
+        if s["agent_session_id"] not in occupied and s["agent_session_id"] != current_sid
     ]
 
 
@@ -1821,7 +1821,7 @@ def get_subagents(session_id: str, user_id: CurrentUser) -> list[dict]:
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    chat_sid = session.claude_session_id or find_newest_claude_session_id(session.cwd)
+    chat_sid = session.agent_session_id or find_newest_claude_session_id(session.cwd)
     if not chat_sid:
         return []
     return list_subagents(chat_sid, session.cwd)
@@ -1839,24 +1839,28 @@ def get_subagent_content(
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    chat_sid = session.claude_session_id or find_newest_claude_session_id(session.cwd)
+    chat_sid = session.agent_session_id or find_newest_claude_session_id(session.cwd)
     if not chat_sid:
         raise HTTPException(status_code=404, detail="no claude session")
     return get_subagent_lines(chat_sid, session.cwd, agent_id, from_line)
 
 
-class SetClaudeSessionIdRequest(BaseModel):
-    claude_session_id: str
+class SetAgentSessionIdRequest(BaseModel):
+    agent_session_id: str
 
 
 @router.put("/{session_id}/claude-session-id", status_code=status.HTTP_204_NO_CONTENT)
-def set_claude_session_id(session_id: str, body: SetClaudeSessionIdRequest, user_id: CurrentUser) -> None:
-    """Update the claude_session_id used when resuming this session."""
+def set_agent_session_id(session_id: str, body: SetAgentSessionIdRequest, user_id: CurrentUser) -> None:
+    """Update the agent_session_id used when resuming this session.
+
+    URL path keeps the historical `/claude-session-id` segment for callers that
+    haven't migrated yet; the body field is the new `agent_session_id`.
+    """
     store = _get_store()
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    store.update_claude_session_id(session_id, body.claude_session_id)
+    store.update_agent_session_id(session_id, body.agent_session_id)
 
 
 @router.get("/{session_id}/raw-messages")
@@ -1880,7 +1884,7 @@ def get_raw_messages(
         raise HTTPException(status_code=404, detail="session not found")
 
     adapter = get_adapter(session.tool)
-    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    chat_sid = session.agent_session_id or adapter.find_newest_session_id(session.cwd)
 
     if session.tool == "codex" and chat_sid:
         from app.services.codex_session_reader import get_codex_raw_messages
@@ -2106,7 +2110,7 @@ def get_raw_messages_all(
         raise HTTPException(status_code=404, detail="session not found")
 
     adapter = get_adapter(session.tool)
-    chat_sid = session.claude_session_id or adapter.find_newest_session_id(session.cwd)
+    chat_sid = session.agent_session_id or adapter.find_newest_session_id(session.cwd)
 
     if session.tool == "codex" and chat_sid:
         from app.services.codex_session_reader import get_codex_raw_messages

@@ -310,7 +310,7 @@ class TmuxService:
         except OSError:
             return False
 
-    def resolve_claude_session_id_by_inner_id(self, inner_id: str, timeout: float = 15.0) -> tuple[str | None, int | None]:
+    def resolve_agent_session_id_by_inner_id(self, inner_id: str, timeout: float = 15.0) -> tuple[str | None, int | None]:
         """Resolve Claude session ID for a new session using the PID file written by the wrapper sh.
         Returns (sessionId, pid) — either or both may be None on failure."""
         pid_file = Path(f"/tmp/claude-inner-{inner_id}.pid")
@@ -342,7 +342,7 @@ class TmuxService:
             pass
         return None, found_pid
 
-    def resolve_claude_session_id(self, session_name: str, timeout: float = 15.0) -> tuple[str | None, int | None]:
+    def resolve_agent_session_id(self, session_name: str, timeout: float = 15.0) -> tuple[str | None, int | None]:
         """
         Wait for Claude CLI to start and write its session file,
         then read the Claude session ID from ~/.claude/sessions/{pid}.json.

@@ -83,7 +83,7 @@ def list_all_cursor_sessions_global(excluded_ids: set[str]) -> list[dict]:
             if not data.get("title") and not data.get("prompts"):
                 continue
             entry = {
-                "claude_session_id": chat_id,
+                "agent_session_id": chat_id,
                 "mtime": mtime,
                 "title": data.get("title"),
                 "prompts": data.get("prompts", []),

@@ -194,11 +194,11 @@ def test_list_all_global_groups_by_cwd_and_skips_excluded(codex_root):
     groups = csr.list_all_codex_sessions_global(set())
     assert len(groups) == 1
     assert groups[0]["dir"] == "/proj/alpha"
-    assert {s["claude_session_id"] for s in groups[0]["sessions"]} == {SAMPLE_UUID_A, SAMPLE_UUID_B}
+    assert {s["agent_session_id"] for s in groups[0]["sessions"]} == {SAMPLE_UUID_A, SAMPLE_UUID_B}
 
     # Exclude one → only the other appears
     groups = csr.list_all_codex_sessions_global({SAMPLE_UUID_A})
-    assert {s["claude_session_id"] for s in groups[0]["sessions"]} == {SAMPLE_UUID_B}
+    assert {s["agent_session_id"] for s in groups[0]["sessions"]} == {SAMPLE_UUID_B}
 
 
 # ── CodexAdapter wiring ─────────────────────────────────────────────────────

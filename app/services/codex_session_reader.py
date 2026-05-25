@@ -471,7 +471,7 @@ def list_all_codex_sessions_global(excluded_ids: set[str]) -> list[dict]:
         if not data.get("title") and not data.get("prompts"):
             continue
         by_cwd.setdefault(cwd, []).append({
-            "claude_session_id": sid,  # field name reused over the wire (matches Cursor)
+            "agent_session_id": sid,
             "mtime": f.stat().st_mtime,
             "title": data.get("title"),
             "prompts": data.get("prompts", []),

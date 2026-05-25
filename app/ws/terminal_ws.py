@@ -163,9 +163,9 @@ async def terminal_ws(
                     if not _pty_idle_synced[0]:
                         _pty_idle_synced[0] = True
                         cur = store.get(session_id)
-                        if cur and cur.claude_session_id:
+                        if cur and cur.agent_session_id:
                             try:
-                                _sid, _cwd = cur.claude_session_id, cur.cwd
+                                _sid, _cwd = cur.agent_session_id, cur.cwd
                                 info = await loop.run_in_executor(
                                     None, get_latest_turn_info, _sid, _cwd, 0.0
                                 )
@@ -489,9 +489,9 @@ async def terminal_ws(
             pass
         # Immediately sync last_turn_at so is_streaming clears promptly on disconnect.
         # Run in executor — reads JSONL from disk, must not block the event loop.
-        if updated and updated.claude_session_id:
+        if updated and updated.agent_session_id:
             try:
-                _sid, _cwd = updated.claude_session_id, updated.cwd
+                _sid, _cwd = updated.agent_session_id, updated.cwd
                 info = await loop.run_in_executor(
                     None, get_latest_turn_info, _sid, _cwd, 0.0
                 )

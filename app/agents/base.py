@@ -88,7 +88,7 @@ class AgentAdapter(Protocol):
         """
 
     def list_local_sessions(self, cwd: str) -> list[dict]:
-        """Sessions for this cwd, shaped as {claude_session_id, title, mtime}.
+        """Sessions for this cwd, shaped as {agent_session_id, title, mtime}.
 
         Used by the session-switcher dropdown. Distinct from
         list_external_sessions (which groups globally for the browse panel).

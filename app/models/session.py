@@ -49,7 +49,7 @@ class SessionMetadata(BaseModel):
     ws_token: str | None = None
     tmux_session_name: str
     resume_session_id: str | None = None
-    claude_session_id: str | None = None
+    agent_session_id: str | None = None
     claude_proc_pid: int | None = None
     git_auto_commit: bool = False
     git_commit_msg_count: int = 0

@@ -414,10 +414,10 @@ export function SessionCard({
       {/* row 2: cwd */}
       <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 3 }}>{s.cwd}</div>
 
-      {/* row 3: claude session id + title */}
-      {s.claude_session_id && (
+      {/* row 3: agent session id + title */}
+      {s.agent_session_id && (
         <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>
-          <span style={{ color: "var(--text-secondary)", fontFamily: "monospace" }}>{s.claude_session_id.slice(0, 8)}</span>
+          <span style={{ color: "var(--text-secondary)", fontFamily: "monospace" }}>{s.agent_session_id.slice(0, 8)}</span>
           {s.claude_title && <span style={{ marginLeft: 6, color: "var(--text-muted)" }}>{s.claude_title}</span>}
         </div>
       )}
