@@ -131,11 +131,15 @@ def start(
     env: dict[str, str] | None = None,
     model: str | None = None,
     codex_bin: str = "codex",
+    resume_thread_id: str | None = None,
 ) -> int:
-    """Spawn the codex app-server, send `initialize`, and start a thread.
+    """Spawn the codex app-server, send `initialize`, and start/resume a thread.
 
     Returns the subprocess PID. Raises RuntimeError if a client already
     exists for this session.
+
+    If `resume_thread_id` is provided, codex resumes that existing thread via
+    `thread/resume`; otherwise a fresh thread is created via `thread/start`.
     """
     with _state_lock:
         if session_id in _sessions:
@@ -176,10 +180,15 @@ def start(
             await client.close()
             raise
         try:
-            ts_params: dict[str, Any] = {"cwd": cwd}
-            if model:
-                ts_params["model"] = model
-            resp = await client.send_request("thread/start", ts_params, timeout=15.0)
+            if resume_thread_id:
+                method = "thread/resume"
+                ts_params: dict[str, Any] = {"threadId": resume_thread_id}
+            else:
+                method = "thread/start"
+                ts_params = {"cwd": cwd}
+                if model:
+                    ts_params["model"] = model
+            resp = await client.send_request(method, ts_params, timeout=15.0)
             # codex 0.130.0 returns {thread: {id, sessionId, ...}, model, ...}.
             # Older shapes (top-level threadId) are still tolerated as fallbacks.
             tid: str | None = None
@@ -195,12 +204,12 @@ def start(
                         tid = cand
             if tid is None:
                 raise RuntimeError(
-                    f"codex thread/start response missing thread id: {resp!r}"
+                    f"codex {method} response missing thread id: {resp!r}"
                 )
             state.thread_id = tid
         except Exception:
             logger.exception(
-                "codex app-server: thread/start failed for session %s", session_id
+                "codex app-server: %s failed for session %s", method, session_id
             )
             await client.close()
             raise

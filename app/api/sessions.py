@@ -948,10 +948,38 @@ def resume_session(session_id: str, user_id: CurrentUser) -> SessionMetadata:
     if session.status != SessionStatus.TERMINATED:
         raise HTTPException(status_code=409, detail="only terminated sessions can be resumed")
 
+    os.makedirs(session.cwd, exist_ok=True)
+
+    # Codex app-server sessions have no tmux pane — resume means re-spawning the
+    # codex subprocess and re-attaching to the previous thread via thread/resume.
+    if session.tool == "codex" and session.codex_transport == "app_server":
+        from app.services import codex_appserver_manager as csm
+        try:
+            pid = csm.start(
+                session_id,
+                cwd=session.cwd,
+                env=session.env or None,
+                model=session.model,
+                resume_thread_id=session.agent_session_id or None,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to resume codex app-server: {exc}",
+            ) from exc
+        store.update_codex_appserver_pid(session_id, pid)
+        # thread/resume preserves the id, but pick it up defensively in case
+        # the underlying codex returned a forked id.
+        tid = csm.get_thread_id(session_id)
+        if tid and tid != session.agent_session_id:
+            store.update_agent_session_id(session_id, tid)
+        store.transition(session_id, SessionStatus.RUNNING)
+        store.reset_attached_clients(session_id)
+        audit_event(user_id, "resume", session_id, {"transport": "app_server"})
+        return store.get(session_id)  # type: ignore[return-value]
+
     ts = int(time.time())
     tmux_name = f"claude-{user_id}-{session.project}-{ts}"
-
-    os.makedirs(session.cwd, exist_ok=True)
 
     # If we have a stored claude_session_id, hand it to `claude --resume` so the
     # conversation continues where it left off. Otherwise start fresh and let the
