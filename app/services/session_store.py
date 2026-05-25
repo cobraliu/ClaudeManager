@@ -105,6 +105,7 @@ class SessionStore:
             ("tool", "TEXT NOT NULL DEFAULT 'claude'"),
             ("codex_transport", "TEXT NOT NULL DEFAULT 'tui'"),
             ("codex_appserver_pid", "INTEGER"),
+            ("codex_appserver_port", "INTEGER"),
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {coltype}")
@@ -148,6 +149,7 @@ class SessionStore:
             tool=row["tool"] if "tool" in row.keys() else "claude",
             codex_transport=(row["codex_transport"] if "codex_transport" in row.keys() else "tui") or "tui",
             codex_appserver_pid=row["codex_appserver_pid"] if "codex_appserver_pid" in row.keys() else None,
+            codex_appserver_port=row["codex_appserver_port"] if "codex_appserver_port" in row.keys() else None,
         )
 
     def _now(self) -> str:
@@ -160,8 +162,9 @@ class SessionStore:
                    (id, owner_id, name, project, cwd, env, model, status,
                     created_at, updated_at, attached_clients, last_output_offset,
                     last_activity_at, ws_token, tmux_session_name, resume_session_id,
-                    agent_session_id, git_repo_url, tool, codex_transport, codex_appserver_pid)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    agent_session_id, git_repo_url, tool, codex_transport,
+                    codex_appserver_pid, codex_appserver_port)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     session.id,
                     session.owner_id,
@@ -184,6 +187,7 @@ class SessionStore:
                     session.tool,
                     session.codex_transport,
                     session.codex_appserver_pid,
+                    session.codex_appserver_port,
                 ),
             )
             self._conn.commit()
@@ -329,6 +333,20 @@ class SessionStore:
             self._conn.execute(
                 "UPDATE sessions SET codex_appserver_pid = ?, updated_at = ? WHERE id = ?",
                 (pid, now, session_id),
+            )
+            self._conn.commit()
+
+    def update_codex_appserver_endpoint(
+        self, session_id: str, pid: int | None, port: int | None
+    ) -> None:
+        """Persist the detached app-server's PID + listen port so we can
+        reconnect after a backend restart."""
+        with self._lock:
+            now = self._now()
+            self._conn.execute(
+                "UPDATE sessions SET codex_appserver_pid = ?, codex_appserver_port = ?, "
+                "updated_at = ? WHERE id = ?",
+                (pid, port, now, session_id),
             )
             self._conn.commit()
 
