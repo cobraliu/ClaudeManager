@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMe
 import { createPortal } from "react-dom";
 import hljs from "highlight.js/lib/common";
 import { marked, renderMarkdown } from "../lib/markdown";
-import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
+import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
 
 const POLL_MS = 1500;
@@ -1126,7 +1126,7 @@ function AskUserQuestionDisplay({ questions, answer }: {
 // ── AskUserQuestion interactive block ────────────────────────────────────────
 
 interface AskOption { label: string; description?: string; preview?: string }
-interface AskQuestion { header?: string; question: string; multiSelect?: boolean; options: AskOption[] }
+interface AskQuestion { id?: string; header?: string; question: string; multiSelect?: boolean; options: AskOption[] }
 
 // Persist dismissed block IDs in sessionStorage so page refreshes don't re-show
 // answered questions while Claude Code is still processing the response.
@@ -3518,8 +3518,10 @@ interface PendingAuqData {
   multiSelect?: boolean;
   allowFreeform?: boolean;
   options?: { label: string; description?: string }[];
-  // Hook format (raw tool_input from Claude Code)
+  // Hook format (raw tool_input from Claude Code) + codex request_user_input
+  // (codex sets `id` per question; Claude's hook does not).
   questions?: Array<{
+    id?: string;
     question: string;
     options?: Array<string | { label?: string; value?: string; description?: string; preview?: string }>;
     multiSelect?: boolean;
@@ -3527,9 +3529,49 @@ interface PendingAuqData {
   }>;
 }
 
+function extractCodexAuqAnswers(
+  answers: unknown[],
+  questions: AskQuestion[],
+): Record<string, string[]> {
+  // codex's ToolRequestUserInputResponse is keyed by question.id, value is
+  // a string array of selected labels / typed text. AskUserQuestionBlock's
+  // buildAnswer produces either a plain string (single-select) or an array
+  // of {type, click?, value?} items (multi-select). Convert each per-question
+  // entry into the string[] codex expects.
+  const out: Record<string, string[]> = {};
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    if (!q.id) continue;  // codex always sets question.id; skip if missing
+    const a = answers[i];
+    const picks: string[] = [];
+    if (typeof a === "string") {
+      if (a) picks.push(a);
+    } else if (Array.isArray(a)) {
+      let optIdx = 0;
+      for (const raw of a as Array<{ type?: string; click?: boolean; value?: string }>) {
+        if (raw?.type === "option") {
+          if (raw.click && q.options[optIdx]) picks.push(q.options[optIdx].label);
+          optIdx++;
+        } else if (
+          raw?.type === "type_something" &&
+          typeof raw.value === "string" &&
+          raw.value.trim()
+        ) {
+          picks.push(raw.value.trim());
+        }
+      }
+    } else if (a != null) {
+      picks.push(String(a));
+    }
+    out[q.id] = picks;
+  }
+  return out;
+}
+
 function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
   if (data.questions && data.questions.length > 0) {
     return data.questions.map(q => ({
+      id: (q as { id?: string }).id,
       question: q.question ?? "",
       header: q.header,
       multiSelect: q.multiSelect,
@@ -3555,6 +3597,11 @@ function _normalizePendingAuq(data: PendingAuqData): AskQuestion[] {
 interface Props {
   sessionId: string;
   tool?: "claude" | "cursor" | "codex";
+  /** Codex transport, only meaningful when tool === "codex". "app_server" sessions
+   *  have no tmux pane — the parent owns message submission via /codex-message and
+   *  this pane must skip its terminal WS attach and hide its own textarea to avoid
+   *  rendering a second, broken input alongside CodexChatInput. */
+  codexTransport?: "tui" | "app_server";
   isStreaming?: boolean;
   /** True while claude is running its compaction pass — drives the bottom banner's compacting variant. */
   isCompacting?: boolean;
@@ -3648,7 +3695,12 @@ function _cleanupExpiredDrafts(): void {
   } catch { /* ignore */ }
 }
 
-export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+export function ConversationPane({ sessionId, tool, codexTransport, isStreaming, isCompacting = false, compactingProgress = null, chatOnly = false, pendingAuqData, pendingApproveData, isWaitingForAuq = false, stopRef, refreshRef }: Props) {
+  // Codex app-server transport: no tmux, no terminal WS. The parent (SessionsPage)
+  // owns input via CodexChatInput → POST /codex-message. We must short-circuit the
+  // WS attach effect AND the internal textarea or the user sees two input bars
+  // and the WS-based one attaches to a nonexistent tmux pane.
+  const isCodexAppServer = tool === "codex" && codexTransport === "app_server";
   const agentDisplayName = tool === "cursor" ? "Cursor" : tool === "codex" ? "Codex" : "Claude";
   const [messages, setMessages] = useState<RawMessage[]>([]);
   const [tail, setTail] = useState(DEFAULT_TAIL);
@@ -4203,6 +4255,7 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
 
   useEffect(() => {
     if (chatOnly) return; // terminated sessions: no WS needed
+    if (isCodexAppServer) return; // app-server transport: no tmux WS to attach to
     let ws: WsClient | null = null;
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4279,7 +4332,7 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
       ws?.close();
       wsRef.current = null;
     };
-  }, [sessionId]);
+  }, [sessionId, isCodexAppServer]);
 
   // ── Input draft persistence ───────────────────────────────────────────────
 
@@ -4601,15 +4654,27 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
             blockId={stickyAuq.blockId}
             questions={stickyAuq.questions}
             onSubmitAnswers={(answers) => {
-              submitAuqAnswers(sessionId, answers, stickyAuq.questions);
+              if (isCodexAppServer) {
+                // codex expects {answers: {<qid>: {answers: [<str>, ...]}}};
+                // collapse our per-question structured answers into the
+                // string-array shape keyed by question.id.
+                const byId = extractCodexAuqAnswers(answers, stickyAuq.questions);
+                resolveCodexAuq(sessionId, byId).catch((err) => {
+                  console.error("codex AUQ resolve failed", err);
+                });
+              } else {
+                submitAuqAnswers(sessionId, answers, stickyAuq.questions);
+              }
               setStickyAuq(null);
             }}
           />
         </div>
       )}
 
-      {/* Status banner – three states: compacting (orange + progress) / responding (stop button) / idle (faint). */}
-      {!chatOnly && wsStatus === "connected" && (() => {
+      {/* Status banner – three states: compacting (orange + progress) / responding (stop button) / idle (faint).
+          Codex app-server mode has no terminal WS, so we gate on transport too — liveness is
+          owned elsewhere (status poll + codex_appserver_manager). */}
+      {!chatOnly && (wsStatus === "connected" || isCodexAppServer) && (() => {
         if (isStreaming && isCompacting) {
           const pctNum = compactingProgress ? parseInt(compactingProgress, 10) : NaN;
           const hasPct = Number.isFinite(pctNum) && pctNum >= 0 && pctNum <= 100;
@@ -4682,8 +4747,9 @@ export function ConversationPane({ sessionId, tool, isStreaming, isCompacting = 
         );
       })()}
 
-      {/* Input bar – hidden in read-only chat mode */}
-      {!chatOnly && <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)", background: "var(--bg-surface)" }}>
+      {/* Input bar – hidden in read-only chat mode AND in codex app-server mode
+          (the parent renders CodexChatInput against /codex-message instead). */}
+      {!chatOnly && !isCodexAppServer && <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)", background: "var(--bg-surface)" }}>
         {/* Top grip: drag up to enlarge the input. The textarea sits at the bottom of
             the page, so resizing must extend upward, not from a corner. */}
         <div

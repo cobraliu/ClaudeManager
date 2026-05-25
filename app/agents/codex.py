@@ -137,10 +137,16 @@ class CodexAdapter:
             )
         auq = csm.get_pending_auq(session_id)
         if auq is not None:
+            # csm wraps the ServerRequest as {request_id, method, params, ...}.
+            # The frontend AUQ widget reads `questions` / `question` / `options`
+            # at the top level (same shape Claude's hook uses), so flatten by
+            # exposing the request params directly. request_id is held by csm
+            # and used internally by resolve_auq(session_id, text).
+            params = auq.get("params") if isinstance(auq, dict) else None
             return WaitingState(
                 kind="auq",
                 hint="Codex is asking a question",
-                raw=auq,
+                raw=params if isinstance(params, dict) else {},
             )
         if csm.is_compacting(session_id):
             return WaitingState(kind="compacting", hint="Codex is compacting", raw={})

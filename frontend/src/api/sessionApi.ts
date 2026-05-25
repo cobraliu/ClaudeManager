@@ -396,10 +396,13 @@ export function sendCodexMessage(sessionId: string, text: string): Promise<{ ok:
   });
 }
 
-export function resolveCodexAuq(sessionId: string, text: string): Promise<{ ok: boolean }> {
+export function resolveCodexAuq(
+  sessionId: string,
+  answers: Record<string, string[]>,
+): Promise<{ ok: boolean }> {
   return request(`/api/sessions/${sessionId}/codex-auq`, {
     method: "POST",
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ answers }),
   });
 }
 

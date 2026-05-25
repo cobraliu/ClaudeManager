@@ -131,16 +131,28 @@ def start(
     env: dict[str, str] | None = None,
     model: str | None = None,
     codex_bin: str = "codex",
+    resume_thread_id: str | None = None,
 ) -> int:
-    """Spawn the codex app-server, send `initialize`, and start a thread.
+    """Spawn the codex app-server, send `initialize`, and start/resume a thread.
 
     Returns the subprocess PID. Raises RuntimeError if a client already
     exists for this session.
+
+    If `resume_thread_id` is provided, codex resumes that existing thread via
+    `thread/resume`; otherwise a fresh thread is created via `thread/start`.
     """
     with _state_lock:
         if session_id in _sessions:
             raise RuntimeError(f"codex app-server already running for {session_id}")
-    client = CodexAppServerClient(cwd=cwd, env=env, codex_bin=codex_bin)
+    # Enable the `request_user_input` tool in Default collaboration mode.
+    # Why: codex's default mode normally hides this tool ("request_user_input is
+    # unavailable in Default mode") and only allows free-text questions. The
+    # ClaudeManager UI surfaces structured AUQ via this RPC, so we opt into the
+    # `default_mode_request_user_input` feature for every app-server session.
+    extra_args = ["--enable", "default_mode_request_user_input"]
+    client = CodexAppServerClient(
+        cwd=cwd, env=env, codex_bin=codex_bin, extra_args=extra_args
+    )
     state = _SessionState(client=client)
 
     async def _setup() -> int:
@@ -149,7 +161,17 @@ def start(
         # notification that may arrive interleaved with the initialize reply.
         _attach_handlers(session_id, state)
         try:
-            await client.send_request("initialize", {}, timeout=10.0)
+            await client.send_request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "ClaudeManager",
+                        "title": "ClaudeManager",
+                        "version": "0.1.0",
+                    },
+                },
+                timeout=10.0,
+            )
         except Exception:
             logger.exception(
                 "codex app-server: initialize failed for session %s", session_id
@@ -158,17 +180,59 @@ def start(
             await client.close()
             raise
         try:
-            ts_params: dict[str, Any] = {"cwd": cwd}
-            if model:
-                ts_params["model"] = model
-            resp = await client.send_request("thread/start", ts_params, timeout=15.0)
+            if resume_thread_id:
+                method = "thread/resume"
+                ts_params: dict[str, Any] = {
+                    "threadId": resume_thread_id,
+                    **_default_thread_overrides(),
+                }
+            else:
+                method = "thread/start"
+                ts_params = {"cwd": cwd, **_default_thread_overrides()}
+                if model:
+                    ts_params["model"] = model
+            try:
+                resp = await client.send_request(method, ts_params, timeout=15.0)
+            except CodexAppServerError as exc:
+                # thread/resume requires an on-disk rollout JSONL. If the previous
+                # spawn died before writing one (e.g. crashed at startup), codex
+                # answers "no rollout found". Fall back to a fresh thread/start so
+                # the user can keep using the ClaudeManager session; the caller
+                # will pick up the new thread id via get_thread_id and update DB.
+                if method == "thread/resume" and _is_no_rollout_error(exc):
+                    logger.warning(
+                        "codex app-server: thread/resume found no rollout for %s; "
+                        "falling back to thread/start",
+                        resume_thread_id,
+                    )
+                    method = "thread/start"
+                    ts_params = {"cwd": cwd, **_default_thread_overrides()}
+                    if model:
+                        ts_params["model"] = model
+                    resp = await client.send_request(method, ts_params, timeout=15.0)
+                else:
+                    raise
+            # codex 0.130.0 returns {thread: {id, sessionId, ...}, model, ...}.
+            # Older shapes (top-level threadId) are still tolerated as fallbacks.
+            tid: str | None = None
             if isinstance(resp, dict):
-                tid = resp.get("threadId") or resp.get("thread_id")
-                if isinstance(tid, str):
-                    state.thread_id = tid
+                thread = resp.get("thread")
+                if isinstance(thread, dict):
+                    cand = thread.get("id") or thread.get("sessionId")
+                    if isinstance(cand, str):
+                        tid = cand
+                if tid is None:
+                    cand = resp.get("threadId") or resp.get("thread_id")
+                    if isinstance(cand, str):
+                        tid = cand
+            if tid is None:
+                raise RuntimeError(
+                    f"codex {method} response missing thread id: {resp!r}"
+                )
+            state.thread_id = tid
         except Exception:
             logger.exception(
-                "codex app-server: thread/start failed for session %s", session_id
+                "codex app-server: %s failed for session %s", method, session_id
             )
             await client.close()
             raise
@@ -274,7 +338,9 @@ def send_user_message(
         state = _sessions.get(session_id)
     if state is None:
         raise KeyError(session_id)
-    params: dict = {"items": [{"type": "text", "text": text}]}
+    # codex 0.130.0 turn/start expects `input` (list of content items); older
+    # versions used `items`. threadId is required.
+    params: dict = {"input": [{"type": "text", "text": text}]}
     if state.thread_id:
         params["threadId"] = state.thread_id
     return _runner.submit(
@@ -316,8 +382,19 @@ def resolve_approval(
     _runner.submit(_send_response(), timeout=5.0)
 
 
-def resolve_auq(session_id: str, text: str) -> None:
-    """Respond to a pending tool/requestUserInput ServerRequest with text."""
+def resolve_auq(session_id: str, answers: dict[str, list[str]]) -> None:
+    """Respond to a pending tool/requestUserInput ServerRequest.
+
+    `answers` is keyed by `question.id` (from the original request's
+    `params.questions[].id`). Each value is the list of selected/typed
+    strings for that question.
+
+    Codex's ToolRequestUserInputResponse shape is:
+        {"answers": {<qid>: {"answers": [<str>, ...]}, ...}}
+    — a dict of question ids to a wrapper object whose `answers` is a
+    string array. Sending the wrong shape causes codex to parse `answers`
+    as `{}` and report empty answers to the model.
+    """
     with _state_lock:
         state = _sessions.get(session_id)
         pending = state.pending_auq if state is not None else None
@@ -326,9 +403,17 @@ def resolve_auq(session_id: str, text: str) -> None:
     if state is None or pending is None:
         raise KeyError(f"no pending AUQ for {session_id}")
 
+    payload = {
+        "answers": {
+            qid: {"answers": [s for s in (vals or []) if isinstance(s, str)]}
+            for qid, vals in (answers or {}).items()
+            if isinstance(qid, str)
+        }
+    }
+
     async def _send_response() -> None:
         await state.client._write_line(  # noqa: SLF001
-            {"jsonrpc": "2.0", "id": pending.request_id, "result": {"text": text}}
+            {"jsonrpc": "2.0", "id": pending.request_id, "result": payload}
         )
 
     _runner.submit(_send_response(), timeout=5.0)
@@ -429,6 +514,38 @@ def _intercept_server_requests(session_id: str, state: _SessionState) -> None:
         original_dispatch(msg)
 
     client._dispatch = _wrapped  # type: ignore[attr-defined]
+
+
+def _default_thread_overrides() -> dict[str, Any]:
+    """Force `sandbox` + `approvalPolicy` on every thread/start and thread/resume.
+
+    codex's compiled-in defaults pick `read-only` for any cwd that isn't in
+    `~/.codex/config.toml`'s `projects.*.trust_level = "trusted"` list. With
+    `read-only` we observe a 175s silent hang on tool-use turns (the model
+    receives a degraded tool catalog and never emits a function_call). The
+    ClaudeManager UI also has no way to surface a sandbox-escape prompt, so a
+    silent denial is the worst possible UX.
+
+    Behavior we want: same as `codex` TUI in a trusted directory — read+write
+    inside cwd, approval prompt for anything that needs escalation. The user
+    already opted into this directory by creating the ClaudeManager session
+    against it, so we treat that as authorization.
+    """
+    return {
+        "sandbox": "workspace-write",
+        "approvalPolicy": "on-request",
+    }
+
+
+def _is_no_rollout_error(exc: CodexAppServerError) -> bool:
+    """Detect the codex 'no rollout found for thread id <X>' error.
+
+    codex uses generic -32600 (Invalid Request) for this, so we match on the
+    message text instead of the code. The phrasing has been stable across
+    0.130.x but we keep the check loose to survive small wording tweaks.
+    """
+    msg = (exc.message or "").lower()
+    return "no rollout" in msg or "rollout not found" in msg
 
 
 def _build_approval_response(method: str, *, allow: bool, feedback: str | None) -> dict:

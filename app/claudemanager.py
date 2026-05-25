@@ -86,7 +86,14 @@ if user_store.is_empty():
 # Sync session state with actual tmux processes on startup
 for s in session_store.all():
     if s.status in (SessionStatus.RUNNING, SessionStatus.CREATING, SessionStatus.DETACHED):
-        if not tmux.has_session(s.tmux_session_name):
+        # Codex app-server sessions don't have a tmux session — the subprocess
+        # is a child of the previous backend process and is gone after restart.
+        if s.tool == "codex" and s.codex_transport == "app_server":
+            try:
+                session_store.force_status(s.id, SessionStatus.TERMINATED)
+            except Exception:
+                pass
+        elif not tmux.has_session(s.tmux_session_name):
             # tmux session gone – mark terminated
             try:
                 session_store.force_status(s.id, SessionStatus.TERMINATED)
@@ -513,6 +520,17 @@ def _sync_session_states() -> None:
     in sessions that have no attached WS clients."""
     for s in session_store.all():
         if s.status in (SessionStatus.RUNNING, SessionStatus.CREATING, SessionStatus.DETACHED):
+            # Codex app-server sessions have no tmux session — their liveness
+            # is owned by codex_appserver_manager. Skip the tmux check and
+            # ask the manager whether the client is still alive.
+            if s.tool == "codex" and s.codex_transport == "app_server":
+                from app.services import codex_appserver_manager as csm
+                if not csm.is_alive(s.id):
+                    try:
+                        session_store.force_status(s.id, SessionStatus.TERMINATED)
+                    except Exception:
+                        pass
+                continue
             if not tmux.has_session(s.tmux_session_name):
                 try:
                     session_store.force_status(s.id, SessionStatus.TERMINATED)

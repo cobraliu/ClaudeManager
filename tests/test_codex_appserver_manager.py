@@ -43,7 +43,10 @@ def _patch_client_for_fake(monkeypatch):
 
     real_cls = CodexAppServerClient
 
-    def _make(*, cwd, env=None, codex_bin="codex"):
+    def _make(*, cwd, env=None, codex_bin="codex", extra_args=None):
+        # extra_args is accepted (and ignored) so the manager can pass --enable
+        # default_mode_request_user_input — the fake server doesn't care about
+        # codex CLI feature flags.
         return real_cls(
             cwd=cwd,
             env=env,
@@ -59,8 +62,13 @@ def _patch_client_for_fake(monkeypatch):
     real_send = real_cls.send_request
 
     async def _patched_send(self, method, params=None, *, timeout=30.0):
-        if method in ("initialize", "thread/start"):
-            return {}  # fake doesn't implement these
+        if method == "initialize":
+            return {}  # fake doesn't implement initialize
+        if method == "thread/start":
+            # Manager reads {thread: {id|sessionId}} or top-level {threadId}.
+            return {"thread": {"id": "fake-thread-id"}}
+        if method == "thread/resume":
+            return {"thread": {"id": params.get("threadId", "fake-thread-id") if params else "fake-thread-id"}}
         return await real_send(self, method, params, timeout=timeout)
 
     monkeypatch.setattr(CodexAppServerClient, "send_request", _patched_send)
@@ -106,6 +114,128 @@ def test_start_twice_same_session_raises():
             mgr.start("s1", cwd=os.getcwd())
     finally:
         mgr.stop("s1")
+
+
+def test_resume_falls_back_to_start_when_no_rollout(monkeypatch):
+    """If thread/resume reports 'no rollout found', start() should retry
+    with thread/start and end up alive with the new thread id."""
+    from app.services.codex_appserver_client import (
+        CodexAppServerClient,
+        CodexAppServerError,
+    )
+
+    real_send = CodexAppServerClient.send_request
+    new_thread_id = "fresh-thread-after-fallback"
+
+    async def _no_rollout_then_start(self, method, params=None, *, timeout=30.0):
+        if method == "initialize":
+            return {}
+        if method == "thread/resume":
+            raise CodexAppServerError(
+                -32600,
+                "no rollout found for thread id 019e5e49-d65a-7a53-8dad-a6dc820f33c0",
+            )
+        if method == "thread/start":
+            return {"thread": {"id": new_thread_id}}
+        return await real_send(self, method, params, timeout=timeout)
+
+    monkeypatch.setattr(CodexAppServerClient, "send_request", _no_rollout_then_start)
+
+    pid = mgr.start(
+        "s1",
+        cwd=os.getcwd(),
+        resume_thread_id="019e5e49-d65a-7a53-8dad-a6dc820f33c0",
+    )
+    try:
+        assert isinstance(pid, int) and pid > 0
+        assert mgr.is_alive("s1") is True
+        # Manager must surface the NEW thread id so the caller can update DB.
+        assert mgr.get_thread_id("s1") == new_thread_id
+    finally:
+        mgr.stop("s1")
+
+
+def test_thread_start_sends_sandbox_and_approval_overrides(monkeypatch):
+    """start() must pin sandbox=workspace-write + approvalPolicy=on-request on
+    fresh threads. Without this, codex's compiled-in default falls to read-only
+    in any untrusted cwd, which silently hangs request_user_input turns."""
+    from app.services.codex_appserver_client import CodexAppServerClient
+
+    real_send = CodexAppServerClient.send_request
+    captured: dict[str, dict] = {}
+
+    async def _capture_send(self, method, params=None, *, timeout=30.0):
+        if method == "initialize":
+            return {}
+        if method == "thread/start":
+            captured["thread/start"] = dict(params or {})
+            return {"thread": {"id": "tid-fresh"}}
+        return await real_send(self, method, params, timeout=timeout)
+
+    monkeypatch.setattr(CodexAppServerClient, "send_request", _capture_send)
+
+    mgr.start("s1", cwd=os.getcwd())
+    try:
+        params = captured["thread/start"]
+        assert params["sandbox"] == "workspace-write"
+        assert params["approvalPolicy"] == "on-request"
+        assert params["cwd"] == os.getcwd()
+    finally:
+        mgr.stop("s1")
+
+
+def test_thread_resume_sends_sandbox_and_approval_overrides(monkeypatch):
+    """thread/resume must also pin sandbox/approvalPolicy — codex applies the
+    same trust-based default at resume time, so a stale read-only would still
+    bite when the user returns to an existing session."""
+    from app.services.codex_appserver_client import CodexAppServerClient
+
+    real_send = CodexAppServerClient.send_request
+    captured: dict[str, dict] = {}
+
+    async def _capture_send(self, method, params=None, *, timeout=30.0):
+        if method == "initialize":
+            return {}
+        if method == "thread/resume":
+            captured["thread/resume"] = dict(params or {})
+            return {"thread": {"id": "tid-resumed"}}
+        return await real_send(self, method, params, timeout=timeout)
+
+    monkeypatch.setattr(CodexAppServerClient, "send_request", _capture_send)
+
+    mgr.start("s1", cwd=os.getcwd(), resume_thread_id="prior-tid")
+    try:
+        params = captured["thread/resume"]
+        assert params["threadId"] == "prior-tid"
+        assert params["sandbox"] == "workspace-write"
+        assert params["approvalPolicy"] == "on-request"
+    finally:
+        mgr.stop("s1")
+
+
+def test_resume_propagates_other_errors(monkeypatch):
+    """Errors other than 'no rollout' must NOT trigger the fallback."""
+    from app.services.codex_appserver_client import (
+        CodexAppServerClient,
+        CodexAppServerError,
+    )
+
+    real_send = CodexAppServerClient.send_request
+
+    async def _other_error(self, method, params=None, *, timeout=30.0):
+        if method == "initialize":
+            return {}
+        if method == "thread/resume":
+            raise CodexAppServerError(-32603, "internal server error")
+        if method == "thread/start":
+            pytest.fail("fallback should not run for non-rollout errors")
+        return await real_send(self, method, params, timeout=timeout)
+
+    monkeypatch.setattr(CodexAppServerClient, "send_request", _other_error)
+
+    with pytest.raises(CodexAppServerError):
+        mgr.start("s1", cwd=os.getcwd(), resume_thread_id="some-id")
+    assert mgr.is_alive("s1") is False
 
 
 def test_list_sessions_reflects_state():
@@ -182,24 +312,58 @@ def _ask_fake_to_send_server_request_async(
 def test_auq_server_request_is_cached_without_responding():
     mgr.start("s1", cwd=os.getcwd())
     try:
+        params = {
+            "questions": [
+                {"id": "name", "header": "Identity", "question": "Your name?"},
+            ],
+        }
         fut = _ask_fake_to_send_server_request_async(
-            "s1", "item/tool/requestUserInput", {"prompt": "your name?"}
+            "s1", "item/tool/requestUserInput", params
         )
         # Cache should populate quickly
         assert _wait_until(lambda: mgr.get_pending_auq("s1") is not None)
         auq = mgr.get_pending_auq("s1")
         assert auq is not None
         assert auq["method"] == "item/tool/requestUserInput"
-        assert auq["params"] == {"prompt": "your name?"}
+        assert auq["params"] == params
         # The fake's send_server_request future should NOT be done yet —
         # we never replied.
         assert not fut.done()
-        # Resolve and verify the fake receives our reply
-        mgr.resolve_auq("s1", "Codex")
+        # Resolve and verify the fake receives our reply in codex's expected
+        # shape: {answers: {<qid>: {answers: [<str>...]}}}.
+        mgr.resolve_auq("s1", {"name": ["Codex"]})
         roundtrip = fut.result(timeout=3.0)
-        assert roundtrip["client_reply"] == {"text": "Codex"}
+        assert roundtrip["client_reply"] == {
+            "answers": {"name": {"answers": ["Codex"]}}
+        }
         # After resolve, pending cleared
         assert mgr.get_pending_auq("s1") is None
+    finally:
+        mgr.stop("s1")
+
+
+def test_resolve_auq_filters_non_string_entries():
+    """Defensive: only string answers per question survive; bogus keys/values
+    are dropped so we never send malformed JSON to codex."""
+    mgr.start("s1", cwd=os.getcwd())
+    try:
+        fut = _ask_fake_to_send_server_request_async(
+            "s1",
+            "item/tool/requestUserInput",
+            {"questions": [{"id": "q1", "header": "h", "question": "q?"}]},
+        )
+        assert _wait_until(lambda: mgr.get_pending_auq("s1") is not None)
+        mgr.resolve_auq(
+            "s1",
+            {
+                "q1": ["yes", 42, None, "also"],  # type: ignore[list-item]
+                123: ["nope"],  # type: ignore[dict-item]
+            },
+        )
+        roundtrip = fut.result(timeout=3.0)
+        assert roundtrip["client_reply"] == {
+            "answers": {"q1": {"answers": ["yes", "also"]}}
+        }
     finally:
         mgr.stop("s1")
 

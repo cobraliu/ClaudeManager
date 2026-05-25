@@ -2495,6 +2495,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                               key={active.session_id + active.ws_token}
                               sessionId={active.session_id}
                               tool={activeSessionMeta?.tool}
+                              codexTransport={activeSessionMeta?.codex_transport}
                               isStreaming={activeSessionMeta?.is_streaming}
                               isCompacting={fresh ? isCompacting : false}
                               compactingProgress={fresh ? compactingProgress : null}
