@@ -47,6 +47,7 @@ import { UsageBar, UsageCenter } from "../components/UsageBar";
 import { FileEditorModal } from "../components/FileEditorModal";
 import { GitPanel } from "../components/GitPanel";
 import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
+import { MemoryPanel } from "../components/MemoryPanel";
 import { downloadConversationHtml } from "../lib/exportChat";
 import { apiPath } from "../lib/baseUrl";
 import { SessionSideDock } from "../components/SessionSideDock";
@@ -1410,7 +1411,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [enabledTools, setEnabledTools] = useState<string[]>(["claude", "codex", "cursor"]);
   const [fileEditorSession, setFileEditorSession] = useState<SessionMeta | null>(null);
   // Inline overlay in the conversation column (sits above bottom toolbar, replaces TUI/Chat content)
-  const [inlineView, setInlineView] = useState<"git" | "jsonl" | null>(null);
+  const [inlineView, setInlineView] = useState<"git" | "jsonl" | "memory" | null>(null);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
@@ -2593,6 +2594,14 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                 />
               </div>
             )}
+            {inlineView === "memory" && activeSessionMeta && (
+              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+                <MemoryPanel
+                  sessionId={active.session_id}
+                  onClose={() => setInlineView(null)}
+                />
+              </div>
+            )}
             </div>
             {/* ↑ close InnerCol column */}
             {activeSessionMeta && anyDockOpen && (
@@ -2774,6 +2783,22 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   style={{ fontSize: 11, padding: "2px 10px", background: inlineView === "jsonl" ? "var(--bg-hover)" : "transparent", color: inlineView === "jsonl" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (inlineView === "jsonl" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
                 >
                   📄 JSONL
+                </button>
+              )}
+              {activeSessionMeta && (
+                <button
+                  onClick={() => {
+                    if (inlineView === "memory") {
+                      setInlineView(null);
+                    } else {
+                      setInlineView("memory");
+                      setCodeFileView(null);
+                    }
+                  }}
+                  title="Browse project memory files"
+                  style={{ fontSize: 11, padding: "2px 10px", background: inlineView === "memory" ? "var(--bg-hover)" : "transparent", color: inlineView === "memory" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (inlineView === "memory" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                >
+                  🧠 Memory
                 </button>
               )}
               {(() => {

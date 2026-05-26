@@ -23,6 +23,7 @@ from app.api import code_api
 from app.api import config_api
 from app.api import files as files_api
 from app.api import fs as fs_api
+from app.api import memory as memory_api
 from app.api import sessions as sessions_api
 from app.api import usage_api
 from app.config import (
@@ -151,6 +152,7 @@ auth_api.configure(user_store)
 sessions_api.configure(session_store, tmux)
 files_api.configure(session_store)
 code_api.configure(session_store)
+memory_api.configure(session_store)
 terminal_ws.configure(session_store, tmux)
 shell_ws.configure(tmux, sessions_api._shell_tokens)
 term_ws.configure(tmux, term_mgr)
@@ -720,6 +722,7 @@ app.include_router(sessions_api.router)
 app.include_router(sessions_api.models_router)
 app.include_router(files_api.router)
 app.include_router(code_api.router)
+app.include_router(memory_api.router)
 app.include_router(usage_api.router)
 app.include_router(terminal_ws.router)
 app.include_router(shell_ws.router)
