@@ -56,6 +56,7 @@ import {
   setClaudeSessionId,
   fetchRawFileBlob,
   browseExternalSessions,
+  browseCodexSessions,
   browseCursorSessions,
   getExternalPreview,
   type ExternalPreview,
@@ -120,6 +121,7 @@ import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
 import { GitGraph } from "../components/GitGraph";
 import { FileIcon, NewFolderIcon } from "../components/FileIcon";
 import { HtmlViewer } from "../components/HtmlViewer";
+import CodexChatInput from "../components/CodexChatInput";
 import type { DirInfoResponse } from "../api/sessionApi";
 
 const MOBILE_PAGE_SIZE = 10;
@@ -242,6 +244,8 @@ function CreateModal({
 }: { workspaceBase: string; username: string; onClose: () => void; onCreate: (s: SessionMeta) => void }) {
   const [project, setProject] = useState("");
   const [suffix, setSuffix] = useState("");
+  const [tool, setTool] = useState<"claude" | "codex">("claude");
+  const [codexTransport, setCodexTransport] = useState<"tui" | "app_server">("tui");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const prefix = `${workspaceBase}/${username}/`;
@@ -251,9 +255,28 @@ function CreateModal({
     setLoading(true); setErr("");
     try {
       const cwd = suffix.trim() ? prefix + suffix.trim() : undefined;
-      onCreate(await createSession({ project: project.trim(), cwd }));
+      const params = {
+        project: project.trim(),
+        cwd,
+        tool,
+        ...(tool === "codex" ? { codex_transport: codexTransport } : {}),
+      };
+      onCreate(await createSession(params));
     } catch (e) { setErr(String(e)); } finally { setLoading(false); }
   };
+
+  const pillBtn = (active: boolean): React.CSSProperties => ({
+    flex: 1,
+    padding: "8px 10px",
+    fontSize: 13,
+    borderRadius: 6,
+    border: "1px solid " + (active ? "var(--accent-blue)" : "var(--border)"),
+    background: active ? "rgba(88,166,255,0.15)" : "var(--bg-main)",
+    color: active ? "var(--text-body)" : "var(--text-secondary)",
+    fontWeight: active ? 600 : 400,
+    cursor: "pointer",
+    textTransform: "capitalize" as const,
+  });
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end" }} onClick={onClose}>
@@ -261,6 +284,31 @@ function CreateModal({
         <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 4px" }} />
         <h3 style={{ margin: 0, fontSize: 16, color: "var(--text-primary)" }}>New Session</h3>
         <input placeholder="Project name *" value={project} onChange={(e) => setProject(e.target.value)} autoFocus style={inp} />
+        <div>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>Agent</div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {(["claude", "codex"] as const).map(k => (
+              <button key={k} onClick={() => setTool(k)} style={pillBtn(tool === k)}>{k}</button>
+            ))}
+          </div>
+        </div>
+        {tool === "codex" && (
+          <div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>Transport</div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {(["tui", "app_server"] as const).map(k => (
+                <button key={k} onClick={() => setCodexTransport(k)} style={pillBtn(codexTransport === k)}>
+                  {k === "tui" ? "TUI (default)" : "App-server"}
+                </button>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 4 }}>
+              {codexTransport === "tui"
+                ? "Interactive terminal — full chat + paste support."
+                : "Programmatic JSON-RPC — chat in app, live AUQ/approval."}
+            </div>
+          </div>
+        )}
         <div>
           <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 2 }}>Working directory (optional)</div>
           <div style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "monospace", marginBottom: 4 }}>{prefix}</div>
@@ -288,7 +336,7 @@ function relativeTime(mtime: number): string {
 
 function MobileSessionPreviewModal({
   session, tool, onClose,
-}: { session: ExternalSession; tool: "claude" | "cursor"; onClose: () => void }) {
+}: { session: ExternalSession; tool: "claude" | "codex" | "cursor"; onClose: () => void }) {
   const [preview, setPreview] = useState<ExternalPreview | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -362,10 +410,12 @@ function PreviewTurnBubble({ turn }: { turn: { role: string; text: string; ts: n
   );
 }
 
+type ExternalTool = "claude" | "codex" | "cursor";
+
 function MobileBrowseExternalPanel({
   onClose, onLoad,
-}: { onClose: () => void; onLoad: (ext: ExternalSession, tool: "claude" | "cursor") => Promise<void> }) {
-  const [tool, setTool] = useState<"claude" | "cursor">("claude");
+}: { onClose: () => void; onLoad: (ext: ExternalSession, tool: ExternalTool) => Promise<void> }) {
+  const [tool, setTool] = useState<ExternalTool>("claude");
   const [groups, setGroups] = useState<ExternalSessionGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -376,7 +426,11 @@ function MobileBrowseExternalPanel({
   useEffect(() => {
     setLoading(true);
     setGroups([]);
-    const fetcher = tool === "cursor" ? browseCursorSessions : browseExternalSessions;
+    const fetcher = tool === "cursor"
+      ? browseCursorSessions
+      : tool === "codex"
+        ? browseCodexSessions
+        : browseExternalSessions;
     fetcher().then((data) => setGroups(data)).catch(() => {}).finally(() => setLoading(false));
   }, [tool]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -412,7 +466,7 @@ function MobileBrowseExternalPanel({
         <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1, flexShrink: 0 }}>‹</button>
         <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Browse External Sessions</span>
         <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden", flexShrink: 0 }}>
-          {(["claude", "cursor"] as const).map((t) => (
+          {(["claude", "codex", "cursor"] as const).map((t) => (
             <button
               key={t}
               onClick={() => setTool(t)}
@@ -4931,6 +4985,9 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const [workspaceBase, setWorkspaceBase] = useState("/workspace");
   useEffect(() => { getConfig().then((c) => setWorkspaceBase(c.workspace)).catch(() => {}); }, []);
 
+  // Codex app-server: no terminal, only chat input.
+  const isCodexAppServer = session.tool === "codex" && session.codex_transport === "app_server";
+
   // ── TUI view ──────────────────────────────────────────────────────────────
   const [viewMode, setViewMode] = useState<"chat" | "tui">("chat");
   const [tuiWs, setTuiWs] = useState<{ url: string; token: string } | null>(null);
@@ -5322,17 +5379,19 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         <ClaudeCapsModal cwd={session.cwd ?? null} onClose={() => history.back()} />
       )}
 
-      {/* Chat / TUI tab strip */}
+      {/* Chat / TUI tab strip — TUI hidden for Codex app-server (no terminal) */}
       <div style={{ display: "flex", background: "var(--bg-surface)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
         <button
           onClick={() => setViewMode("chat")}
           style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "chat" ? "2px solid var(--accent-blue)" : "2px solid transparent", color: viewMode === "chat" ? "var(--accent-blue)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "color 0.15s" }}
         >💬 Chat</button>
-        <button
-          onClick={switchToTui}
-          disabled={tuiLoading}
-          style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "tui" ? "2px solid var(--accent-green)" : "2px solid transparent", color: viewMode === "tui" ? "var(--accent-green)" : tuiLoading ? "var(--text-faintest)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: tuiLoading ? "default" : "pointer", transition: "color 0.15s" }}
-        >{tuiLoading ? "Connecting…" : "TUI"}</button>
+        {!isCodexAppServer && (
+          <button
+            onClick={switchToTui}
+            disabled={tuiLoading}
+            style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "tui" ? "2px solid var(--accent-green)" : "2px solid transparent", color: viewMode === "tui" ? "var(--accent-green)" : tuiLoading ? "var(--text-faintest)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: tuiLoading ? "default" : "pointer", transition: "color 0.15s" }}
+          >{tuiLoading ? "Connecting…" : "TUI"}</button>
+        )}
       </div>
 
       {/* Content area — both panes mounted, visibility toggled */}
@@ -5350,7 +5409,8 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         <ConversationPane
           key={session.id}
           sessionId={session.id}
-          tool={session.tool as "claude" | "cursor" | undefined}
+          tool={session.tool as "claude" | "cursor" | "codex" | undefined}
+          codexTransport={session.codex_transport}
           isStreaming={session.is_streaming}
           isCompacting={isCompacting}
           compactingProgress={compactingProgress}
@@ -5360,6 +5420,9 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
           stopRef={stopResponseRef}
           refreshRef={convRefreshRef}
         />
+        {isCodexAppServer && (
+          <CodexChatInput sessionId={session.id} onSent={() => convRefreshRef.current?.()} />
+        )}
       </div>
       {tuiWs && (
         <div style={{ flex: 1, minHeight: 0, display: viewMode === "tui" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
