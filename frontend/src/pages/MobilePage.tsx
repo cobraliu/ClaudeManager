@@ -5477,7 +5477,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         </div>
       )}
       <div style={{ flex: 1, minHeight: 0, display: viewMode === "memory" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
-        <MemoryPanel sessionId={session.id} compact />
+        <MemoryPanel sessionId={session.id} compact fontSize={fontSize} />
       </div>
 
       {/* TUI keyboard toolbar */}
