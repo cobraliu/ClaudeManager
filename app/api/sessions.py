@@ -138,6 +138,7 @@ def _cleanup_session_hooks(claude_session_id: str) -> None:
     except OSError:
         pass
     _hooks_cache.pop(claude_session_id, None)
+    _plan_pending_cache.pop(claude_session_id, None)
 
 
 def _is_compacting_via_hook(
@@ -294,6 +295,130 @@ def _pending_auq_from_hooks(claude_session_id: str, cwd: str) -> dict | None:
     return latest_auq_input
 
 
+# mtime-keyed cache for plan-pending status: {claude_session_id: (mtime, bool)}
+# Avoids re-scanning every session JSONL on every 3s status poll.
+_plan_pending_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
+    """Return True iff the session JSONL says a plan is awaiting user approval.
+
+    Has to handle two distinct on-disk formats because Claude CLI changed how
+    plan mode is recorded:
+
+    - **Legacy (CLI ≤ 2.1.144)**: plan approval was an `ExitPlanMode` tool_use.
+      An assistant message carried `{"type":"tool_use","name":"ExitPlanMode"}`,
+      and the user's Approve/Reject decision arrived as a `tool_result` with
+      a matching `tool_use_id`. Pending = at least one ExitPlanMode id has no
+      paired tool_result. Mirrors `ConversationPane.tsx` (`!toolResults.has`).
+
+    - **Current (CLI 2.1.150+)**: ExitPlanMode is gone. Plan mode is now
+      tracked by two new JSONL entry types:
+        * `{"type":"attachment","attachment":{"type":"plan_mode",...}}` — fires
+          when plan mode starts (carries `planFilePath`, `planExists` flag).
+        * `{"type":"permission-mode","permissionMode":"plan"|"default"|...}`
+          — toggles permission mode across the session.
+      Approval = a subsequent `permission-mode` entry flips back out of
+      "plan". So pending = the LATEST `permission-mode` entry's value is
+      "plan" (or there's still a plan_mode attachment with no subsequent
+      mode-flip-out).
+
+    Either format counts as pending — covers users on either CLI release.
+    """
+    import json as _json
+    from app.services.claude_session_reader import _find_session_jsonl as _find_jsonl
+    jsonl = _find_jsonl(claude_session_id, cwd)
+    if jsonl is None:
+        return False
+    try:
+        mtime = jsonl.stat().st_mtime
+    except OSError:
+        return False
+    cached = _plan_pending_cache.get(claude_session_id)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    # Legacy-format accumulators.
+    legacy_plan_ids: set[str] = set()
+    legacy_resolved_ids: set[str] = set()
+    # New-format accumulators. We track the latest permission-mode value seen;
+    # whatever the file ends on wins (the entries are appended in order).
+    last_permission_mode: str | None = None
+    saw_plan_mode_attachment = False
+
+    try:
+        with open(jsonl) as f:
+            for raw in f:
+                # Quick substring pre-check: skip lines that can't contribute.
+                # We need ExitPlanMode (legacy), tool_result (legacy),
+                # permission-mode (new), or plan_mode (new attachment).
+                if (
+                    "ExitPlanMode" not in raw
+                    and '"tool_result"' not in raw
+                    and '"permission-mode"' not in raw
+                    and "plan_mode" not in raw
+                ):
+                    continue
+                try:
+                    d = _json.loads(raw)
+                except Exception:
+                    continue
+
+                # New format: top-level "permission-mode" entries toggle mode.
+                if d.get("type") == "permission-mode":
+                    pm = d.get("permissionMode")
+                    if isinstance(pm, str):
+                        last_permission_mode = pm
+                    continue
+
+                # New format: "attachment" with attachment.type=="plan_mode"
+                # is the entry CLI writes when entering plan mode. Useful as
+                # a fallback signal when the session ends inside plan mode
+                # without an explicit permission-mode entry (defensive).
+                if d.get("type") == "attachment":
+                    att = d.get("attachment")
+                    if isinstance(att, dict) and att.get("type") == "plan_mode":
+                        saw_plan_mode_attachment = True
+                    continue
+
+                # Legacy format: scan message.content for ExitPlanMode tool_use
+                # and any tool_result blocks.
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    btype = b.get("type")
+                    if btype == "tool_use" and b.get("name") == "ExitPlanMode":
+                        bid = b.get("id")
+                        if isinstance(bid, str):
+                            legacy_plan_ids.add(bid)
+                    elif btype == "tool_result":
+                        tid = b.get("tool_use_id")
+                        if isinstance(tid, str):
+                            legacy_resolved_ids.add(tid)
+    except OSError:
+        _plan_pending_cache[claude_session_id] = (mtime, False)
+        return False
+
+    pending = False
+    # New-format judgment wins when present — it's an explicit mode toggle.
+    if last_permission_mode == "plan":
+        pending = True
+    elif last_permission_mode is None and saw_plan_mode_attachment:
+        # Plan mode started but no toggle out was ever recorded. Treat as
+        # pending — the alternative (silently dropping the signal) hides
+        # genuinely-pending plans on older snapshots that lack the toggle.
+        pending = True
+    elif legacy_plan_ids - legacy_resolved_ids:
+        pending = True
+
+    _plan_pending_cache[claude_session_id] = (mtime, pending)
+    return pending
 
 
 def configure(store: SessionStore, tmux: TmuxService) -> None:
@@ -749,6 +874,15 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
                 is_compacting = True
                 compacting_progress = pct
                 break
+        # Plan-approval attention: scan JSONL for ExitPlanMode tool_use without
+        # a matching tool_result. Cheap (mtime-cached) and covers sessions
+        # nobody has attached to.
+        tui_plan_pending = False
+        if eligible and s.agent_session_id:
+            try:
+                tui_plan_pending = _pending_plan_from_jsonl(s.agent_session_id, s.cwd)
+            except Exception:
+                tui_plan_pending = False
         views.append(SessionStatusView(
             id=s.id,
             status=s.status,
@@ -761,6 +895,7 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
             tui_hint=tui_hint,
             tui_auq_data=tui_auq_data,
             tui_approve_data=tui_approve_data,
+            tui_plan_pending=tui_plan_pending,
         ))
     return SessionStatusListResponse(items=views, total=len(views))
 

@@ -270,6 +270,16 @@ button:disabled {
 .thinking-pulse { animation: thinking-pulse 1.6s ease-in-out infinite; }
 .thinking-cursor { animation: thinking-blink 1s step-end infinite; color: var(--accent-amber); font-style: normal; }
 
+/* SessionCard attention badge: prominent red banner pulsing at ~1.2 Hz to
+   draw the eye when a session has work waiting for the user (AUQ, plan
+   approval, tool approval). Animates background + shadow together so the
+   banner reads from a peripheral glance, not just up close. */
+@keyframes attention-pulse {
+  0%, 100% { background: #dc2626; box-shadow: 0 0 8px 1px rgba(220,38,38,0.55); }
+  50%      { background: #ef4444; box-shadow: 0 0 14px 4px rgba(239,68,68,0.85); }
+}
+.attention-banner { animation: attention-pulse 1.2s ease-in-out infinite; }
+
 /* hljs in CodeBlock */
 .hljs { background: none; padding: 0; }
 
