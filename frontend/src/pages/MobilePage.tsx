@@ -240,11 +240,13 @@ function MobileUsageRow() {
 
 /* ─── Create Session Modal ─── */
 function CreateModal({
-  workspaceBase, username, onClose, onCreate,
-}: { workspaceBase: string; username: string; onClose: () => void; onCreate: (s: SessionMeta) => void }) {
+  workspaceBase, username, enabledTools, onClose, onCreate,
+}: { workspaceBase: string; username: string; enabledTools: string[]; onClose: () => void; onCreate: (s: SessionMeta) => void }) {
   const [project, setProject] = useState("");
   const [suffix, setSuffix] = useState("");
-  const [tool, setTool] = useState<"claude" | "codex">("claude");
+  const toolOptions = (["claude", "codex"] as const).filter((t) => enabledTools.includes(t));
+  const initialTool: "claude" | "codex" = (toolOptions[0] as "claude" | "codex" | undefined) ?? "claude";
+  const [tool, setTool] = useState<"claude" | "codex">(initialTool);
   const [codexTransport, setCodexTransport] = useState<"tui" | "app_server">("tui");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -284,14 +286,16 @@ function CreateModal({
         <div style={{ width: 36, height: 4, background: "var(--border)", borderRadius: 2, margin: "0 auto 4px" }} />
         <h3 style={{ margin: 0, fontSize: 16, color: "var(--text-primary)" }}>New Session</h3>
         <input placeholder="Project name *" value={project} onChange={(e) => setProject(e.target.value)} autoFocus style={inp} />
-        <div>
-          <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>Agent</div>
-          <div style={{ display: "flex", gap: 6 }}>
-            {(["claude", "codex"] as const).map(k => (
-              <button key={k} onClick={() => setTool(k)} style={pillBtn(tool === k)}>{k}</button>
-            ))}
+        {toolOptions.length > 1 && (
+          <div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>Agent</div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {toolOptions.map(k => (
+                <button key={k} onClick={() => setTool(k)} style={pillBtn(tool === k)}>{k}</button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
         {tool === "codex" && (
           <div>
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>Transport</div>
@@ -413,9 +417,11 @@ function PreviewTurnBubble({ turn }: { turn: { role: string; text: string; ts: n
 type ExternalTool = "claude" | "codex" | "cursor";
 
 function MobileBrowseExternalPanel({
-  onClose, onLoad,
-}: { onClose: () => void; onLoad: (ext: ExternalSession, tool: ExternalTool) => Promise<void> }) {
-  const [tool, setTool] = useState<ExternalTool>("claude");
+  onClose, onLoad, enabledTools,
+}: { onClose: () => void; onLoad: (ext: ExternalSession, tool: ExternalTool) => Promise<void>; enabledTools: string[] }) {
+  const tabOptions = (["claude", "codex", "cursor"] as const).filter((t) => enabledTools.includes(t)) as ExternalTool[];
+  const initialTab: ExternalTool = tabOptions[0] ?? "claude";
+  const [tool, setTool] = useState<ExternalTool>(initialTab);
   const [groups, setGroups] = useState<ExternalSessionGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -466,7 +472,7 @@ function MobileBrowseExternalPanel({
         <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: 22, padding: "0 4px", cursor: "pointer", lineHeight: 1, flexShrink: 0 }}>‹</button>
         <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Browse External Sessions</span>
         <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden", flexShrink: 0 }}>
-          {(["claude", "codex", "cursor"] as const).map((t) => (
+          {tabOptions.map((t) => (
             <button
               key={t}
               onClick={() => setTool(t)}
@@ -626,6 +632,7 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [workspaceBase, setWorkspaceBase] = useState("/workspace");
+  const [enabledTools, setEnabledTools] = useState<string[]>(["claude", "codex", "cursor"]);
   const [restarting, setRestarting] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showAllSessions, setShowAllSessions] = useState<boolean>(
@@ -635,7 +642,7 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
     localStorage.setItem("mobileShowAllSessions", showAllSessions ? "1" : "0");
   }, [showAllSessions]);
 
-  useEffect(() => { getConfig().then((c) => setWorkspaceBase(c.workspace)).catch(() => {}); }, []);
+  useEffect(() => { getConfig().then((c) => { setWorkspaceBase(c.workspace); setEnabledTools(c.enabled_tools); }).catch(() => {}); }, []);
 
   const fetchSessions = useCallback(async (p: number, showLoading = false) => {
     if (showLoading) setLoading(true);
@@ -769,11 +776,11 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
       </div>
 
       <div style={{ flex: 1, overflowY: "auto" }}>
-        {loading
-          ? <div style={{ textAlign: "center", padding: 48, color: "var(--text-faint)" }}>Loading…</div>
-          : sessions.length === 0
-            ? <div style={{ textAlign: "center", padding: 48, color: "var(--text-faint)" }}>{showAllSessions ? "No sessions yet" : "No active sessions"}</div>
-            : sessions.map((s) => (
+        {(() => {
+          const visibleSessions = sessions.filter((s) => enabledTools.includes(s.tool));
+          if (loading) return <div style={{ textAlign: "center", padding: 48, color: "var(--text-faint)" }}>Loading…</div>;
+          if (visibleSessions.length === 0) return <div style={{ textAlign: "center", padding: 48, color: "var(--text-faint)" }}>{showAllSessions ? "No sessions yet" : "No active sessions"}</div>;
+          return visibleSessions.map((s) => (
               <div key={s.id} onClick={() => onOpen(s)}
                 style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer", display: "flex", flexDirection: "column", gap: 5 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -823,8 +830,8 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
                 )}
                 <div style={{ fontSize: 11, color: "var(--text-faintest)", paddingLeft: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.cwd}</div>
               </div>
-            ))
-        }
+            ));
+        })()}
       </div>
 
       {totalPages > 1 && (
@@ -841,12 +848,13 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
       </div>
 
       {showCreate && (
-        <CreateModal workspaceBase={workspaceBase} username={username}
+        <CreateModal workspaceBase={workspaceBase} username={username} enabledTools={enabledTools}
           onClose={() => setShowCreate(false)}
           onCreate={(s) => { setShowCreate(false); onOpen(s); }} />
       )}
       {showImport && (
         <MobileBrowseExternalPanel
+          enabledTools={enabledTools}
           onClose={() => setShowImport(false)}
           onLoad={async (ext, tool) => {
             const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
@@ -4983,7 +4991,8 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [workspaceBase, setWorkspaceBase] = useState("/workspace");
-  useEffect(() => { getConfig().then((c) => setWorkspaceBase(c.workspace)).catch(() => {}); }, []);
+  const [enabledTools, setEnabledTools] = useState<string[]>(["claude", "codex", "cursor"]);
+  useEffect(() => { getConfig().then((c) => { setWorkspaceBase(c.workspace); setEnabledTools(c.enabled_tools); }).catch(() => {}); }, []);
 
   // Codex app-server: no terminal, only chat input.
   const isCodexAppServer = session.tool === "codex" && session.codex_transport === "app_server";
@@ -5476,12 +5485,14 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         <CreateModal
           workspaceBase={workspaceBase}
           username={username}
+          enabledTools={enabledTools}
           onClose={() => setShowCreate(false)}
           onCreate={(s) => { setShowCreate(false); setSession(s); }}
         />
       )}
       {showImport && (
         <MobileBrowseExternalPanel
+          enabledTools={enabledTools}
           onClose={() => setShowImport(false)}
           onLoad={async (ext, tool) => {
             const dirName = ext.cwd.split("/").filter(Boolean).pop() || ext.cwd;
