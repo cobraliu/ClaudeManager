@@ -1224,6 +1224,30 @@ export function SqliteViewer({ sessionId, path }: { sessionId: string; path: str
   const [execing, setExecing] = useState(false);
   const PAGE_SIZE = 100;
 
+  // Drag-resizable table-list panel. Persisted so a wider list survives reloads.
+  const [tableListWidth, setTableListWidth] = useState<number>(() => {
+    const stored = Number(localStorage.getItem("sqliteTableListW"));
+    return Number.isFinite(stored) && stored >= 100 && stored <= 600 ? stored : 180;
+  });
+  const dragRef = useRef({ dragging: false, startX: 0, startW: 0 });
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!dragRef.current.dragging) return;
+      const delta = e.clientX - dragRef.current.startX;
+      setTableListWidth(Math.max(100, Math.min(600, dragRef.current.startW + delta)));
+    };
+    const onUp = () => {
+      if (!dragRef.current.dragging) return;
+      dragRef.current.dragging = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+  }, []);
+  useEffect(() => { localStorage.setItem("sqliteTableListW", String(tableListWidth)); }, [tableListWidth]);
+
   const load = useCallback(async (table?: string, off = 0) => {
     setLoading(true);
     setError(null);
@@ -1293,7 +1317,7 @@ export function SqliteViewer({ sessionId, path }: { sessionId: string; path: str
         />
       )}
       {/* Table list */}
-      <div style={{ width: 180, borderRight: "1px solid #1f2937", overflowY: "auto", padding: "8px 4px", flexShrink: 0 }}>
+      <div style={{ width: tableListWidth, overflowY: "auto", padding: "8px 4px", flexShrink: 0 }}>
         <div style={{ fontSize: 10, color: "var(--text-muted)", padding: "4px 8px", fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>
           Tables
         </div>
@@ -1301,6 +1325,7 @@ export function SqliteViewer({ sessionId, path }: { sessionId: string; path: str
           <div
             key={t}
             onClick={() => load(t, 0)}
+            title={t}
             style={{
               padding: "5px 10px",
               fontSize: 12,
@@ -1309,6 +1334,8 @@ export function SqliteViewer({ sessionId, path }: { sessionId: string; path: str
               cursor: "pointer",
               borderRadius: 4,
               fontFamily: "monospace",
+              wordBreak: "break-all",
+              lineHeight: 1.35,
             }}
             onMouseEnter={(e) => { if (t !== selectedTable) e.currentTarget.style.background = "var(--bg-hover)"; }}
             onMouseLeave={(e) => { if (t !== selectedTable) e.currentTarget.style.background = "transparent"; }}
@@ -1317,6 +1344,19 @@ export function SqliteViewer({ sessionId, path }: { sessionId: string; path: str
           </div>
         ))}
       </div>
+
+      {/* Drag handle between table list and data panel */}
+      <div
+        onMouseDown={(e) => {
+          e.preventDefault();
+          dragRef.current = { dragging: true, startX: e.clientX, startW: tableListWidth };
+          document.body.style.cursor = "col-resize";
+          document.body.style.userSelect = "none";
+        }}
+        style={{ width: 4, background: "#1f2937", cursor: "col-resize", flexShrink: 0, transition: "background 0.15s" }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = "var(--text-faintest)"; }}
+        onMouseLeave={(e) => { if (!dragRef.current.dragging) (e.currentTarget as HTMLDivElement).style.background = "#1f2937"; }}
+      />
 
       {/* Table data */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
