@@ -1503,6 +1503,13 @@ function _planPersist(set: Set<string>) {
 }
 const _dismissedPlan = _planLoadDismissed();
 
+// Module-level cache for plan-file contents keyed by absolute path. Survives
+// PlanApprovalBlock/PlanHistoryBlock remounts that happen when the
+// displayEntries position briefly stops being `isLast` (e.g. a transient
+// compact_boundary or stop-hook user entry lands after ExitPlanMode), so the
+// body is shown immediately instead of cycling back to "Loading plan…".
+const _planContentCache = new Map<string, string>();
+
 function PlanHistoryBlock({ planText, planPath, approved, feedback }: {
   planText?: string;
   planPath?: string;
@@ -1510,7 +1517,9 @@ function PlanHistoryBlock({ planText, planPath, approved, feedback }: {
   feedback?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const [fetched, setFetched] = useState<string | undefined>(undefined);
+  const [fetched, setFetched] = useState<string | undefined>(
+    planPath ? _planContentCache.get(planPath) : undefined,
+  );
   // If the tool input didn't carry plan text, lazy-fetch from disk via the
   // file path captured when Claude wrote the plan. Fetch on first expand so
   // collapsed history rows don't fan out N requests.
@@ -1518,7 +1527,7 @@ function PlanHistoryBlock({ planText, planPath, approved, feedback }: {
     if (planText || fetched || !planPath || !expanded) return;
     let cancelled = false;
     readClaudePlan(planPath)
-      .then(r => { if (!cancelled) setFetched(r.content); })
+      .then(r => { if (!cancelled) { _planContentCache.set(planPath, r.content); setFetched(r.content); } })
       .catch(() => { if (!cancelled) setFetched(""); });
     return () => { cancelled = true; };
   }, [planText, planPath, expanded, fetched]);
@@ -1656,7 +1665,9 @@ function PlanApprovalBlock({ blockId, planText, planPath, onSubmit }: {
   const [dismissed, setDismissed] = useState(false);
   type Mode = "normal" | "edit" | "reject";
   const [mode, setMode] = useState<Mode>("normal");
-  const [fetched, setFetched] = useState<string | undefined>(undefined);
+  const [fetched, setFetched] = useState<string | undefined>(
+    planPath ? _planContentCache.get(planPath) : undefined,
+  );
   const [fetchError, setFetchError] = useState<string | undefined>(undefined);
   // Fetch the plan body from disk when the tool input lacks it. This is the
   // common case now — ExitPlanMode no longer ships the plan text in its
@@ -1665,7 +1676,7 @@ function PlanApprovalBlock({ blockId, planText, planPath, onSubmit }: {
     if (planText || fetched || !planPath) return;
     let cancelled = false;
     readClaudePlan(planPath)
-      .then(r => { if (!cancelled) setFetched(r.content); })
+      .then(r => { if (!cancelled) { _planContentCache.set(planPath, r.content); setFetched(r.content); } })
       .catch(e => { if (!cancelled) setFetchError(String(e?.message ?? e)); });
     return () => { cancelled = true; };
   }, [planText, planPath, fetched]);
@@ -3636,6 +3647,8 @@ interface OptimisticMsg {
   id: string;
   text: string;
   sentAt: number;
+  status: "pending" | "lost";
+  toastShown?: boolean;
 }
 
 type WsStatus = "connecting" | "connected" | "disconnected" | "error";
@@ -3660,6 +3673,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   });
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const [optimisticMsgs, setOptimisticMsgs] = useState<OptimisticMsg[]>([]);
+  const [lostToast, setLostToast] = useState<string | null>(null);
   const [newCompactUuids, setNewCompactUuids] = useState<Set<string>>(new Set());
   const [subagents, setSubagents] = useState<SubAgentMeta[]>([]);
   const wsRef = useRef<WsClient | null>(null);
@@ -4097,6 +4111,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
       // clock-skew slack) consume the earliest unmatched optimistic, in order.
       const now = Date.now();
       const realUserEntries: { text: string; ts: number }[] = [];
+      const compactBoundaryTs: number[] = [];
       for (const m of data.messages) {
         let text: string | null = null;
         if (m.type === "user" && m.message) {
@@ -4108,6 +4123,10 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
           // Claude CLI logs user input typed mid-response as queue-operation enqueue.
           const r = m as unknown as Record<string, unknown>;
           if (r.operation === "enqueue" && typeof r.content === "string") text = r.content.trim();
+        } else if (m.type === "system" && (m as unknown as Record<string, unknown>).subtype === "compact_boundary") {
+          const tsParsed = m.timestamp ? Date.parse(m.timestamp) : NaN;
+          if (!Number.isNaN(tsParsed)) compactBoundaryTs.push(tsParsed);
+          continue;
         }
         if (text === null) continue;
         const tsParsed = m.timestamp ? Date.parse(m.timestamp) : NaN;
@@ -4144,7 +4163,30 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
             }
           }
         }
-        return prev.filter((o) => !resolvedOptIds.has(o.id) && now - o.sentAt < 120_000);
+        // Three-state transition:
+        // - resolved (matched) → drop
+        // - still pending but compact_boundary appeared after sentAt → mark lost (the prompt was likely
+        //   consumed as the compact trigger and never reached the model)
+        // - still pending but > 30s old → mark lost (catch-all timeout for any send failure)
+        // - already lost > 5min → drop (final cleanup)
+        const next: OptimisticMsg[] = [];
+        for (const o of prev) {
+          if (resolvedOptIds.has(o.id)) continue;
+          if (o.status === "pending") {
+            const hadCompactAfter = compactBoundaryTs.some((t) => t > o.sentAt);
+            const timedOut = now - o.sentAt > 30_000;
+            if (hadCompactAfter || timedOut) {
+              next.push({ ...o, status: "lost" });
+            } else {
+              next.push(o);
+            }
+          } else {
+            // status === "lost"
+            if (now - o.sentAt > 300_000) continue;
+            next.push(o);
+          }
+        }
+        return next;
       });
       requestAnimationFrame(() => scrollToBottom(false));
     } catch { /* ignore */ }
@@ -4293,6 +4335,20 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     return () => clearInterval(id);
   }, []);
 
+  // Fire a toast the first time an optimistic message transitions to "lost"
+  // (compact-eaten or 30s send timeout). Mark toastShown so we don't re-toast
+  // on every poll while the lost bubble sits in the list.
+  useEffect(() => {
+    const unshown = optimisticMsgs.find((o) => o.status === "lost" && !o.toastShown);
+    if (!unshown) return;
+    setLostToast("输入未发送成功，请到对话区点击 Resend");
+    const timer = setTimeout(() => setLostToast(null), 3000);
+    setOptimisticMsgs((prev) =>
+      prev.map((o) => (o.id === unshown.id ? { ...o, toastShown: true } : o))
+    );
+    return () => clearTimeout(timer);
+  }, [optimisticMsgs]);
+
   // ── Input / control ───────────────────────────────────────────────────────
 
   const sendPrompt = useCallback(() => {
@@ -4307,7 +4363,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     // Optimistic: show immediately before JSONL poll confirms it
     setOptimisticMsgs((prev) => [
       ...prev,
-      { id: _randomId(), text, sentAt: Date.now() },
+      { id: _randomId(), text, sentAt: Date.now(), status: "pending" },
     ]);
     setInput("");
     inputDrafts.delete(sessionId);
@@ -4320,6 +4376,21 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const stopResponse = useCallback(() => {
     if (!wsRef.current) return;
     wsRef.current.sendInput("\x03");
+  }, []);
+
+  const resendLostMsg = useCallback((id: string, text: string) => {
+    if (!wsRef.current || !wsRef.current.isOpen() || hasUnansweredAuq) return;
+    setOptimisticMsgs((prev) => [
+      ...prev.filter((o) => o.id !== id),
+      { id: _randomId(), text, sentAt: Date.now(), status: "pending" },
+    ]);
+    wsRef.current.sendPrompt(text);
+    stickToBottom.current = true;
+    requestAnimationFrame(() => scrollToBottom(false));
+  }, [hasUnansweredAuq, scrollToBottom]);
+
+  const dismissLostMsg = useCallback((id: string) => {
+    setOptimisticMsgs((prev) => prev.filter((o) => o.id !== id));
   }, []);
   useEffect(() => { if (stopRef) stopRef.current = stopResponse; }, [stopRef, stopResponse]);
   useEffect(() => { if (refreshRef) refreshRef.current = () => fetchMessages(tail); }, [refreshRef, fetchMessages, tail]);
@@ -4365,7 +4436,17 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const canLoadMore = total > tail;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)", position: "relative" }}>
+      {/* Lost-prompt toast (appears once per lost transition; 3s auto-dismiss) */}
+      {lostToast && (
+        <div style={{
+          position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)",
+          background: "var(--accent-red, #c0392b)", color: "#fff",
+          padding: "6px 14px", borderRadius: 4, fontSize: 12, fontWeight: 600,
+          boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
+          pointerEvents: "none", zIndex: 100,
+        }}>{lostToast}</div>
+      )}
       {/* Load more banner */}
       {canLoadMore && (
         <div style={{
@@ -4430,53 +4511,25 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
               // isStreaming to clear (which takes ~2-4 s due to PTY idle + poll lag).
               const stopReason = entry.message?.stop_reason;
               const isWaitingForTool = stopReason === "tool_use";
-              if (
-                entry.type === "assistant" &&
-                isLast &&
-                (!isStreaming || isWaitingForTool) &&
-                optimisticMsgs.length === 0 &&
-                entry.message
-              ) {
+
+              const sendAnswer = (text: string) => {
+                setInput("");
+                inputDrafts.delete(sessionId);
+                clearDraft(sessionId);
+                wsRef.current?.sendPrompt(text);
+                stickToBottom.current = true;
+                requestAnimationFrame(() => scrollToBottom(true));
+              };
+
+              // ExitPlanMode (unanswered) — show plan approval card. Runs
+              // independently of isLast/isStreaming so transient entries
+              // landing after the assistant's ExitPlanMode (compact_boundary,
+              // stop-hook user entries, etc.) don't cycle the body back to
+              // the "Loading plan…" / "Awaiting plan approval…" placeholder.
+              if (entry.type === "assistant" && entry.message && !chatOnly) {
                 const blocks = getBlocks(entry.message.content as RawContentBlock[] | string);
-                const sendAnswer = (text: string) => {
-                  setInput("");
-                  inputDrafts.delete(sessionId);
-                  clearDraft(sessionId);
-                  wsRef.current?.sendPrompt(text);
-                  stickToBottom.current = true;
-                  requestAnimationFrame(() => scrollToBottom(true));
-                };
-
-                // AskUserQuestion tool_use block (unanswered) — render the
-                // surrounding message text only; the interactive widget is
-                // pinned above the status banner so it survives compaction.
-                const auqBlock = blocks.find(b => b.type === "tool_use" && b.name === "AskUserQuestion" && !toolResults.has(b.id!));
-                if (auqBlock) {
-                  const inp = auqBlock.input as Record<string, unknown>;
-                  const rawQs = Array.isArray(inp?.questions) ? inp.questions as AskQuestion[] : [];
-                  if (rawQs.length > 0) {
-                    return (
-                      <MessageEntry
-                        key={uid}
-                        entry={entry}
-                        toolResults={toolResults} codexToolResults={codexToolResults}
-                        compactSummaries={compactSummaries}
-                        isActiveThinking={isActiveThinking}
-                        isNewCompact={newCompactUuids.has(entry.uuid || "")}
-                        sessionId={sessionId}
-                        subagentsByDesc={subagentsByDesc}
-                        chatOnly={chatOnly}
-                        hideAuqDisplay
-                        planPathByExitBlockId={planPathByExitBlockId}
-                        onRewindMessage={handleRewindMessage}
-                      />
-                    );
-                  }
-                }
-
-                // ExitPlanMode (unanswered) — show plan approval card
                 const exitPlanBlock = blocks.find(b => b.type === "tool_use" && b.name === "ExitPlanMode" && !toolResults.has(b.id!));
-                if (exitPlanBlock && !chatOnly) {
+                if (exitPlanBlock) {
                   const planInput = (exitPlanBlock.input as Record<string, unknown>) || {};
                   const planText = planInput.plan ? String(planInput.plan) : undefined;
                   const planPath = exitPlanBlock.id ? planPathByExitBlockId.get(exitPlanBlock.id) : undefined;
@@ -4504,6 +4557,43 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                       />
                     </React.Fragment>
                   );
+                }
+              }
+
+              if (
+                entry.type === "assistant" &&
+                isLast &&
+                (!isStreaming || isWaitingForTool) &&
+                optimisticMsgs.length === 0 &&
+                entry.message
+              ) {
+                const blocks = getBlocks(entry.message.content as RawContentBlock[] | string);
+
+                // AskUserQuestion tool_use block (unanswered) — render the
+                // surrounding message text only; the interactive widget is
+                // pinned above the status banner so it survives compaction.
+                const auqBlock = blocks.find(b => b.type === "tool_use" && b.name === "AskUserQuestion" && !toolResults.has(b.id!));
+                if (auqBlock) {
+                  const inp = auqBlock.input as Record<string, unknown>;
+                  const rawQs = Array.isArray(inp?.questions) ? inp.questions as AskQuestion[] : [];
+                  if (rawQs.length > 0) {
+                    return (
+                      <MessageEntry
+                        key={uid}
+                        entry={entry}
+                        toolResults={toolResults} codexToolResults={codexToolResults}
+                        compactSummaries={compactSummaries}
+                        isActiveThinking={isActiveThinking}
+                        isNewCompact={newCompactUuids.has(entry.uuid || "")}
+                        sessionId={sessionId}
+                        subagentsByDesc={subagentsByDesc}
+                        chatOnly={chatOnly}
+                        hideAuqDisplay
+                        planPathByExitBlockId={planPathByExitBlockId}
+                        onRewindMessage={handleRewindMessage}
+                      />
+                    );
+                  }
                 }
 
                 // Numbered text questions
@@ -4549,23 +4639,59 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                 />
               );
             })}
-            {/* Optimistic messages: shown immediately, disappear once JSONL confirms */}
-            {optimisticMsgs.map((o) => (
-              <div key={o.id} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", padding: "0 16px 2px", opacity: 0.65 }}>
-                <div style={{
-                  maxWidth: "75%", padding: "9px 14px",
-                  borderRadius: "14px 14px 3px 14px",
-                  background: "#1c3a5e", border: "1px dashed #1d4f8a",
-                  color: "#cce5ff", fontSize: 13, lineHeight: 1.6,
-                  whiteSpace: "pre-wrap", wordBreak: "break-word",
-                }}>
-                  {o.text}
+            {/* Optimistic messages: pending = dashed/blue while waiting JSONL confirm; lost = solid red with Resend/Dismiss when reconciliation gives up */}
+            {optimisticMsgs.map((o) => {
+              if (o.status === "lost") {
+                return (
+                  <div key={o.id} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", padding: "0 16px 2px" }}>
+                    <div style={{
+                      maxWidth: "75%", padding: "9px 14px",
+                      borderRadius: "14px 14px 3px 14px",
+                      background: "rgba(180, 60, 60, 0.18)", border: "1px solid var(--accent-red, #c0392b)",
+                      color: "var(--text-default)", fontSize: 13, lineHeight: 1.6,
+                      whiteSpace: "pre-wrap", wordBreak: "break-word",
+                    }}>
+                      <span style={{ marginRight: 6 }}>⚠️</span>{o.text}
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4, paddingRight: 2 }}>
+                      <span style={{ fontSize: 10, color: "var(--accent-red, #c0392b)" }}>Send failed — likely eaten by auto-compact</span>
+                      <button
+                        onClick={() => resendLostMsg(o.id, o.text)}
+                        style={{
+                          fontSize: 11, padding: "2px 10px", borderRadius: 4,
+                          background: "var(--accent-blue, #3498db)", color: "#fff",
+                          border: "none", cursor: "pointer",
+                        }}
+                      >Resend</button>
+                      <button
+                        onClick={() => dismissLostMsg(o.id)}
+                        style={{
+                          fontSize: 11, padding: "2px 10px", borderRadius: 4,
+                          background: "transparent", color: "var(--text-faint)",
+                          border: "1px solid var(--border-default)", cursor: "pointer",
+                        }}
+                      >Dismiss</button>
+                    </div>
+                  </div>
+                );
+              }
+              return (
+                <div key={o.id} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", padding: "0 16px 2px", opacity: 0.65 }}>
+                  <div style={{
+                    maxWidth: "75%", padding: "9px 14px",
+                    borderRadius: "14px 14px 3px 14px",
+                    background: "#1c3a5e", border: "1px dashed #1d4f8a",
+                    color: "#cce5ff", fontSize: 13, lineHeight: 1.6,
+                    whiteSpace: "pre-wrap", wordBreak: "break-word",
+                  }}>
+                    {o.text}
+                  </div>
+                  <span style={{ fontSize: 10, color: "var(--text-faintest)", marginTop: 2, paddingRight: 2 }}>sending…</span>
                 </div>
-                <span style={{ fontSize: 10, color: "var(--text-faintest)", marginTop: 2, paddingRight: 2 }}>sending…</span>
-              </div>
-            ))}
+              );
+            })}
             {/* Pending tool approval from hooks — shown when Claude is waiting for permission */}
-            {pendingApproveData && optimisticMsgs.length === 0 && (
+            {pendingApproveData && !optimisticMsgs.some((o) => o.status === "pending") && (
               <ToolApprovalBlock
                 sessionId={sessionId}
                 toolName={pendingApproveData.tool_name}
