@@ -13,6 +13,7 @@ import { ConfigCheckButton } from "./ConfigCheckButton";
 import { ConfigValidationBanner } from "./ConfigValidationBanner";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { detectFormat, convert, extFor, type ConfigFormat } from "../lib/configConvert";
+import { useFsWatch, type FsChange } from "../lib/useFsWatch";
 import {
   listFiles,
   searchFiles,
@@ -55,49 +56,6 @@ interface NodeState {
   error?: string;
 }
 
-interface FsChange {
-  type: "add" | "modify" | "delete";
-  path: string;
-  dir: string;
-  is_dir: boolean;
-}
-
-function useFsWatch(sessionId: string, onChanges: (changes: FsChange[]) => void) {
-  const onChangesRef = useRef(onChanges);
-  onChangesRef.current = onChanges;
-
-  useEffect(() => {
-    const token = localStorage.getItem("token");
-    if (!token) return;
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${window.location.host}/api/sessions/${sessionId}/fs/watch?token=${encodeURIComponent(token)}`;
-    let ws: WebSocket | null = null;
-    let stopped = false;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const connect = () => {
-      if (stopped) return;
-      ws = new WebSocket(url);
-      ws.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data) as { changes: FsChange[] };
-          if (msg.changes?.length) onChangesRef.current(msg.changes);
-        } catch {}
-      };
-      ws.onclose = () => {
-        if (!stopped) retryTimer = setTimeout(connect, 3000);
-      };
-      ws.onerror = () => ws?.close();
-    };
-
-    connect();
-    return () => {
-      stopped = true;
-      if (retryTimer) clearTimeout(retryTimer);
-      ws?.close();
-    };
-  }, [sessionId]);
-}
 
 type FileKind = "edit" | "code" | "csv" | "jsonl" | "markdown" | "sqlite" | "pdf" | "image";
 
