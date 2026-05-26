@@ -19,6 +19,7 @@ import {
   type FileViewerMode,
 } from "../api/sessionApi";
 import { SessionCard } from "../components/SessionCard";
+import { EmbeddedTerminalPanel, useAdminTerminalApi } from "../components/EmbeddedTerminalPanel";
 
 const PAGE_SIZE = 30;
 
@@ -37,7 +38,8 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
   const [newRole, setNewRole] = useState<"admin" | "user">("user");
   const [pwUser, setPwUser] = useState("");
   const [pwValue, setPwValue] = useState("");
-  const [tab, setTab] = useState<"sessions" | "users" | "config">("config");
+  const [tab, setTab] = useState<"sessions" | "users" | "config" | "terminal">("config");
+  const adminTerminalApi = useAdminTerminalApi();
   const [msg, setMsg] = useState("");
   const [workspace, setWorkspaceVal] = useState("");
   const [workspaceInput, setWorkspaceInput] = useState("");
@@ -212,6 +214,7 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
             <TabBtn active={tab === "config"} label="Config" onClick={() => setTab("config")} />
             <TabBtn active={tab === "users"} label={`Users (${users.length})`} onClick={() => setTab("users")} />
             <TabBtn active={tab === "sessions"} label={`Sessions (${sessions.length})`} onClick={() => setTab("sessions")} />
+            <TabBtn active={tab === "terminal"} label="Terminal" onClick={() => setTab("terminal")} />
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
@@ -621,6 +624,28 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
                   ))}
                 </tbody>
               </table>
+            </div>
+          </div>
+        )}
+
+        {tab === "terminal" && (
+          <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+            <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--bg-hover)", fontSize: 12, color: "var(--text-muted)" }}>
+              Run background tasks / scripts here. Save (💾) the current terminal to give it a name and prevent auto-close. Same lifecycle as session terminals: ephemerals auto-close after idle; running child processes keep the terminal alive.
+            </div>
+            <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+              <EmbeddedTerminalPanel
+                instanceKey="__admin__"
+                api={adminTerminalApi}
+                cwd={workspace || "/"}
+                theme={theme ?? "dark"}
+                open={true}
+                onOpenChange={() => {}}
+                height={0}
+                onHeightChange={() => {}}
+                fill
+                emptyHint="Loading admin terminal…"
+              />
             </div>
           </div>
         )}
