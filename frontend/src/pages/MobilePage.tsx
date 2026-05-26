@@ -122,6 +122,7 @@ import { GitGraph } from "../components/GitGraph";
 import { FileIcon, NewFolderIcon } from "../components/FileIcon";
 import { HtmlViewer } from "../components/HtmlViewer";
 import CodexChatInput from "../components/CodexChatInput";
+import { useFsWatch } from "../lib/useFsWatch";
 import type { DirInfoResponse } from "../api/sessionApi";
 
 const MOBILE_PAGE_SIZE = 10;
@@ -3909,6 +3910,29 @@ function MobileFileBrowserPanel({
       } catch { setRootEntries([]); } finally { setRootLoading(false); }
     })();
   }, [sessionId, sessionCwd, showHidden]);
+
+  // Stash latest tree snapshot so the fs/watch callback can read it without
+  // re-subscribing on every keystroke.
+  const treeRef = useRef(tree);
+  treeRef.current = tree;
+  useFsWatch(sessionId, (changes) => {
+    if (!changes.length) return;
+    let needRoot = false;
+    const dirs = new Set<string>();
+    for (const c of changes) {
+      // Backend emits dir relative to session cwd; "" means root.
+      if (!c.dir) needRoot = true;
+      else dirs.add(c.dir);
+    }
+    if (needRoot) void reloadRoot();
+    // Only reload nested dirs we've actually expanded — otherwise we'd warm
+    // up directories the user never opened.
+    for (const d of dirs) {
+      if (treeRef.current[d]?.loaded) {
+        void reloadAffected(d + "/_");
+      }
+    }
+  });
 
   // Reset sheet state when sheet changes
   useEffect(() => {

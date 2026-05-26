@@ -20,6 +20,7 @@ import { ConfigFormatToggle } from "./ConfigFormatToggle";
 import { ConfigCheckButton } from "./ConfigCheckButton";
 import { ConfigValidationBanner } from "./ConfigValidationBanner";
 import { detectFormat, convert, languageFor, type ConfigFormat } from "../lib/configConvert";
+import { useFsWatch } from "../lib/useFsWatch";
 import downloadIcon from "../assets/download.svg";
 
 const MAX_TRANSFER_MB = 16;
@@ -1147,6 +1148,7 @@ export function FileSidePanel({
   const [changedWarnings, setChangedWarnings] = useState<ChangedFilesWarning[]>([]);
   const [filesRefreshKey, setFilesRefreshKey] = useState(0);
   const prevChangedRef = useRef<Set<string>>(new Set());
+  const pollChangesRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     let mounted = true;
@@ -1166,10 +1168,24 @@ export function FileSidePanel({
         prevChangedRef.current = nextSet;
       } catch {/* ignore */}
     };
+    pollChangesRef.current = poll;
     poll();
+    // Backstop poll — the fs/watch WS handles the common case in ~150ms, but
+    // the poll covers WS gaps and also detects status changes (modified ↔
+    // staged) that don't trigger fs events on their own.
     const id = setInterval(poll, 8000);
     return () => { mounted = false; clearInterval(id); };
   }, [sessionId]);
+
+  // Real-time tree refresh: bump filesRefreshKey on any fs event so adds /
+  // deletes / renames appear in the tree within the WS debounce window
+  // (~150ms) instead of waiting for the 8s poll. Also re-fetch git changes
+  // immediately so the Changes pane stays in sync.
+  useFsWatch(sessionId, (changes) => {
+    if (!changes.length) return;
+    setFilesRefreshKey((k) => k + 1);
+    pollChangesRef.current();
+  });
 
   const changedSet = new Set(changedFiles.map((f) => f.path));
 
