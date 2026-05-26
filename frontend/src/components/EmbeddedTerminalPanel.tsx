@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createTerminal,
   deleteTerminal,
@@ -6,23 +6,47 @@ import {
   issueTerminalToken,
   listTerminals,
   renameTerminal,
+  createAdminTerminal,
+  deleteAdminTerminal,
+  heartbeatAdminTerminal,
+  issueAdminTerminalToken,
+  listAdminTerminals,
+  renameAdminTerminal,
+  type CreateTerminalResponse,
+  type IssueTerminalTokenResponse,
+  type TerminalHeartbeatResponse,
   type TerminalInfo,
 } from "../api/sessionApi";
 import { TerminalPane } from "./TerminalPane";
 
-// Per-session cache: which term_id we were attached to last. Used on panel
+// Per-instance cache: which term_id we were attached to last. Used on panel
 // mount / page reload to reattach instead of spawning yet another ephemeral.
 // Bumping the prefix invalidates all stored ids if the schema ever changes.
 const TERM_CACHE_PREFIX = "cmTermLastTermId:v1:";
-const termCacheKey = (sid: string) => TERM_CACHE_PREFIX + sid;
+const termCacheKey = (instanceKey: string) => TERM_CACHE_PREFIX + instanceKey;
 
 // Heartbeat interval. The default backend idle grace is 600s; 30s gives ~20
 // heartbeats per window, so transient network blips don't lose the terminal.
 // Stays safely below any reasonable user-configured idle grace.
 const HEARTBEAT_INTERVAL_MS = 30_000;
 
+// Adapter so the same panel can drive session-scoped terminals
+// (/api/sessions/{id}/terminals/...) and admin-scoped terminals
+// (/api/admin/terminals/...) with identical lifecycle semantics.
+export interface TerminalApi {
+  list: () => Promise<{ items: TerminalInfo[] }>;
+  create: (opts: { name?: string | null; cwd?: string }) => Promise<CreateTerminalResponse>;
+  issueToken: (termId: string) => Promise<IssueTerminalTokenResponse>;
+  rename: (termId: string, name: string | null) => Promise<TerminalInfo>;
+  delete: (termId: string) => Promise<{ ok: boolean }>;
+  heartbeat: (termId: string) => Promise<TerminalHeartbeatResponse>;
+}
+
 interface Props {
-  sessionId: string | null;
+  // Stable cache/effect key. For session terminals: the session id.
+  // For admin terminals: a fixed sentinel like "__admin__".
+  instanceKey: string | null;
+  api: TerminalApi;
   cwd?: string;
   theme: "dark" | "light";
   fontFamily?: string;
@@ -33,6 +57,11 @@ interface Props {
   resizeFrom?: "top" | "bottom";
   minHeight?: number;
   maxHeightVh?: number;
+  emptyHint?: string;
+  // When true, the panel stretches to fill its flex parent instead of using
+  // the fixed `height` prop. Used for full-page placements (admin terminal
+  // tab) where the parent already manages sizing.
+  fill?: boolean;
 }
 
 type Attached = { termId: string; wsUrl: string; name: string | null; isNamed: boolean };
@@ -40,12 +69,14 @@ type Attached = { termId: string; wsUrl: string; name: string | null; isNamed: b
 const POLL_MS = 4000;
 
 export function EmbeddedTerminalPanel({
-  sessionId, cwd, theme, fontFamily,
+  instanceKey, api, cwd, theme, fontFamily,
   open, onOpenChange,
   height, onHeightChange,
   resizeFrom = "top",
   minHeight = 100,
   maxHeightVh = 70,
+  emptyHint = "Select a session to open a terminal.",
+  fill = false,
 }: Props) {
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
   const [attached, setAttached] = useState<Attached | null>(null);
@@ -62,21 +93,21 @@ export function EmbeddedTerminalPanel({
   const pickerRef = useRef<HTMLDivElement | null>(null);
 
   const refreshList = useCallback(async () => {
-    if (!sessionId) return;
+    if (!instanceKey) return;
     try {
-      const r = await listTerminals(sessionId);
+      const r = await api.list();
       setTerminals(r.items);
     } catch {
       // swallow; periodic poll will retry
     }
-  }, [sessionId]);
+  }, [instanceKey, api]);
 
   const openEphemeral = useCallback(async () => {
-    if (!sessionId || busy) return;
+    if (!instanceKey || busy) return;
     setBusy(true);
     setError(null);
     try {
-      const r = await createTerminal(sessionId, {});
+      const r = await api.create({ cwd });
       setAttached({ termId: r.term_id, wsUrl: r.ws_url, name: r.name, isNamed: r.is_named });
       await refreshList();
     } catch (e) {
@@ -84,10 +115,10 @@ export function EmbeddedTerminalPanel({
     } finally {
       setBusy(false);
     }
-  }, [sessionId, busy, refreshList]);
+  }, [instanceKey, api, cwd, busy, refreshList]);
 
   const attachExisting = useCallback(async (term: TerminalInfo) => {
-    if (!sessionId || busy) return;
+    if (!instanceKey || busy) return;
     // No-op when picking the terminal that's already attached — otherwise we'd
     // tear down the working WS and re-attach with a new token for no reason.
     if (attached && attached.termId === term.term_id) {
@@ -97,7 +128,7 @@ export function EmbeddedTerminalPanel({
     setBusy(true);
     setError(null);
     try {
-      const t = await issueTerminalToken(sessionId, term.term_id);
+      const t = await api.issueToken(term.term_id);
       setAttached({ termId: term.term_id, wsUrl: t.ws_url, name: term.name, isNamed: term.is_named });
       setPicking(false);
       await refreshList();
@@ -106,16 +137,16 @@ export function EmbeddedTerminalPanel({
     } finally {
       setBusy(false);
     }
-  }, [sessionId, busy, attached, refreshList]);
+  }, [instanceKey, api, busy, attached, refreshList]);
 
   const saveAsNamed = useCallback(async (name: string) => {
-    if (!sessionId || !attached || busy) return;
+    if (!instanceKey || !attached || busy) return;
     const trimmed = name.trim();
     if (!trimmed) return;
     setBusy(true);
     setRenameError(null);
     try {
-      const r = await renameTerminal(sessionId, attached.termId, trimmed);
+      const r = await api.rename(attached.termId, trimmed);
       setAttached((a) => (a ? { ...a, name: r.name, isNamed: r.is_named } : a));
       setRenaming(false);
       setRenameValue("");
@@ -126,15 +157,15 @@ export function EmbeddedTerminalPanel({
     } finally {
       setBusy(false);
     }
-  }, [sessionId, attached, busy, refreshList]);
+  }, [instanceKey, api, attached, busy, refreshList]);
 
   const deleteCurrent = useCallback(async () => {
-    if (!sessionId || !attached || busy) return;
+    if (!instanceKey || !attached || busy) return;
     const label = attached.name ? `"${attached.name}"` : "this ephemeral terminal";
     if (!confirm(`Delete ${label}? Any running processes inside will be killed.`)) return;
     setBusy(true);
     try {
-      await deleteTerminal(sessionId, attached.termId);
+      await api.delete(attached.termId);
       setAttached(null);
       await refreshList();
     } catch (e) {
@@ -142,20 +173,20 @@ export function EmbeddedTerminalPanel({
     } finally {
       setBusy(false);
     }
-  }, [sessionId, attached, busy, refreshList]);
+  }, [instanceKey, api, attached, busy, refreshList]);
 
-  // Reset all panel state when the session changes or the panel closes.
+  // Reset all panel state when the instance changes or the panel closes.
   // Without this, switching from session A to B would leave A's terminal
   // attached (and its WS streaming) because `attached` is otherwise
-  // session-agnostic. The auto-open effect below then creates a fresh
-  // ephemeral for the new session.
+  // instance-agnostic. The auto-open effect below then creates a fresh
+  // ephemeral for the new instance.
   useEffect(() => {
     setAttached(null);
     setTerminals([]);
     setError(null);
     setPicking(false);
     setRenaming(false);
-  }, [sessionId, open]);
+  }, [instanceKey, open]);
 
   // Auto-open: when the panel becomes visible with nothing attached, first try
   // to reattach the term_id remembered from the previous mount. Only fall back
@@ -163,16 +194,16 @@ export function EmbeddedTerminalPanel({
   // This is what makes a browser refresh feel like nothing happened, instead
   // of leaving an orphaned ephemeral behind every reload.
   useEffect(() => {
-    if (!open || !sessionId || attached) return;
+    if (!open || !instanceKey || attached) return;
     let cancelled = false;
     (async () => {
       try {
-        const cachedId = localStorage.getItem(termCacheKey(sessionId));
+        const cachedId = localStorage.getItem(termCacheKey(instanceKey));
         if (cachedId) {
           try {
-            // issueTerminalToken works for standby terms too, so revival
+            // issueToken works for standby terms too, so revival
             // happens automatically when the WS later attaches.
-            const t = await issueTerminalToken(sessionId, cachedId);
+            const t = await api.issueToken(cachedId);
             if (cancelled) return;
             setAttached({
               termId: t.term_id,
@@ -180,39 +211,39 @@ export function EmbeddedTerminalPanel({
               name: t.name ?? null,
               isNamed: !!t.is_named,
             });
-            listTerminals(sessionId).then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
+            api.list().then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
             return;
           } catch {
             // Cached term was swept or otherwise unreachable. Drop the cache
             // and fall through to the create-new path below.
-            localStorage.removeItem(termCacheKey(sessionId));
+            localStorage.removeItem(termCacheKey(instanceKey));
           }
         }
-        const r = await listTerminals(sessionId);
+        const r = await api.list();
         if (cancelled) return;
         setTerminals(r.items);
-        const c = await createTerminal(sessionId, {});
+        const c = await api.create({ cwd });
         if (cancelled) return;
         setAttached({ termId: c.term_id, wsUrl: c.ws_url, name: c.name, isNamed: c.is_named });
-        listTerminals(sessionId).then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
+        api.list().then((rr) => { if (!cancelled) setTerminals(rr.items); }).catch(() => {});
       } catch (e) {
         if (!cancelled) setError(String(e));
       }
     })();
     return () => { cancelled = true; };
-  }, [open, sessionId, attached]);
+  }, [open, instanceKey, api, cwd, attached]);
 
   // Persist the currently-attached term_id so the next mount can find it.
   // We store on every attach (named or ephemeral) — the cached id is just
   // "where the user was looking last in this tab," and reattach behavior
   // works identically for both kinds.
   useEffect(() => {
-    if (!sessionId) return;
+    if (!instanceKey) return;
     if (attached) {
-      try { localStorage.setItem(termCacheKey(sessionId), attached.termId); }
+      try { localStorage.setItem(termCacheKey(instanceKey), attached.termId); }
       catch { /* quota exceeded — not worth surfacing */ }
     }
-  }, [sessionId, attached]);
+  }, [instanceKey, attached]);
 
   // While a terminal is attached, periodically heartbeat. This keeps the
   // backend's "last holder" timestamp fresh so an ephemeral with a temporarily
@@ -220,28 +251,28 @@ export function EmbeddedTerminalPanel({
   // 410 means our cached id was already swept — drop attachment so the
   // auto-open effect above can spawn a fresh one.
   useEffect(() => {
-    if (!open || !sessionId || !attached) return;
+    if (!open || !instanceKey || !attached) return;
     const tick = async () => {
       try {
-        await heartbeatTerminal(sessionId, attached.termId);
+        await api.heartbeat(attached.termId);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         if (/gone|404|410/i.test(msg)) {
-          try { localStorage.removeItem(termCacheKey(sessionId)); } catch { /* ignore */ }
+          try { localStorage.removeItem(termCacheKey(instanceKey)); } catch { /* ignore */ }
           setAttached(null);
         }
       }
     };
     const id = setInterval(tick, HEARTBEAT_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [open, sessionId, attached]);
+  }, [open, instanceKey, api, attached]);
 
   // Periodic list refresh (mostly to update attach_count badges)
   useEffect(() => {
-    if (!open || !sessionId) return;
+    if (!open || !instanceKey) return;
     const id = setInterval(refreshList, POLL_MS);
     return () => clearInterval(id);
-  }, [open, sessionId, refreshList]);
+  }, [open, instanceKey, refreshList]);
 
   // Close picker on outside-click / Escape.
   useEffect(() => {
@@ -309,14 +340,14 @@ export function EmbeddedTerminalPanel({
 
   return (
     <div style={{
-      height, flexShrink: 0,
+      ...(fill ? { flex: 1, minHeight: 0 } : { height, flexShrink: 0 }),
       display: "flex", flexDirection: "column",
       background: "var(--bg-base)",
-      borderTop: resizeFrom === "top" ? "1px solid var(--border)" : undefined,
-      borderBottom: resizeFrom === "bottom" ? "1px solid var(--border)" : undefined,
+      borderTop: !fill && resizeFrom === "top" ? "1px solid var(--border)" : undefined,
+      borderBottom: !fill && resizeFrom === "bottom" ? "1px solid var(--border)" : undefined,
       overflow: "hidden",
     }}>
-      {resizeFrom === "top" && resizeHandle}
+      {!fill && resizeFrom === "top" && resizeHandle}
 
       {/* Header */}
       <div style={{
@@ -330,7 +361,7 @@ export function EmbeddedTerminalPanel({
         <button
           onClick={() => setPicking(p => !p)}
           title="Switch terminal"
-          disabled={!sessionId || busy}
+          disabled={!instanceKey || busy}
           style={{
             background: "var(--bg-hover)", color: "var(--text-body)",
             fontSize: 11, padding: "2px 8px", lineHeight: 1,
@@ -481,14 +512,16 @@ export function EmbeddedTerminalPanel({
         <span style={{ color: "var(--text-faint)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 280 }}>
           {cwd || ""}
         </span>
-        <button
-          onClick={() => onOpenChange(false)}
-          title="Hide terminal"
-          style={{
-            background: "var(--bg-hover)", color: "var(--text-secondary)",
-            fontSize: 11, padding: "2px 8px", lineHeight: 1,
-          }}
-        >✕</button>
+        {!fill && (
+          <button
+            onClick={() => onOpenChange(false)}
+            title="Hide terminal"
+            style={{
+              background: "var(--bg-hover)", color: "var(--text-secondary)",
+              fontSize: 11, padding: "2px 8px", lineHeight: 1,
+            }}
+          >✕</button>
+        )}
       </div>
 
       {/* Body */}
@@ -498,9 +531,9 @@ export function EmbeddedTerminalPanel({
             {error}
           </div>
         )}
-        {!sessionId && !error && (
+        {!instanceKey && !error && (
           <div style={{ padding: 12, fontSize: 12, color: "var(--text-muted)" }}>
-            Select a session to open a terminal.
+            {emptyHint}
           </div>
         )}
         {attached && !error && (
@@ -516,7 +549,32 @@ export function EmbeddedTerminalPanel({
           />
         )}
       </div>
-      {resizeFrom === "bottom" && resizeHandle}
+      {!fill && resizeFrom === "bottom" && resizeHandle}
     </div>
   );
+}
+
+/** Build a TerminalApi bound to a specific session id. Stable across renders
+ *  when sessionId is stable so the panel doesn't churn its effects. */
+export function useSessionTerminalApi(sessionId: string | null): TerminalApi {
+  return useMemo<TerminalApi>(() => ({
+    list: () => sessionId ? listTerminals(sessionId) : Promise.resolve({ items: [] }),
+    create: (opts) => createTerminal(sessionId!, opts),
+    issueToken: (termId) => issueTerminalToken(sessionId!, termId),
+    rename: (termId, name) => renameTerminal(sessionId!, termId, name),
+    delete: (termId) => deleteTerminal(sessionId!, termId),
+    heartbeat: (termId) => heartbeatTerminal(sessionId!, termId),
+  }), [sessionId]);
+}
+
+/** Admin-scoped TerminalApi — same TerminalManager backend, no session. */
+export function useAdminTerminalApi(): TerminalApi {
+  return useMemo<TerminalApi>(() => ({
+    list: () => listAdminTerminals(),
+    create: (opts) => createAdminTerminal({ name: opts.name, cwd: opts.cwd ?? "/" }),
+    issueToken: (termId) => issueAdminTerminalToken(termId),
+    rename: (termId, name) => renameAdminTerminal(termId, name),
+    delete: (termId) => deleteAdminTerminal(termId),
+    heartbeat: (termId) => heartbeatAdminTerminal(termId),
+  }), []);
 }

@@ -47,6 +47,7 @@ from app.services.tmux_service import TmuxService
 from app.services.user_store import UserStore
 from app.ws import terminal_ws, shell_ws, term_ws
 from app.api import terminals as terminals_api
+from app.api import admin_terminals as admin_terminals_api
 
 # Init stores (both share the same database file)
 _db_path = get_session_db_path()
@@ -154,6 +155,7 @@ terminal_ws.configure(session_store, tmux)
 shell_ws.configure(tmux, sessions_api._shell_tokens)
 term_ws.configure(tmux, term_mgr)
 terminals_api.configure(session_store, term_mgr)
+admin_terminals_api.configure(term_mgr)
 
 
 def _startup_ensure_bypass_accepted() -> None:
@@ -710,6 +712,7 @@ app.include_router(terminal_ws.router)
 app.include_router(shell_ws.router)
 app.include_router(term_ws.router)
 app.include_router(terminals_api.router)
+app.include_router(admin_terminals_api.router)
 
 
 @app.get("/health")

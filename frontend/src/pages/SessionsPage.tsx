@@ -50,7 +50,7 @@ import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
 import { downloadConversationHtml } from "../lib/exportChat";
 import { SessionSideDock } from "../components/SessionSideDock";
 import { UserConfigModal } from "../components/UserConfigModal";
-import { EmbeddedTerminalPanel } from "../components/EmbeddedTerminalPanel";
+import { EmbeddedTerminalPanel, useSessionTerminalApi } from "../components/EmbeddedTerminalPanel";
 import CodexChatInput from "../components/CodexChatInput";
 import { TextSelectionMenu } from "../components/TextSelectionMenu";
 import { AsciiflowModal } from "../components/AsciiflowModal";
@@ -1399,6 +1399,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const isAdmin = localStorage.getItem("role") === "admin";
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [active, setActive] = useState<AttachResponse | null>(null);
+  const sessionTerminalApi = useSessionTerminalApi(active?.session_id ?? null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   // true when the active session was opened in read-only chat mode (terminated)
   const [chatOnlyMode, setChatOnlyMode] = useState(false);
@@ -2792,7 +2793,8 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               </div>
             </div>
             <EmbeddedTerminalPanel
-              sessionId={active?.session_id ?? null}
+              instanceKey={active?.session_id ?? null}
+              api={sessionTerminalApi}
               cwd={activeSessionMeta?.cwd}
               theme={theme}
               fontFamily={terminalFont}

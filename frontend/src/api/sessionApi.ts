@@ -979,6 +979,41 @@ export function heartbeatTerminal(
   return request(`/api/sessions/${sessionId}/terminals/${termId}/heartbeat`, { method: "POST" });
 }
 
+// Admin-scoped terminals (not tied to a session). Identical lifecycle to
+// session terminals — same TerminalManager, same idle/standby/kept rules,
+// same active-child detection. Just a different URL prefix + admin auth.
+export function listAdminTerminals(): Promise<{ items: TerminalInfo[] }> {
+  return request(`/api/admin/terminals`);
+}
+
+export function createAdminTerminal(
+  opts: { name?: string | null; cwd: string },
+): Promise<CreateTerminalResponse> {
+  return request(`/api/admin/terminals`, {
+    method: "POST",
+    body: JSON.stringify({ name: opts.name ?? null, cwd: opts.cwd }),
+  });
+}
+
+export function issueAdminTerminalToken(termId: string): Promise<IssueTerminalTokenResponse> {
+  return request(`/api/admin/terminals/${termId}/token`, { method: "POST" });
+}
+
+export function renameAdminTerminal(termId: string, name: string | null): Promise<TerminalInfo> {
+  return request(`/api/admin/terminals/${termId}/rename`, {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function deleteAdminTerminal(termId: string): Promise<{ ok: boolean }> {
+  return request(`/api/admin/terminals/${termId}`, { method: "DELETE" });
+}
+
+export function heartbeatAdminTerminal(termId: string): Promise<TerminalHeartbeatResponse> {
+  return request(`/api/admin/terminals/${termId}/heartbeat`, { method: "POST" });
+}
+
 // Git
 export interface GitLogEntry {
   hash: string;
