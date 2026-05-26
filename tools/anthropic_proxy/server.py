@@ -55,6 +55,11 @@ log = logging.getLogger("anthropic_proxy")
 # single-process asyncio so we don't need locking.
 _STATS: dict[str, Any] = {
     "requests_total": 0,
+    # Subset of requests_total that carried the x-claude-code-session-id
+    # header. If the CLI ever renames the header we depend on, this counter
+    # drops to 0 even though requests_total keeps climbing — surface via
+    # /_proxy_health so monitoring can alert on the ratio.
+    "sessioned_requests_total": 0,
     "sse_streams_total": 0,
     "snapshots_total": 0,
     "client_disconnects_total": 0,
@@ -75,14 +80,24 @@ def _safe_session_dir(session_id: str) -> Path | None:
     return d
 
 
-def _write_snapshot(session_dir: Path, payload: dict[str, Any]) -> bool:
+def _write_snapshot_blocking(tmp: Path, final: Path, payload: dict[str, Any]) -> None:
+    """Pure I/O path — runs in a thread so the event loop stays unblocked.
+
+    Both json.dumps and the syscalls live here because dumps on a large
+    tool_use.input (tens of KB) is itself non-trivial CPU and the
+    GIL-released pwrite/rename are the actual blocking calls.
+    """
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(final)
+
+
+async def _write_snapshot(session_dir: Path, payload: dict[str, Any]) -> bool:
     """Atomic write of one snapshot file. Returns True on success."""
     name = f"{payload['ts_ns']}.json"
     tmp = session_dir / f".{name}.tmp"
     final = session_dir / name
     try:
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(final)
+        await asyncio.to_thread(_write_snapshot_blocking, tmp, final, payload)
         _STATS["snapshots_total"] += 1
         log.debug("snapshot session=%s kind=%s blocks=%d → %s",
                   payload.get("session_id"), payload.get("kind"),
@@ -159,7 +174,7 @@ class StreamAggregator:
         elif dtype == "signature_delta":
             blk["signature"] = (blk.get("signature") or "") + (delta.get("signature") or "")
 
-    def maybe_snapshot(self, kind: str = "snapshot") -> None:
+    async def maybe_snapshot(self, kind: str = "snapshot") -> None:
         now = time.monotonic()
         if kind == "snapshot":
             if not self._dirty:
@@ -181,10 +196,14 @@ class StreamAggregator:
             "kind": kind,
             "content": content,
         }
-        if _write_snapshot(self.session_dir, payload):
-            self.snapshots_taken += 1
+        # Mark non-dirty *before* the await so concurrent feed_event calls
+        # (from later chunks in the same loop iteration) re-flag dirty and
+        # earn a fresh snapshot rather than getting swallowed by the in-flight
+        # write.
         self._last_snapshot_ts = now
         self._dirty = False
+        if await _write_snapshot(self.session_dir, payload):
+            self.snapshots_taken += 1
 
 
 def _parse_sse_chunk(buf: str) -> tuple[list[tuple[str, dict[str, Any]]], str]:
@@ -236,6 +255,8 @@ async def handle(
     session_id = request.headers.get(SESSION_HEADER) or request.headers.get(SESSION_HEADER.title()) or ""
     session_dir = _safe_session_dir(session_id) if session_id else None
     aggregator = StreamAggregator(session_id, session_dir) if session_dir else None
+    if session_id:
+        _STATS["sessioned_requests_total"] += 1
 
     log.debug("req start method=%s path=%s session=%s body_bytes=%d",
               request.method, request.path, session_id or "-", len(body))
@@ -288,9 +309,12 @@ async def handle(
                         # Task cancellation must propagate after we flush the
                         # final snapshot — swallowing it here would mask
                         # caller-driven shutdowns and leak the upstream socket.
+                        # The finally block also attempts a final flush as a
+                        # safety net; both checks gate on `_dirty` so we won't
+                        # double-write.
                         client_gone = True
                         if is_sse and aggregator and aggregator._dirty:
-                            aggregator.maybe_snapshot(kind="final")
+                            await aggregator.maybe_snapshot(kind="final")
                         raise
                     if is_sse:
                         try:
@@ -313,11 +337,12 @@ async def handle(
                         for name, data in events:
                             aggregator.feed_event(name, data)
                             if name == "message_stop":
-                                aggregator.maybe_snapshot(kind="final")
-                        aggregator.maybe_snapshot(kind="snapshot")
+                                await aggregator.maybe_snapshot(kind="final")
+                        await aggregator.maybe_snapshot(kind="snapshot")
 
-                if is_sse and aggregator and aggregator._dirty:
-                    aggregator.maybe_snapshot(kind="final")
+                # Normal-exit final flush is delegated to the `finally` block
+                # below — that path also covers ClientError mid-stream where
+                # we'd otherwise lose the trailing blocks.
 
                 if not client_gone:
                     try:
@@ -356,6 +381,20 @@ async def handle(
         log.warning("upstream error url=%s session=%s: %s", url, session_id or "-", exc)
         return web.Response(status=502, text=f"proxy upstream error: {exc}")
     finally:
+        # Safety-net final flush. Reaches here on:
+        #   (a) normal exit — if the stream ended without message_stop (e.g.
+        #       upstream truncated), the trailing blocks would otherwise sit
+        #       in memory and never hit disk.
+        #   (b) ClientError mid-stream — the inline final flush after the
+        #       loop never runs because we jumped out via the except branch.
+        # Idempotent: maybe_snapshot(kind="final") writes only if `_dirty`,
+        # so a successful message_stop flush above suppresses this one.
+        if aggregator is not None and aggregator._dirty:
+            try:
+                await aggregator.maybe_snapshot(kind="final")
+            except Exception as exc:
+                log.warning("final snapshot flush failed session=%s: %s",
+                            session_id or "-", exc)
         if client_gone:
             _STATS["client_disconnects_total"] += 1
         dur_ms = int((time.monotonic() - t0) * 1000)
@@ -378,7 +417,11 @@ def make_app(upstream_proxy: str | None) -> web.Application:
     # session to api.anthropic.com instead of doing a fresh handshake per call.
     # Created/closed via aiohttp app lifecycle hooks so it's torn down cleanly.
     async def _on_startup(app_: web.Application) -> None:
-        app_["shared_connector"] = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+        # limit=100: defensive ceiling on concurrent upstream sockets. Far
+        # above any real Claude CLI fan-out (single user, few in-flight
+        # turns), but stops a runaway loop from exhausting fds before
+        # Anthropic's rate limiter catches up.
+        app_["shared_connector"] = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
 
     async def _on_cleanup(app_: web.Application) -> None:
         conn = app_.get("shared_connector")
@@ -433,7 +476,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.upstream_proxy:
         try:
             up = urlparse(args.upstream_proxy)
-            up_host, up_port = up.hostname, up.port
+            up_host = up.hostname
+            # urlparse returns None for the port component when the URL omits
+            # one (e.g. http://localhost). Expand to the scheme default so the
+            # comparison below catches "http://localhost" --port 80 — without
+            # this the guard was a no-op for any URL missing :PORT.
+            up_port = up.port
+            if up_port is None:
+                up_port = {"http": 80, "https": 443}.get((up.scheme or "").lower())
         except Exception:
             up_host, up_port = None, None
         loopback_hosts = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
