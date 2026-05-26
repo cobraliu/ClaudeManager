@@ -1673,8 +1673,22 @@ export function EditorWithLineNumbers({
 }
 
 // ── Main modal ───────────────────────────────────────────────────────────────
+const SHOW_HIDDEN_KEY = (sid: string) => `fileEditor.showHidden.${sid}`;
+
 export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
-  const [showHidden, setShowHidden] = useState(false);
+  // Per-session preference: dot-prefixed files are hidden by default; the
+  // toolbar toggle persists in localStorage so each session remembers it.
+  const [showHidden, setShowHiddenState] = useState<boolean>(() => {
+    try { return localStorage.getItem(SHOW_HIDDEN_KEY(sessionId)) === "1"; }
+    catch { return false; }
+  });
+  const setShowHidden = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
+    setShowHiddenState((prev) => {
+      const next = typeof v === "function" ? (v as (prev: boolean) => boolean)(prev) : v;
+      try { localStorage.setItem(SHOW_HIDDEN_KEY(sessionId), next ? "1" : "0"); } catch {}
+      return next;
+    });
+  }, [sessionId]);
   const [tree, setTree] = useState<Record<string, NodeState>>({
     "": { entries: [], expanded: true, loaded: false, loading: false },
   });
@@ -2238,16 +2252,6 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
         {/* Header */}
         <div style={headerStyle}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1 }}>
-            {/* Hidden files toggle */}
-            <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", fontSize: 11, color: "var(--text-muted)", userSelect: "none", flexShrink: 0 }}>
-              <input
-                type="checkbox"
-                checked={showHidden}
-                onChange={() => setShowHidden((v) => !v)}
-                style={{ cursor: "pointer" }}
-              />
-              hidden
-            </label>
             <FileIcon isDir size={13} />
             <span style={{ fontSize: 12, color: "var(--text-secondary)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {sessionCwd}
@@ -2462,6 +2466,11 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
                       title="View git history for any file path (including deleted files)"
                       style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 10, padding: "3px 6px", flexShrink: 0, display: "flex", alignItems: "center" }}
                     ><img src={gitIcon} style={{ width: 12, height: 12, filter: "invert(0.6)" }} /></button>
+                    <button
+                      onClick={() => setShowHidden((v) => !v)}
+                      title={showHidden ? "Hide dot-prefixed files" : "Show dot-prefixed files"}
+                      style={{ background: showHidden ? "var(--accent-blue)" : "var(--bg-hover)", color: showHidden ? "#fff" : "var(--text-body)", fontSize: 10, padding: "3px 6px", flexShrink: 0 }}
+                    >.*</button>
                   </div>
                 )}
               </div>

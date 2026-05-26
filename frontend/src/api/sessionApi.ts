@@ -1650,3 +1650,23 @@ export function readClaudePlan(path: string): Promise<{ path: string; content: s
   return request<{ path: string; content: string }>(`/api/claude-caps/plan?${params}`);
 }
 
+export interface MemoryFile {
+  name: string;
+  size: number;
+  mtime: number;
+}
+
+export interface MemoryListResp {
+  dir: string | null;
+  files: MemoryFile[];
+}
+
+export function listMemory(sessionId: string): Promise<MemoryListResp> {
+  return request<MemoryListResp>(`/api/sessions/${sessionId}/memory/list`);
+}
+
+export function readMemory(sessionId: string, name: string): Promise<{ name: string; content: string; size: number; mtime: number }> {
+  const params = new URLSearchParams({ name });
+  return request(`/api/sessions/${sessionId}/memory/read?${params.toString()}`);
+}
+
