@@ -20,10 +20,15 @@ const STATUS_COLORS: Record<string, string> = {
   terminated: "#d9534f",
 };
 
+type AttentionKind = "plan" | "auq" | "approve";
+
 interface Props {
   session: SessionMeta;
   isActive?: boolean;
   showOwner?: boolean;
+  // When set, the card shows a prominent attention badge. Provided by the
+  // SessionsPage poll loop from the per-session tui_* status fields.
+  attentionKind?: AttentionKind | null;
   onAttach?: () => void;
   onViewChat?: () => void;
   onTerminate?: () => void;
@@ -33,6 +38,12 @@ interface Props {
   onRename?: () => void;
   loading?: boolean;
 }
+
+const ATTENTION_LABEL: Record<AttentionKind, string> = {
+  plan: "APPROVE PLAN",
+  auq: "ANSWER QUESTION",
+  approve: "APPROVE TOOL",
+};
 
 function formatRemaining(runAt: string): string {
   const ms = new Date(runAt).getTime() - Date.now();
@@ -298,6 +309,7 @@ export function SessionCard({
   session: s,
   isActive,
   showOwner,
+  attentionKind,
   onAttach,
   onViewChat,
   onTerminate,
@@ -341,10 +353,25 @@ export function SessionCard({
     <div
       style={{
         padding: "10px 12px",
-        background: isActive ? "rgba(88,166,255,0.12)" : "var(--bg-modal)",
+        // Attention overrides background tint with a dim red so the card is
+        // visibly different from the rest of the list even without the badge.
+        background: attentionKind
+          ? "rgba(220,38,38,0.10)"
+          : isActive
+          ? "rgba(88,166,255,0.12)"
+          : "var(--bg-modal)",
         borderRadius: 8,
-        border: isActive ? "1px solid var(--accent-blue)" : "1px solid var(--bg-hover)",
-        borderLeft: isActive
+        // Attention also overrides the outer border so it remains conspicuous
+        // when the session also happens to be the active one.
+        border: attentionKind
+          ? "1px solid #dc2626"
+          : isActive ? "1px solid var(--accent-blue)" : "1px solid var(--bg-hover)",
+        // Attention beats every other left-rail signal — it's the most user-
+        // blocking state we can convey, and a thick red rail makes scanning
+        // the list trivial.
+        borderLeft: attentionKind
+          ? "4px solid #dc2626"
+          : isActive
           ? "3px solid var(--accent-blue)"
           : s.is_streaming
           ? "3px solid #22c55e"
@@ -368,6 +395,29 @@ export function SessionCard({
         else if (canResume && onViewChat) { onViewChat(); }
       }}
     >
+      {/* attention banner: only when the session has work awaiting user input.
+          Placed above row 1 so it reads as the first thing in the card and
+          never gets pushed below the fold by long project names or prompts. */}
+      {attentionKind && (
+        <div
+          className="attention-banner"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "4px 8px",
+            margin: "-4px -6px 8px",
+            borderRadius: 5,
+            color: "#fff",
+            fontSize: 11,
+            fontWeight: 700,
+            letterSpacing: 0.4,
+          }}
+        >
+          <span style={{ fontSize: 13 }}>⚠</span>
+          <span>NEEDS ATTENTION · {ATTENTION_LABEL[attentionKind]}</span>
+        </div>
+      )}
       {/* row 1: owner? + project + status */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, minWidth: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, flex: "1 1 auto" }}>

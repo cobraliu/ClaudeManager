@@ -1443,6 +1443,11 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   // render time so a remounting ConversationPane never observes data fetched
   // for a different session (the poll effect can only clear *after* commit).
   const [tuiOwnerSessionId, setTuiOwnerSessionId] = useState<string | null>(null);
+  // Per-session attention markers for the session list. Populated by the same
+  // /api/sessions/status poll that drives the active session's tui_*. Keyed by
+  // session.id → highest-priority pending kind. Plan > AUQ > approve.
+  type AttentionKind = "plan" | "auq" | "approve";
+  const [attentionMap, setAttentionMap] = useState<Map<string, AttentionKind>>(() => new Map());
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [modelList, setModelList] = useState<ModelInfo[]>([]);
   const [settingModel, setSettingModel] = useState(false);
@@ -1663,12 +1668,36 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     setIsCompacting(false);
     setCompactingProgress(null);
 
-    if (!activeSessionId) return;
     let cancelled = false;
     const poll = async () => {
       try {
         const res = await listSessionsStatus();
         if (cancelled) return;
+        // Build attention map across ALL sessions (not just active) so the
+        // session list can flag pending work even when nothing is attached.
+        // Priority: plan > auq > approve (most user-blocking wins). Only
+        // remembers ids with something pending — entries drop when cleared
+        // upstream, so stale markers can't accumulate.
+        const nextAttention = new Map<string, AttentionKind>();
+        for (const item of res.items) {
+          let kind: AttentionKind | null = null;
+          if (item.tui_plan_pending) kind = "plan";
+          else if (item.tui_auq_data) kind = "auq";
+          else if (item.tui_approve_data) kind = "approve";
+          if (kind) nextAttention.set(item.id, kind);
+        }
+        setAttentionMap((prev) => {
+          if (prev.size === nextAttention.size) {
+            let same = true;
+            for (const [k, v] of nextAttention) {
+              if (prev.get(k) !== v) { same = false; break; }
+            }
+            if (same) return prev;
+          }
+          return nextAttention;
+        });
+
+        if (!activeSessionId) return;
         const st = res.items.find((s) => s.id === activeSessionId);
         if (st) {
           setTuiHint((prev) => {
@@ -2197,6 +2226,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               key={s.id}
               session={s}
               isActive={activeSessionId === s.id}
+              attentionKind={attentionMap.get(s.id) ?? null}
               onAttach={() => handleAttach(s.id)}
               onViewChat={() => handleViewChat(s.id)}
               onTerminate={() => handleTerminate(s.id)}

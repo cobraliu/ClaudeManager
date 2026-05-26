@@ -363,6 +363,7 @@ export interface SessionStatusItem {
   tui_hint?: string | null;
   tui_auq_data?: TuiAuqData | null;
   tui_approve_data?: TuiApproveData | null;
+  tui_plan_pending?: boolean;
 }
 
 export function approveToolRequest(sessionId: string, decision: "allow" | "deny"): Promise<{ ok: boolean }> {

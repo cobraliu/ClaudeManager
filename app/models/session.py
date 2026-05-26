@@ -121,6 +121,10 @@ class SessionStatusView(BaseModel):
     tui_hint: str | None = None
     tui_auq_data: dict | None = None
     tui_approve_data: dict | None = None
+    # True iff the session's JSONL has an unresolved ExitPlanMode tool_use
+    # (a plan_use without a matching tool_result). Surfaces plan-approval
+    # attention in the session list without requiring an attached client.
+    tui_plan_pending: bool = False
 
 
 class SessionStatusListResponse(BaseModel):
