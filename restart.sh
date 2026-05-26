@@ -10,6 +10,15 @@
 #                                    #   frontend rebuild loops.
 #   bash restart.sh 8080             # explicit backend port (still both)
 #
+# Sub-path deployment (reverse-proxy under e.g. https://host/rosaccm/):
+#   1. Rebuild frontend with matching base:
+#        cd frontend && VITE_BASE=/rosaccm/ npm run build
+#   2. Start backend with ROOT_PATH set (env inherits into uvicorn):
+#        ROOT_PATH=/rosaccm bash restart.sh
+#   3. nginx: `location /rosaccm/ { proxy_pass http://127.0.0.1:19099/; ...}`
+#      (trailing slash on proxy_pass strips the prefix before forwarding).
+#   Leave both unset for default root-mount / subdomain deployments.
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"

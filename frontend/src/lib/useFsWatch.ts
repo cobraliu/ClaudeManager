@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { apiPath } from "./baseUrl";
 
 export interface FsChange {
   type: "add" | "modify" | "delete";
@@ -26,7 +27,7 @@ export function useFsWatch(
     const token = localStorage.getItem("token");
     if (!token) return;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${window.location.host}/api/sessions/${sessionId}/fs/watch?token=${encodeURIComponent(token)}`;
+    const url = `${proto}://${window.location.host}${apiPath(`/api/sessions/${sessionId}/fs/watch?token=${encodeURIComponent(token)}`)}`;
     let ws: WebSocket | null = null;
     let stopped = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;

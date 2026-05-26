@@ -20,6 +20,7 @@ import {
 } from "../api/sessionApi";
 import { SessionCard } from "../components/SessionCard";
 import { EmbeddedTerminalPanel, useAdminTerminalApi } from "../components/EmbeddedTerminalPanel";
+import { apiPath } from "../lib/baseUrl";
 
 const PAGE_SIZE = 30;
 
@@ -66,7 +67,7 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
     setRestarting(true);
     try { await restartServer(); } catch { /* server may disconnect before responding */ }
     const poll = setInterval(async () => {
-      try { const r = await fetch("/health"); if (r.ok) { clearInterval(poll); setRestarting(false); } } catch {}
+      try { const r = await fetch(apiPath("/health")); if (r.ok) { clearInterval(poll); setRestarting(false); } } catch {}
     }, 1500);
     setTimeout(() => { clearInterval(poll); setRestarting(false); }, 30000);
   };

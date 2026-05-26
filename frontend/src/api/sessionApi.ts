@@ -1,3 +1,5 @@
+import { apiPath } from "../lib/baseUrl";
+
 export interface ScheduledTask {
   id: string;
   command: string;
@@ -76,7 +78,7 @@ async function request<T>(
     }
     headers["Authorization"] = `Bearer ${token}`;
   }
-  const resp = await fetch(path, { ...init, headers });
+  const resp = await fetch(apiPath(path), { ...init, headers });
   if (resp.status === 401 && !skipAuth) {
     localStorage.removeItem("token");
     localStorage.removeItem("username");
@@ -575,7 +577,7 @@ export async function fetchRawFileBlob(
 ): Promise<string> {
   const token = localStorage.getItem("token") || "";
   const resp = await fetch(
-    `/api/sessions/${sessionId}/fs/raw?path=${encodeURIComponent(path)}`,
+    apiPath(`/api/sessions/${sessionId}/fs/raw?path=${encodeURIComponent(path)}`),
     { headers: { Authorization: `Bearer ${token}` } }
   );
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -586,7 +588,7 @@ export async function fetchRawFileBlob(
 export async function downloadFile(sessionId: string, path: string): Promise<void> {
   const token = localStorage.getItem("token") || "";
   const resp = await fetch(
-    `/api/sessions/${sessionId}/fs/raw?path=${encodeURIComponent(path)}&download=true`,
+    apiPath(`/api/sessions/${sessionId}/fs/raw?path=${encodeURIComponent(path)}&download=true`),
     { headers: { Authorization: `Bearer ${token}` } }
   );
   if (resp.status === 401) { localStorage.removeItem("token"); window.location.reload(); throw new Error("unauthorized"); }
@@ -614,7 +616,7 @@ export async function uploadFile(
   const form = new FormData();
   form.append("path", dirPath);
   form.append("file", file);
-  const resp = await fetch(`/api/sessions/${sessionId}/fs/upload`, {
+  const resp = await fetch(apiPath(`/api/sessions/${sessionId}/fs/upload`), {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: form,
@@ -661,7 +663,7 @@ async function _triggerZipDownload(resp: Response, fallbackName: string): Promis
 
 export async function downloadDirZip(sessionId: string, path: string, exclude: string[] = [], compress = true): Promise<void> {
   const token = localStorage.getItem("token") || "";
-  const resp = await fetch(`/api/sessions/${sessionId}/fs/download-zip`, {
+  const resp = await fetch(apiPath(`/api/sessions/${sessionId}/fs/download-zip`), {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ path, exclude, compress }),
@@ -746,7 +748,7 @@ export async function extractToDir(targetDir: string, file: File): Promise<{ pat
   const form = new FormData();
   form.append("target_dir", targetDir);
   form.append("file", file);
-  const resp = await fetch("/api/fs/extract-to", {
+  const resp = await fetch(apiPath("/api/fs/extract-to"), {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: form,
@@ -776,7 +778,7 @@ export async function writeFile(
   opts?: { expectedMtime?: number | null; force?: boolean },
 ): Promise<{ mtime: number | null }> {
   const token = getToken();
-  const resp = await fetch(`/api/sessions/${sessionId}/fs/write`, {
+  const resp = await fetch(apiPath(`/api/sessions/${sessionId}/fs/write`), {
     method: "PUT",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({
@@ -1259,7 +1261,7 @@ export async function gitCheckoutBranch(
   opts: { stash?: boolean; remote?: boolean } = {},
 ): Promise<{ ok: boolean; branch: string; output: string; stashed?: boolean }> {
   const token = getToken();
-  const resp = await fetch(`/api/sessions/${sessionId}/git/checkout`, {
+  const resp = await fetch(apiPath(`/api/sessions/${sessionId}/git/checkout`), {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ branch, stash: opts.stash ?? false, remote: opts.remote ?? false }),
@@ -1311,7 +1313,7 @@ export async function getConversationJsonl(
 ): Promise<JsonlPageResponse> {
   const token = localStorage.getItem("token") || "";
   const params = new URLSearchParams({ page: String(page), page_size: String(page_size) });
-  const resp = await fetch(`/api/sessions/${sessionId}/conversation/jsonl?${params}`, {
+  const resp = await fetch(apiPath(`/api/sessions/${sessionId}/conversation/jsonl?${params}`), {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (resp.status === 401) { localStorage.removeItem("token"); window.location.reload(); throw new Error("unauthorized"); }
