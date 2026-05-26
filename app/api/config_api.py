@@ -16,6 +16,7 @@ from app.config import (
     get_claude_bin,
     get_cursor_bin,
     get_default_workspace,
+    get_enabled_tools,
     get_file_viewer_max_bytes,
     get_file_viewer_max_lines,
     get_file_viewer_mode,
@@ -27,6 +28,7 @@ from app.config import (
     set_claude_bin,
     set_cursor_bin,
     set_default_workspace,
+    set_enabled_tools,
     set_file_viewer_max_bytes,
     set_file_viewer_max_lines,
     set_file_viewer_mode,
@@ -56,6 +58,7 @@ class ConfigView(BaseModel):
     file_viewer_mode: str = FILE_VIEWER_MODE_LINES  # "unlimited" | "lines" | "bytes"
     file_viewer_max_lines: int = 3000
     file_viewer_max_bytes: int = 1024 * 1024
+    enabled_tools: list[str] = Field(default_factory=lambda: ["claude"])
 
 
 class FileViewerRequest(BaseModel):
@@ -85,6 +88,10 @@ class TerminalFontRequest(BaseModel):
     font: str
 
 
+class EnabledToolsRequest(BaseModel):
+    tools: list[str] = Field(..., description="Subset of [claude, codex, cursor]")
+
+
 class TermLifecycleRequest(BaseModel):
     """Idle = how long an ephemeral tmux terminal sits with no holder before
     standby; standby = grace period after standby starts before tmux kill."""
@@ -105,6 +112,7 @@ def _full_config() -> ConfigView:
         file_viewer_mode=get_file_viewer_mode(),
         file_viewer_max_lines=get_file_viewer_max_lines(),
         file_viewer_max_bytes=get_file_viewer_max_bytes(),
+        enabled_tools=get_enabled_tools(),
     )
 
 
@@ -208,6 +216,17 @@ def update_file_viewer(body: FileViewerRequest, _admin: AdminUser) -> ConfigView
     set_file_viewer_mode(mode)
     set_file_viewer_max_lines(body.max_lines)
     set_file_viewer_max_bytes(body.max_bytes)
+    return _full_config()
+
+
+@router.put("/enabled-tools")
+def update_enabled_tools(body: EnabledToolsRequest, _admin: AdminUser) -> ConfigView:
+    valid = {"claude", "codex", "cursor"}
+    bad = [t for t in body.tools if t not in valid]
+    if bad:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"invalid tools: {bad}")
+    set_enabled_tools(list(body.tools))
     return _full_config()
 
 

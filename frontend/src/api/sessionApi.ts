@@ -220,6 +220,7 @@ export interface ConfigView {
   file_viewer_mode: FileViewerMode;
   file_viewer_max_lines: number;
   file_viewer_max_bytes: number;
+  enabled_tools: string[];
 }
 
 export interface FontInfo {
@@ -296,6 +297,13 @@ export function setFileViewer(
 
 export function restartServer(): Promise<void> {
   return request("/api/config/restart", { method: "POST" });
+}
+
+export function setEnabledTools(tools: string[]): Promise<ConfigView> {
+  return request("/api/config/enabled-tools", {
+    method: "PUT",
+    body: JSON.stringify({ tools }),
+  });
 }
 
 export function getAvailableTools(): Promise<{ claude: boolean; cursor: boolean }> {

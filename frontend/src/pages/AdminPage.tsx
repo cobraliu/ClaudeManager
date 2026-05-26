@@ -11,6 +11,7 @@ import {
   setClaudeBin,
   setProxy,
   setFileViewer,
+  setEnabledTools,
   restartServer,
   type UserInfo,
   type SessionMeta,
@@ -52,6 +53,8 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
   const [fvModeSaved, setFvModeSaved] = useState<FileViewerMode>("lines");
   const [fvMaxLinesSaved, setFvMaxLinesSaved] = useState<number>(3000);
   const [fvMaxBytesMbSaved, setFvMaxBytesMbSaved] = useState<number>(1);
+  const [enabledTools, setEnabledToolsState] = useState<string[]>(["claude"]);
+  const [enabledToolsSaved, setEnabledToolsSaved] = useState<string[]>(["claude"]);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
   const [restarting, setRestarting] = useState(false);
@@ -90,6 +93,8 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
       const mb = Math.max(0.1, Math.round((c.file_viewer_max_bytes / (1024 * 1024)) * 100) / 100);
       setFvMaxBytesMb(mb);
       setFvMaxBytesMbSaved(mb);
+      setEnabledToolsState(c.enabled_tools);
+      setEnabledToolsSaved(c.enabled_tools);
     } catch {}
   }, []);
 
@@ -474,6 +479,60 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
                 Lines mode minimum: 100. Size mode minimum: 4 KB. Unlimited returns the entire file
                 — beware of OOM on multi-GB files.
               </p>
+            </div>
+
+            {/* Enabled coding tools */}
+            <div style={cardStyle}>
+              <h3 style={{ marginBottom: 12, fontSize: 15 }}>Enabled Coding Tools</h3>
+              <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
+                Which coding agents are available to users. Sessions whose tool is disabled are
+                hidden from the session list and from new-session / load-session pickers.
+                <code style={{ color: "var(--text-secondary)" }}> claude</code> is the default.
+              </p>
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 8 }}>
+                {(["claude", "codex", "cursor"] as const).map((t) => {
+                  const checked = enabledTools.includes(t);
+                  return (
+                    <label key={t} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "var(--text-body)", cursor: "pointer", userSelect: "none" }}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => {
+                          setEnabledToolsState((prev) => {
+                            const set = new Set(prev);
+                            if (set.has(t)) set.delete(t); else set.add(t);
+                            return ["claude", "codex", "cursor"].filter((x) => set.has(x));
+                          });
+                        }}
+                      />
+                      <span style={{ textTransform: "capitalize" }}>{t}</span>
+                    </label>
+                  );
+                })}
+                <button
+                  disabled={
+                    enabledTools.length === 0 ||
+                    (enabledTools.length === enabledToolsSaved.length &&
+                      enabledTools.every((t, i) => t === enabledToolsSaved[i]))
+                  }
+                  onClick={async () => {
+                    try {
+                      const c = await setEnabledTools(enabledTools);
+                      setEnabledToolsSaved(c.enabled_tools);
+                      setEnabledToolsState(c.enabled_tools);
+                      setMsg("Enabled tools updated.");
+                    } catch (e) { setMsg(String(e)); }
+                  }}
+                  style={{ background: "#58a6ff", color: "#fff", marginLeft: "auto" }}
+                >
+                  Save
+                </button>
+              </div>
+              {enabledTools.length === 0 && (
+                <p style={{ fontSize: 11, color: "var(--accent-red)", margin: 0 }}>
+                  At least one tool must remain enabled.
+                </p>
+              )}
             </div>
 
           </div>

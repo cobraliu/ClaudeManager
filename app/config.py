@@ -168,6 +168,36 @@ def set_cursor_bin(path: str) -> None:
     _set("cursor_bin", path)
 
 
+# ── Enabled coding tools ─────────────────────────────────────────────────────
+# Admin-controlled allow-list. Sessions whose tool is not in this set are hidden
+# from session pickers and the listing UI; "claude" is always in the default so
+# the system stays usable on a fresh install.
+_VALID_TOOLS = ("claude", "codex", "cursor")
+_DEFAULT_ENABLED_TOOLS = ["claude"]
+
+
+def get_enabled_tools() -> list[str]:
+    raw = _get("enabled_tools")
+    if not raw:
+        return list(_DEFAULT_ENABLED_TOOLS)
+    try:
+        vals = json.loads(raw)
+    except Exception:
+        return list(_DEFAULT_ENABLED_TOOLS)
+    if not isinstance(vals, list):
+        return list(_DEFAULT_ENABLED_TOOLS)
+    out = [v for v in vals if v in _VALID_TOOLS]
+    return out or list(_DEFAULT_ENABLED_TOOLS)
+
+
+def set_enabled_tools(tools: list[str]) -> None:
+    cleaned = [t for t in tools if t in _VALID_TOOLS]
+    # Disallow an empty list — UI would have no usable tool.
+    if not cleaned:
+        cleaned = list(_DEFAULT_ENABLED_TOOLS)
+    _set("enabled_tools", json.dumps(cleaned))
+
+
 _DEFAULT_TERMINAL_FONT = '"Ubuntu Sans Mono", "WenQuanYi Micro Hei Mono", "WenQuanYi Zen Hei Mono", monospace'
 
 

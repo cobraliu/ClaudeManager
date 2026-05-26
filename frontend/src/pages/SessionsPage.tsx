@@ -701,11 +701,13 @@ function getJwtUsername(): string {
 function NewSessionModal({
   workspaceBase,
   loading,
+  enabledTools,
   onSubmit,
   onClose,
 }: {
   workspaceBase: string;
   loading: boolean;
+  enabledTools: string[];
   onSubmit: (p: { project: string; cwd?: string; git_repo_url?: string; tool: "claude" | "cursor" | "codex"; codex_transport?: "tui" | "app_server" }) => void;
   onClose: () => void;
 }) {
@@ -714,7 +716,11 @@ function NewSessionModal({
   const prefix = `${workspaceBase}/${username}/`;
 
   const [project, setProject] = useState("");
-  const [tool, setTool] = useState<"claude" | "cursor" | "codex">("claude");
+  // Tool defaults to the first enabled one (fall back to claude if list is empty,
+  // which shouldn't happen — backend rejects an empty enabled_tools list).
+  const allTools = (["claude", "codex", "cursor"] as const).filter((t) => enabledTools.includes(t));
+  const initialTool: "claude" | "cursor" | "codex" = (allTools[0] as "claude" | "cursor" | "codex" | undefined) ?? "claude";
+  const [tool, setTool] = useState<"claude" | "cursor" | "codex">(initialTool);
   const [codexTransport, setCodexTransport] = useState<"tui" | "app_server">("tui");
 
   // suffix is the editable part after the fixed prefix
@@ -799,7 +805,7 @@ function NewSessionModal({
             Agent
           </label>
           <div style={{ display: "flex", gap: 6 }}>
-            {(["claude", "codex"] as const).map((k) => (
+            {allTools.map((k) => (
               <button
                 key={k}
                 onClick={() => setTool(k)}
@@ -1118,11 +1124,15 @@ function TurnBubble({ turn }: { turn: { role: string; text: string; ts: number }
 function BrowseExternalPanel({
   onLoad,
   onClose,
+  enabledTools,
 }: {
   onLoad: (tool: "claude" | "cursor" | "codex", session: ExternalSession) => void;
   onClose: () => void;
+  enabledTools: string[];
 }) {
-  const [tool, setTool] = useState<"claude" | "cursor" | "codex">("claude");
+  const allTabs = (["claude", "codex", "cursor"] as const).filter((t) => enabledTools.includes(t));
+  const initialTab: "claude" | "cursor" | "codex" = (allTabs[0] as "claude" | "cursor" | "codex" | undefined) ?? "claude";
+  const [tool, setTool] = useState<"claude" | "cursor" | "codex">(initialTab);
   const [groups, setGroups] = useState<ExternalSessionGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -1197,7 +1207,7 @@ function BrowseExternalPanel({
         <div style={{ padding: "11px 16px 10px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
           <span style={{ fontSize: 14, fontWeight: 600, marginRight: 4 }}>Browse External Sessions</span>
           <div style={{ display: "flex", gap: 4 }}>
-            {(["claude", "codex"] as const).map((k) => (
+            {allTabs.map((k) => (
               <button
                 key={k}
                 onClick={() => setTool(k)}
@@ -1395,6 +1405,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [showModal, setShowModal] = useState(false);
   const [workspaceBase, setWorkspaceBase] = useState("");
   const [terminalFont, setTerminalFont] = useState<string | undefined>(undefined);
+  const [enabledTools, setEnabledTools] = useState<string[]>(["claude", "codex", "cursor"]);
   const [fileEditorSession, setFileEditorSession] = useState<SessionMeta | null>(null);
   // Inline overlay in the conversation column (sits above bottom toolbar, replaces TUI/Chat content)
   const [inlineView, setInlineView] = useState<"git" | "jsonl" | null>(null);
@@ -1579,7 +1590,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
 
   // Fetch workspace config once on mount
   useEffect(() => {
-    getConfig().then((c) => { setWorkspaceBase(c.workspace); setTerminalFont(c.terminal_font || undefined); }).catch(() => {});
+    getConfig().then((c) => { setWorkspaceBase(c.workspace); setTerminalFont(c.terminal_font || undefined); setEnabledTools(c.enabled_tools); }).catch(() => {});
   }, []);
 
   // ── Hash-based session routing ──────────────────────────────────────────────
@@ -1693,7 +1704,8 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   }, [search, refresh]);
 
   const isActiveSession = (s: SessionMeta) => s.status === "running" || s.status === "detached";
-  const visibleSessions = showAllSessions ? sessions : sessions.filter(isActiveSession);
+  const toolFilteredSessions = sessions.filter((s) => enabledTools.includes(s.tool));
+  const visibleSessions = showAllSessions ? toolFilteredSessions : toolFilteredSessions.filter(isActiveSession);
   const totalPages = Math.max(1, Math.ceil(visibleSessions.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages - 1);
   const pageItems = visibleSessions.slice(
@@ -2801,6 +2813,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
         <NewSessionModal
           workspaceBase={workspaceBase}
           loading={loading}
+          enabledTools={enabledTools}
           onSubmit={handleCreate}
           onClose={() => setShowModal(false)}
         />
@@ -2818,6 +2831,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       {/* Browse external sessions panel */}
       {showBrowse && (
         <BrowseExternalPanel
+          enabledTools={enabledTools}
           onLoad={(t, s) => {
             if (t === "codex") return handleLoadCodex(s);
             if (t === "cursor") return handleLoadCursor(s);
