@@ -15,8 +15,11 @@ import { renderMarkdown } from "../lib/markdown";
  */
 interface MemoryPanelProps {
   sessionId: string;
-  /** Mobile passes inline=true; both modes use the same render path now. */
+  /** Reserved — currently no special behaviour vs not passing it. */
   inline?: boolean;
+  /** Mobile / narrow-screen layout: stacked, with a dropdown picker
+   *  instead of a sidebar so the markdown body gets the full width. */
+  compact?: boolean;
   onClose?: () => void;
 }
 
@@ -37,7 +40,7 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
-export function MemoryPanel({ sessionId, onClose }: MemoryPanelProps) {
+export function MemoryPanel({ sessionId, compact, onClose }: MemoryPanelProps) {
   const [files, setFiles] = useState<MemoryFile[]>([]);
   const [dirPath, setDirPath] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -170,82 +173,132 @@ export function MemoryPanel({ sessionId, onClose }: MemoryPanelProps) {
         )}
       </div>
 
-      {/* Body: list | splitter | content */}
-      <div style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden" }}>
-        {/* File list */}
-        <div style={{ width: sidebarWidth, flexShrink: 0, display: "flex", flexDirection: "column", borderRight: "1px solid var(--border)", minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
-          {listLoading ? (
-            <div style={{ padding: 10, color: "var(--text-faint)", fontSize: 12 }}>Loading…</div>
-          ) : listError ? (
-            <div style={{ padding: 10, color: "var(--accent-red)", fontSize: 12 }}>{listError}</div>
-          ) : files.length === 0 ? (
-            <div style={{ padding: 10, color: "var(--text-faint)", fontSize: 12 }}>
-              No memory files.
-              <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-muted)" }}>
+      {/* Compact (mobile / narrow): file picker dropdown + full-width body.
+       *  Split (desktop): sidebar list + draggable vertical splitter + body. */}
+      {compact ? (
+        <>
+          {/* File picker row */}
+          <div style={{ padding: "6px 10px", borderBottom: "1px solid var(--border)", background: "var(--bg-surface)", flexShrink: 0, display: "flex", alignItems: "center", gap: 6 }}>
+            {listLoading ? (
+              <span style={{ fontSize: 12, color: "var(--text-faint)" }}>Loading…</span>
+            ) : listError ? (
+              <span style={{ fontSize: 12, color: "var(--accent-red)" }}>{listError}</span>
+            ) : files.length === 0 ? (
+              <span style={{ fontSize: 12, color: "var(--text-faint)" }}>No memory files</span>
+            ) : (
+              <>
+                <select
+                  value={selected ?? ""}
+                  onChange={(e) => setSelected(e.target.value)}
+                  style={{ flex: 1, minWidth: 0, background: "var(--bg-base)", color: "var(--text-body)", border: "1px solid var(--border)", borderRadius: 4, padding: "4px 6px", fontSize: 12 }}
+                >
+                  {files.map((f) => (
+                    <option key={f.name} value={f.name}>
+                      {f.name} ({formatBytes(f.size)})
+                    </option>
+                  ))}
+                </select>
+              </>
+            )}
+          </div>
+          {/* Body — full width */}
+          <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "auto", padding: "12px 14px" }}>
+            {contentLoading ? (
+              <div style={{ color: "var(--text-faint)", fontSize: 12 }}>Loading…</div>
+            ) : contentError ? (
+              <div style={{ color: "var(--accent-red)", fontSize: 12 }}>{contentError}</div>
+            ) : selected ? (
+              <div
+                className="conv-markdown"
+                style={{ fontSize: 13, lineHeight: 1.6, color: "var(--text-body)" }}
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+              />
+            ) : files.length === 0 ? (
+              <div style={{ color: "var(--text-faint)", fontSize: 12 }}>
                 Memory lives at <code style={{ fontFamily: "monospace" }}>~/.claude/projects/&lt;cwd&gt;/memory/</code>.
               </div>
-            </div>
-          ) : (
-            <div style={{ overflow: "auto", flex: 1, minHeight: 0 }}>
-              {files.map((f) => {
-                const isActive = f.name === selected;
-                return (
-                  <button
-                    key={f.name}
-                    onClick={() => setSelected(f.name)}
-                    style={{
-                      width: "100%",
-                      textAlign: "left",
-                      background: isActive ? "var(--bg-hover)" : "transparent",
-                      color: isActive ? "var(--text-body)" : "var(--text-secondary)",
-                      border: "none",
-                      borderLeft: isActive ? "2px solid var(--accent-blue)" : "2px solid transparent",
-                      padding: "5px 10px",
-                      fontSize: 12,
-                      cursor: "pointer",
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                      overflow: "hidden",
-                    }}
-                    onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover-subtle, rgba(255,255,255,0.03))"; }}
-                    onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
-                  >
-                    <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
-                    <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{formatBytes(f.size)}</span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
+            ) : (
+              <div style={{ color: "var(--text-faint)", fontSize: 12 }}>Select a file above.</div>
+            )}
+          </div>
+        </>
+      ) : (
+        <div style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden" }}>
+          {/* File list */}
+          <div style={{ width: sidebarWidth, flexShrink: 0, display: "flex", flexDirection: "column", borderRight: "1px solid var(--border)", minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
+            {listLoading ? (
+              <div style={{ padding: 10, color: "var(--text-faint)", fontSize: 12 }}>Loading…</div>
+            ) : listError ? (
+              <div style={{ padding: 10, color: "var(--accent-red)", fontSize: 12 }}>{listError}</div>
+            ) : files.length === 0 ? (
+              <div style={{ padding: 10, color: "var(--text-faint)", fontSize: 12 }}>
+                No memory files.
+                <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-muted)" }}>
+                  Memory lives at <code style={{ fontFamily: "monospace" }}>~/.claude/projects/&lt;cwd&gt;/memory/</code>.
+                </div>
+              </div>
+            ) : (
+              <div style={{ overflow: "auto", flex: 1, minHeight: 0 }}>
+                {files.map((f) => {
+                  const isActive = f.name === selected;
+                  return (
+                    <button
+                      key={f.name}
+                      onClick={() => setSelected(f.name)}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        background: isActive ? "var(--bg-hover)" : "transparent",
+                        color: isActive ? "var(--text-body)" : "var(--text-secondary)",
+                        border: "none",
+                        borderLeft: isActive ? "2px solid var(--accent-blue)" : "2px solid transparent",
+                        padding: "5px 10px",
+                        fontSize: 12,
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        overflow: "hidden",
+                      }}
+                      onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = "var(--bg-hover-subtle, rgba(255,255,255,0.03))"; }}
+                      onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
+                    >
+                      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
+                      <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{formatBytes(f.size)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
-        {/* Vertical splitter — 4px hit area with a 1px visual line */}
-        <div
-          onMouseDown={startDrag}
-          title="Drag to resize"
-          style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
-          onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
-          onMouseLeave={(e) => { if (!dragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
-        />
+          {/* Vertical splitter — 5px hit area */}
+          <div
+            onMouseDown={startDrag}
+            title="Drag to resize"
+            style={{ width: 5, cursor: "col-resize", background: "var(--bg-hover)", flexShrink: 0 }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = "var(--border-strong)"; }}
+            onMouseLeave={(e) => { if (!dragging.current) e.currentTarget.style.background = "var(--bg-hover)"; }}
+          />
 
-        {/* Markdown content */}
-        <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "auto", padding: "12px 16px" }}>
-          {contentLoading ? (
-            <div style={{ color: "var(--text-faint)", fontSize: 12 }}>Loading…</div>
-          ) : contentError ? (
-            <div style={{ color: "var(--accent-red)", fontSize: 12 }}>{contentError}</div>
-          ) : selected ? (
-            <div
-              className="conv-markdown"
-              style={{ fontSize: 13, lineHeight: 1.6, color: "var(--text-body)" }}
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
-            />
-          ) : (
-            <div style={{ color: "var(--text-faint)", fontSize: 12 }}>Select a file to preview.</div>
-          )}
+          {/* Markdown content */}
+          <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "auto", padding: "12px 16px" }}>
+            {contentLoading ? (
+              <div style={{ color: "var(--text-faint)", fontSize: 12 }}>Loading…</div>
+            ) : contentError ? (
+              <div style={{ color: "var(--accent-red)", fontSize: 12 }}>{contentError}</div>
+            ) : selected ? (
+              <div
+                className="conv-markdown"
+                style={{ fontSize: 13, lineHeight: 1.6, color: "var(--text-body)" }}
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+              />
+            ) : (
+              <div style={{ color: "var(--text-faint)", fontSize: 12 }}>Select a file to preview.</div>
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
