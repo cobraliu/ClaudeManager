@@ -123,6 +123,7 @@ import { FileIcon, NewFolderIcon } from "../components/FileIcon";
 import { HtmlViewer } from "../components/HtmlViewer";
 import CodexChatInput from "../components/CodexChatInput";
 import { useFsWatch } from "../lib/useFsWatch";
+import { apiPath } from "../lib/baseUrl";
 import type { DirInfoResponse } from "../api/sessionApi";
 
 const MOBILE_PAGE_SIZE = 10;
@@ -716,7 +717,7 @@ function ListView({ username, onLogout, onOpen, onSwitchToAdmin, theme, onToggle
     }
     const poll = setInterval(async () => {
       try {
-        const r = await fetch("/health");
+        const r = await fetch(apiPath("/health"));
         if (r.ok) { clearInterval(poll); setRestarting(false); }
       } catch {}
     }, 1500);

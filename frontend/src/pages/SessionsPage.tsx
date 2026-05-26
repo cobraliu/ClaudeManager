@@ -48,6 +48,7 @@ import { FileEditorModal } from "../components/FileEditorModal";
 import { GitPanel } from "../components/GitPanel";
 import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
 import { downloadConversationHtml } from "../lib/exportChat";
+import { apiPath } from "../lib/baseUrl";
 import { SessionSideDock } from "../components/SessionSideDock";
 import { UserConfigModal } from "../components/UserConfigModal";
 import { EmbeddedTerminalPanel, useSessionTerminalApi } from "../components/EmbeddedTerminalPanel";
@@ -2087,7 +2088,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     // Poll until the server comes back
     const poll = setInterval(async () => {
       try {
-        const r = await fetch("/health");
+        const r = await fetch(apiPath("/health"));
         if (r.ok) { clearInterval(poll); setRestarting(false); }
       } catch {}
     }, 1500);

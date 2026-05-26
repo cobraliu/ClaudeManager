@@ -1,7 +1,14 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+// Public base path. Defaults to "/" (root mount: subdomain or direct port).
+// Set VITE_BASE=/rosaccm/ at build time when deploying behind a sub-path
+// reverse proxy. Must match the backend's ROOT_PATH env var and the nginx
+// `location /rosaccm/` prefix. Trailing slash required for Vite.
+const BASE = process.env.VITE_BASE || "/";
+
 export default defineConfig({
+  base: BASE,
   plugins: [react()],
   build: {
     // Split heavy vendor libs into separate chunks so they can be cached
@@ -22,11 +29,22 @@ export default defineConfig({
     },
   },
   server: {
+    // Proxy entries are matched on the URL the browser actually sends. With
+    // BASE="/rosaccm/", `apiPath("/api/foo")` emits `/rosaccm/api/foo`; we
+    // need a proxy key for that prefixed path AND a rewrite that strips the
+    // base back to bare `/api/foo` (the backend is unaware of the prefix).
+    // When BASE="/" the prefixed entries collapse to plain `/api` and `/ws`.
     proxy: {
-      "/api": "http://localhost:19099",
-      "/ws": {
+      [`${BASE}api`]: {
+        target: "http://localhost:19099",
+        rewrite: (p: string) =>
+          BASE === "/" ? p : p.replace(new RegExp(`^${BASE}`), "/"),
+      },
+      [`${BASE}ws`]: {
         target: "ws://localhost:19099",
         ws: true,
+        rewrite: (p: string) =>
+          BASE === "/" ? p : p.replace(new RegExp(`^${BASE}`), "/"),
       },
     },
   },

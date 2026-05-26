@@ -34,6 +34,7 @@ from app.services.claude_goals import read_goals
 from app.services.claude_auqs import list_auqs
 from app.agents import get_adapter
 from app.services.cursor_session_reader import list_all_cursor_sessions_global
+from app.url_prefix import public_path
 from app.services.git_service import (
     git_add_commit, git_checkout_branch, git_checkout_remote_branch, git_clone,
     git_conflict_file_versions, git_file_diff, git_file_log, git_file_show,
@@ -980,7 +981,7 @@ def attach_session(session_id: str, body: AttachRequest, user_id: CurrentUser) -
     return AttachResponse(
         session_id=session_id,
         ws_token=token,
-        ws_url=f"/ws/sessions/{session_id}?token={token}",
+        ws_url=public_path(f"/ws/sessions/{session_id}?token={token}"),
         status=session.status,
     )
 
@@ -1529,7 +1530,7 @@ def open_shell(session_id: str, user_info: CurrentUserInfo) -> AttachResponse:
     return AttachResponse(
         session_id=token,
         ws_token=token,
-        ws_url=f"/ws/shell?token={token}",
+        ws_url=public_path(f"/ws/shell?token={token}"),
         status="running",
     )
 

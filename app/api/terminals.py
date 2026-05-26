@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from app.security import CurrentUserInfo
 from app.services.bash_term_service import TerminalManager
 from app.services.session_store import SessionStore
+from app.url_prefix import public_path
 
 router = APIRouter(prefix="/api/sessions", tags=["terminals"])
 
@@ -112,7 +113,7 @@ def create_terminal(
         name=rec.name,
         is_named=rec.is_named,
         ws_token=token,
-        ws_url=f"/ws/terminals/{rec.term_id}?token={token}",
+        ws_url=public_path(f"/ws/terminals/{rec.term_id}?token={token}"),
     )
 
 
@@ -129,7 +130,7 @@ def issue_token(session_id: str, term_id: str, user_info: CurrentUserInfo) -> Is
     return IssueTokenResponse(
         term_id=term_id,
         ws_token=token,
-        ws_url=f"/ws/terminals/{term_id}?token={token}",
+        ws_url=public_path(f"/ws/terminals/{term_id}?token={token}"),
         name=rec.name,
         is_named=rec.is_named,
         kept=rec.kept,

@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from app.security import AdminUser
 from app.services.bash_term_service import TerminalManager
+from app.url_prefix import public_path
 
 router = APIRouter(prefix="/api/admin/terminals", tags=["admin-terminals"])
 
@@ -116,7 +117,7 @@ def create_terminal(body: CreateTerminalRequest, admin: AdminUser) -> CreateTerm
         name=rec.name,
         is_named=rec.is_named,
         ws_token=token,
-        ws_url=f"/ws/terminals/{rec.term_id}?token={token}",
+        ws_url=public_path(f"/ws/terminals/{rec.term_id}?token={token}"),
     )
 
 
@@ -128,7 +129,7 @@ def issue_token(term_id: str, _admin: AdminUser) -> IssueTokenResponse:
     return IssueTokenResponse(
         term_id=term_id,
         ws_token=token,
-        ws_url=f"/ws/terminals/{term_id}?token={token}",
+        ws_url=public_path(f"/ws/terminals/{term_id}?token={token}"),
         name=rec.name,
         is_named=rec.is_named,
         kept=rec.kept,

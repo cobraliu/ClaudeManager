@@ -5,6 +5,7 @@ import { SessionsPage } from "./pages/SessionsPage";
 import { AdminPage } from "./pages/AdminPage";
 import { MobilePage } from "./pages/MobilePage";
 import { startMermaidObserver } from "./lib/mermaid";
+import { apiPath } from "./lib/baseUrl";
 import "./index.css";
 import "highlight.js/styles/github-dark.css";
 import "katex/dist/katex.min.css";
@@ -65,7 +66,7 @@ function App() {
     if (!_autologinParam) return;
     // Remove token from URL immediately to avoid sharing it accidentally.
     window.history.replaceState({}, "", window.location.pathname);
-    fetch(`/api/auth/autologin?token=${encodeURIComponent(_autologinParam)}`)
+    fetch(apiPath(`/api/auth/autologin?token=${encodeURIComponent(_autologinParam)}`))
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then((data: { token: string; username: string; role: "admin" | "user"; is_admin: boolean }) => {
         localStorage.setItem("token", data.token);

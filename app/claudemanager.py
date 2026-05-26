@@ -689,7 +689,20 @@ async def lifespan(app: FastAPI):
         logger.exception("codex app-server: shutdown_all failed")
 
 
-app = FastAPI(title="Claude Session Manager", version="0.2.0", lifespan=lifespan)
+# Sub-path mount support. When deploying behind nginx at e.g. `/rosaccm/`,
+# set ROOT_PATH=/rosaccm and configure nginx to STRIP the prefix on
+# proxy_pass (location /rosaccm/ { proxy_pass http://backend/; }). The
+# value is also surfaced to the WS URL emitters in app.api.sessions /
+# terminals / admin_terminals via ROOT_PATH env; they prepend it so the
+# browser opens wss://host/rosaccm/ws/... and nginx routes correctly.
+# Empty string (default) = root-mounted, behaves exactly as before.
+_ROOT_PATH = os.getenv("ROOT_PATH", "").rstrip("/")
+app = FastAPI(
+    title="Claude Session Manager",
+    version="0.2.0",
+    lifespan=lifespan,
+    root_path=_ROOT_PATH,
+)
 
 app.add_middleware(
     CORSMiddleware,
