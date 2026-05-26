@@ -312,16 +312,21 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
       a matching `tool_use_id`. Pending = at least one ExitPlanMode id has no
       paired tool_result. Mirrors `ConversationPane.tsx` (`!toolResults.has`).
 
-    - **Current (CLI 2.1.150+)**: ExitPlanMode is gone. Plan mode is now
-      tracked by two new JSONL entry types:
-        * `{"type":"attachment","attachment":{"type":"plan_mode",...}}` — fires
-          when plan mode starts (carries `planFilePath`, `planExists` flag).
-        * `{"type":"permission-mode","permissionMode":"plan"|"default"|...}`
-          — toggles permission mode across the session.
-      Approval = a subsequent `permission-mode` entry flips back out of
-      "plan". So pending = the LATEST `permission-mode` entry's value is
-      "plan" (or there's still a plan_mode attachment with no subsequent
-      mode-flip-out).
+    - **Current (CLI 2.1.150+)**: ExitPlanMode is gone. Plan mode lifecycle is
+      written as two distinct streams of signals that both need to be tracked
+      as a *rolling* in-plan state — we can't pick one slot and call it the
+      winner, because approval doesn't always toggle the same slot it entered
+      on:
+        * `permission-mode` entries — `permissionMode == "plan"` enters,
+          anything else exits.
+        * `attachment` entries — `attachment.type == "plan_mode"` enters,
+          `attachment.type == "plan_mode_exit"` exits (this is what CLI
+          writes when the user clicks Approve — there is **no** matching
+          `permission-mode` flip-out, which is why the prior "latest
+          permission-mode wins" heuristic stuck on True after approval).
+
+      So we walk the file once and treat each in/out signal as a state
+      transition. The final `in_plan_state` after the scan is the answer.
 
     Either format counts as pending — covers users on either CLI release.
     """
@@ -341,17 +346,17 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
     # Legacy-format accumulators.
     legacy_plan_ids: set[str] = set()
     legacy_resolved_ids: set[str] = set()
-    # New-format accumulators. We track the latest permission-mode value seen;
-    # whatever the file ends on wins (the entries are appended in order).
-    last_permission_mode: str | None = None
-    saw_plan_mode_attachment = False
+    # New-format rolling state. Flipped True/False as we walk in/out signals
+    # in file order; whatever value it holds at EOF is the verdict.
+    in_plan_state = False
 
     try:
         with open(jsonl) as f:
             for raw in f:
                 # Quick substring pre-check: skip lines that can't contribute.
                 # We need ExitPlanMode (legacy), tool_result (legacy),
-                # permission-mode (new), or plan_mode (new attachment).
+                # permission-mode (new), or plan_mode / plan_mode_exit (new
+                # attachment — plan_mode_exit substring is covered by "plan_mode").
                 if (
                     "ExitPlanMode" not in raw
                     and '"tool_result"' not in raw
@@ -364,21 +369,23 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
                 except Exception:
                     continue
 
-                # New format: top-level "permission-mode" entries toggle mode.
+                # New format: top-level "permission-mode" toggles mode.
                 if d.get("type") == "permission-mode":
                     pm = d.get("permissionMode")
                     if isinstance(pm, str):
-                        last_permission_mode = pm
+                        in_plan_state = (pm == "plan")
                     continue
 
-                # New format: "attachment" with attachment.type=="plan_mode"
-                # is the entry CLI writes when entering plan mode. Useful as
-                # a fallback signal when the session ends inside plan mode
-                # without an explicit permission-mode entry (defensive).
+                # New format: "attachment" of type plan_mode / plan_mode_exit
+                # is the actual approve/reject signal CLI 2.1.150+ writes.
                 if d.get("type") == "attachment":
                     att = d.get("attachment")
-                    if isinstance(att, dict) and att.get("type") == "plan_mode":
-                        saw_plan_mode_attachment = True
+                    if isinstance(att, dict):
+                        att_type = att.get("type")
+                        if att_type == "plan_mode":
+                            in_plan_state = True
+                        elif att_type == "plan_mode_exit":
+                            in_plan_state = False
                     continue
 
                 # Legacy format: scan message.content for ExitPlanMode tool_use
@@ -405,17 +412,7 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
         _plan_pending_cache[claude_session_id] = (mtime, False)
         return False
 
-    pending = False
-    # New-format judgment wins when present — it's an explicit mode toggle.
-    if last_permission_mode == "plan":
-        pending = True
-    elif last_permission_mode is None and saw_plan_mode_attachment:
-        # Plan mode started but no toggle out was ever recorded. Treat as
-        # pending — the alternative (silently dropping the signal) hides
-        # genuinely-pending plans on older snapshots that lack the toggle.
-        pending = True
-    elif legacy_plan_ids - legacy_resolved_ids:
-        pending = True
+    pending = in_plan_state or bool(legacy_plan_ids - legacy_resolved_ids)
 
     _plan_pending_cache[claude_session_id] = (mtime, pending)
     return pending
