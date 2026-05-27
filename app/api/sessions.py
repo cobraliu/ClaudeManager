@@ -907,6 +907,42 @@ def get_session(session_id: str, user_id: CurrentUser) -> SessionView:
     return _enrich(session)
 
 
+@router.get("/{session_id}/prompt-history")
+def get_prompt_history(
+    session_id: str,
+    user_id: CurrentUser,
+    limit: int = Query(20, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    q: str | None = Query(None),
+) -> dict:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    query = (q or "").strip() or None
+    entries = store.list_prompt_history(
+        session_id, limit=limit, offset=offset, query=query
+    )
+    total = store.count_prompt_history(session_id, query=query)
+    return {"entries": entries, "total": total}
+
+
+@router.delete(
+    "/{session_id}/prompt-history/{entry_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_prompt_history_entry(
+    session_id: str,
+    entry_id: int,
+    user_id: CurrentUser,
+) -> None:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    store.delete_prompt_history_entry(session_id, entry_id)
+
+
 @router.get("/{session_id}/search")
 def search_session(
     session_id: str,

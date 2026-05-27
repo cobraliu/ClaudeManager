@@ -151,6 +151,42 @@ def _is_turn_complete(d: dict) -> bool:
     return d.get("type") == "system" and d.get("subtype") == "turn_duration"
 
 
+def iter_user_prompts(claude_session_id: str, cwd: str):
+    """Yield (text, sent_at_unix) tuples for every real user prompt in the
+    Claude JSONL. Skips tool_result entries and compaction-injected system
+    messages. Timestamps with no parseable value yield 0.0 (caller can drop).
+    Used by the prompt-history backfill scanner to populate the DB from
+    sessions that pre-date the on-send recording hook."""
+    jsonl = _find_session_jsonl(claude_session_id, cwd)
+    if jsonl is None:
+        return
+    try:
+        with open(jsonl) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not _is_user_message(d):
+                    continue
+                text = _extract_text(d.get("message", {}))
+                if not text or _is_compact_message(text):
+                    continue
+                ts_str = d.get("timestamp", "")
+                ts_unix = 0.0
+                if ts_str:
+                    try:
+                        from datetime import datetime
+                        ts_unix = datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        ).timestamp()
+                    except Exception:
+                        ts_unix = 0.0
+                yield text, ts_unix
+    except OSError:
+        return
+
+
 def enrich_session(claude_session_id: str, cwd: str) -> dict:
     """
     Single-pass reader: returns {title, prompts, search_text} from one file read.

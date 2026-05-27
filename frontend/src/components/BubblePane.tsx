@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getConversation, attachSession, type ConversationTurn } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
+import { PromptHistoryPopover } from "./PromptHistoryPopover";
 
 const POLL_MS = 1500;
 const INITIAL_TAIL = 20;
@@ -104,6 +105,9 @@ export function BubblePane({ sessionId, tool }: Props) {
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const wsRef = useRef<WsClient | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
+  const paneContainerRef = useRef<HTMLDivElement>(null);
+  const [historyPopover, setHistoryPopover] = useState<{ rect: DOMRect | null; container: DOMRect | null } | null>(null);
 
   const isAtBottom = () => {
     const el = scrollRef.current;
@@ -267,7 +271,7 @@ export function BubblePane({ sessionId, tool }: Props) {
   const wsLabel = wsStatus === "connected" ? "Connected" : wsStatus === "connecting" ? "Connecting…" : "Disconnected";
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
+    <div ref={paneContainerRef} style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)" }}>
       {/* "Load full history" banner */}
       {showLoadBanner && (
         <div style={{
@@ -345,6 +349,23 @@ export function BubblePane({ sessionId, tool }: Props) {
             return (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, flexShrink: 0 }}>
                 <button
+                  ref={historyButtonRef}
+                  onClick={() => {
+                    const rect = historyButtonRef.current?.getBoundingClientRect() ?? null;
+                    const container = paneContainerRef.current?.getBoundingClientRect() ?? null;
+                    setHistoryPopover(historyPopover ? null : { rect, container });
+                  }}
+                  style={{
+                    background: "var(--bg-base)",
+                    color: "var(--text-body)",
+                    border: "1px solid var(--text-faintest)", borderRadius: 8,
+                    width: 36, height: 36, fontSize: 16,
+                    cursor: "pointer",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}
+                  title="Sent history"
+                >🕐</button>
+                <button
                   onClick={sendPrompt}
                   disabled={sendDisabled}
                   style={{
@@ -370,6 +391,19 @@ export function BubblePane({ sessionId, tool }: Props) {
           })()}
         </div>
       </div>
+      {historyPopover && (
+        <PromptHistoryPopover
+          sessionId={sessionId}
+          anchorRect={historyPopover.rect}
+          containerRect={historyPopover.container}
+          mobile
+          onPick={(text) => {
+            setInput(text);
+            textareaRef.current?.focus();
+          }}
+          onClose={() => setHistoryPopover(null)}
+        />
+      )}
     </div>
   );
 }

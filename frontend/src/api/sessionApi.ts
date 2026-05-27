@@ -135,6 +135,43 @@ export function submitAuqAnswers(
   });
 }
 
+export interface PromptHistoryEntry {
+  id: number;
+  text: string;
+  sent_at: number;
+  pane: string | null;
+}
+
+export interface PromptHistoryPage {
+  entries: PromptHistoryEntry[];
+  total: number;
+}
+
+export function getPromptHistory(
+  sessionId: string,
+  opts: { limit?: number; offset?: number; query?: string } = {},
+): Promise<PromptHistoryPage> {
+  const { limit = 20, offset = 0, query } = opts;
+  const qs = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  if (query && query.trim()) qs.set("q", query.trim());
+  return request(
+    `/api/sessions/${sessionId}/prompt-history?${qs.toString()}`,
+  );
+}
+
+export function deletePromptHistoryEntry(
+  sessionId: string,
+  entryId: number,
+): Promise<void> {
+  return request(
+    `/api/sessions/${sessionId}/prompt-history/${entryId}`,
+    { method: "DELETE" },
+  );
+}
+
 export function rewindSession(
   sessionId: string,
   messageUuid: string,
