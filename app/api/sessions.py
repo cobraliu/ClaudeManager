@@ -2778,6 +2778,57 @@ def tool_approve(session_id: str, body: _ToolApproveBody, user_id: CurrentUser) 
     return {"ok": True}
 
 
+class _PlanApproveBody(BaseModel):
+    decision: str  # "approve" | "reject"
+
+
+@router.post("/{session_id}/plan-approve")
+def plan_approve(session_id: str, body: _PlanApproveBody, user_id: CurrentUser) -> dict:
+    """Resolve a pending ExitPlanMode modal in the Claude CLI TUI.
+
+    The modal shows a 4-option list:
+        1. Yes, and bypass permissions
+        2. Yes, manually approve edits
+        3. No, refine with Ultraplan on Claude Code on the web
+        4. Tell Claude what to change
+
+    Approve maps to option 2 (manual approve preserves ClaudeManager's own
+    per-tool permission UI). Reject maps to option 4 (asks Claude to redo);
+    we submit it with no inline feedback — empty Enter confirms.
+
+    Prior behavior routed Approve/Reject text through the normal chat
+    `sendPrompt` path, which paste-buffer'd "Approved" / "Rejected" into
+    the modal. Those strings match no option, but the trailing Enter
+    submitted the default-highlighted option 1 — so Reject was silently
+    approving the plan with bypassed permissions. Mirrors the
+    `tool_approve` endpoint above; structured key sequence rather than
+    free text.
+    """
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    tmux = _get_tmux()
+    pane = f"{session.tmux_session_name}:0.0"
+    if body.decision == "approve":
+        # option 2 — modal opens with option 1 highlighted, Down × 1 → Enter
+        tmux._run("send-keys", "-t", pane, "Down")
+        time.sleep(0.15)
+        tmux._run("send-keys", "-t", pane, "Enter")
+    elif body.decision == "reject":
+        # option 4 — Down × 3 → Enter. The option may open a feedback
+        # input; we don't pass any, so a follow-up Enter submits empty.
+        for _ in range(3):
+            tmux._run("send-keys", "-t", pane, "Down")
+            time.sleep(0.15)
+        tmux._run("send-keys", "-t", pane, "Enter")
+        time.sleep(0.3)
+        tmux._run("send-keys", "-t", pane, "Enter")
+    else:
+        raise HTTPException(status_code=400, detail="decision must be 'approve' or 'reject'")
+    return {"ok": True}
+
+
 @router.post("/{session_id}/git/diff")
 def git_diff_endpoint(session_id: str, body: GitDiffRequest, user_id: CurrentUser) -> dict:
     """Return per-file diff between two commits: {files: [{path, old_content, new_content}]}."""
