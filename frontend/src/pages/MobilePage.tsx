@@ -4997,6 +4997,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const [showSettings, setShowSettings] = useState(false);
   const [showCaps, setShowCaps] = useState(false);
   const [showJsonl, setShowJsonl] = useState(false);
+  const [showForward, setShowForward] = useState(false);
   const [fontSize, setFontSize] = useState<number>(() => Number(localStorage.getItem("cm_mobile_font") || 13));
   const changeFontSize = (delta: number) => setFontSize(prev => {
     const next = Math.min(20, Math.max(10, prev + delta));
@@ -5025,7 +5026,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const isCodexAppServer = session.tool === "codex" && session.codex_transport === "app_server";
 
   // ── TUI view ──────────────────────────────────────────────────────────────
-  const [viewMode, setViewMode] = useState<"chat" | "tui" | "memory" | "forward">("chat");
+  const [viewMode, setViewMode] = useState<"chat" | "tui" | "memory">("chat");
   const [tuiWs, setTuiWs] = useState<{ url: string; token: string } | null>(null);
   const [tuiLoading, setTuiLoading] = useState(false);
   const [tuiCtrlActive, setTuiCtrlActive] = useState(false);
@@ -5060,6 +5061,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const showModelPickerRef = useRef(false);
   const showCapsRef = useRef(false);
   const showJsonlRef = useRef(false);
+  const showForwardRef = useRef(false);
   const stopResponseRef = useRef<(() => void) | null>(null);
   const convRefreshRef = useRef<(() => void) | null>(null);
   const showTasksRef = useRef(false);
@@ -5076,6 +5078,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   showModelPickerRef.current = showModelPicker;
   showCapsRef.current = showCaps;
   showJsonlRef.current = showJsonl;
+  showForwardRef.current = showForward;
 
   // Push history entry when this view mounts; handle all back navigation here.
   useEffect(() => {
@@ -5093,6 +5096,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       if (showModelPickerRef.current) { setShowModelPicker(false); return; }
       if (showCapsRef.current) { setShowCaps(false); return; }
       if (showJsonlRef.current) { setShowJsonl(false); return; }
+      if (showForwardRef.current) { setShowForward(false); return; }
       onBack();
     };
     window.addEventListener("popstate", handlePop);
@@ -5112,6 +5116,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   useEffect(() => { if (showModelPicker) history.pushState({ mobileDetail: true, sub: "modelPicker" }, ""); }, [showModelPicker]);
   useEffect(() => { if (showCaps) history.pushState({ mobileDetail: true, sub: "caps" }, ""); }, [showCaps]);
   useEffect(() => { if (showJsonl) history.pushState({ mobileDetail: true, sub: "jsonl" }, ""); }, [showJsonl]);
+  useEffect(() => { if (showForward) history.pushState({ mobileDetail: true, sub: "forward" }, ""); }, [showForward]);
 
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTask[]>(initialSession.scheduled_tasks ?? []);
 
@@ -5283,6 +5288,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
               onClick: () => setShowJsonl(true),
               color: iconMuted, bg: "transparent",
             }] : []),
+            { icon: <span style={{ fontSize: 13 }}>🌐</span>, title: "Forwards (local dev server proxy)", onClick: () => setShowForward(true), color: iconMuted, bg: "transparent" },
           ];
           // With 12+ buttons, even-grid would shrink each below tap-target size on narrow
           // phones. Use flex with a min-width per button and let it scroll horizontally
@@ -5376,6 +5382,12 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         </div>
       )}
 
+      {showForward && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 3000, background: "var(--bg-base)", display: "flex", flexDirection: "column" }}>
+          <ForwardsPanel onClose={() => history.back()} />
+        </div>
+      )}
+
       {showModelPicker && (
         <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}
           onClick={() => history.back()}>
@@ -5432,10 +5444,6 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
           onClick={() => setViewMode("memory")}
           style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "memory" ? "2px solid var(--accent-purple, #a78bfa)" : "2px solid transparent", color: viewMode === "memory" ? "var(--accent-purple, #a78bfa)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "color 0.15s" }}
         >🧠 Memory</button>
-        <button
-          onClick={() => setViewMode("forward")}
-          style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "forward" ? "2px solid var(--accent-blue)" : "2px solid transparent", color: viewMode === "forward" ? "var(--accent-blue)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "color 0.15s" }}
-        >🌐 Forward</button>
       </div>
 
       {/* Content area — both panes mounted, visibility toggled */}
@@ -5483,9 +5491,6 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       )}
       <div style={{ flex: 1, minHeight: 0, display: viewMode === "memory" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
         <MemoryPanel sessionId={session.id} compact fontSize={fontSize} />
-      </div>
-      <div style={{ flex: 1, minHeight: 0, display: viewMode === "forward" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
-        <ForwardsPanel />
       </div>
 
       {/* TUI keyboard toolbar */}
