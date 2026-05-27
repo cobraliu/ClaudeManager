@@ -117,6 +117,7 @@ import { WsClient } from "../lib/wsClient";
 import { ClaudeCapsModal } from "../components/ClaudeCapsModal";
 import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
 import { MemoryPanel } from "../components/MemoryPanel";
+import { ForwardsPanel } from "../components/ForwardsPanel";
 import { downloadConversationHtml } from "../lib/exportChat";
 import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
 import { GitGraph } from "../components/GitGraph";
@@ -5024,7 +5025,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const isCodexAppServer = session.tool === "codex" && session.codex_transport === "app_server";
 
   // ── TUI view ──────────────────────────────────────────────────────────────
-  const [viewMode, setViewMode] = useState<"chat" | "tui" | "memory">("chat");
+  const [viewMode, setViewMode] = useState<"chat" | "tui" | "memory" | "forward">("chat");
   const [tuiWs, setTuiWs] = useState<{ url: string; token: string } | null>(null);
   const [tuiLoading, setTuiLoading] = useState(false);
   const [tuiCtrlActive, setTuiCtrlActive] = useState(false);
@@ -5431,6 +5432,10 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
           onClick={() => setViewMode("memory")}
           style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "memory" ? "2px solid var(--accent-purple, #a78bfa)" : "2px solid transparent", color: viewMode === "memory" ? "var(--accent-purple, #a78bfa)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "color 0.15s" }}
         >🧠 Memory</button>
+        <button
+          onClick={() => setViewMode("forward")}
+          style={{ flex: 1, height: 30, background: "transparent", border: "none", borderBottom: viewMode === "forward" ? "2px solid var(--accent-blue)" : "2px solid transparent", color: viewMode === "forward" ? "var(--accent-blue)" : "var(--text-faint)", fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "color 0.15s" }}
+        >🌐 Forward</button>
       </div>
 
       {/* Content area — both panes mounted, visibility toggled */}
@@ -5478,6 +5483,9 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       )}
       <div style={{ flex: 1, minHeight: 0, display: viewMode === "memory" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
         <MemoryPanel sessionId={session.id} compact fontSize={fontSize} />
+      </div>
+      <div style={{ flex: 1, minHeight: 0, display: viewMode === "forward" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
+        <ForwardsPanel />
       </div>
 
       {/* TUI keyboard toolbar */}

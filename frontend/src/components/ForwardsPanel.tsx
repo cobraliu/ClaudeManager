@@ -145,7 +145,7 @@ export function ForwardsPanel({ onClose }: Props) {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-base)", overflow: "hidden" }}>
       {/* Header bar */}
-      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0, fontSize: 12 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0, fontSize: 12 }}>
         <span style={{ color: "var(--text-faint)", marginRight: 4 }}>Forwards</span>
         {shortcuts.length === 0 && (
           <span style={{ color: "var(--text-faint)", fontStyle: "italic" }}>no shortcuts yet</span>
@@ -228,7 +228,7 @@ export function ForwardsPanel({ onClose }: Props) {
 
       {/* Inline add/edit form */}
       {(addingNew || editingId) && (
-        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0, fontSize: 12, background: "var(--bg-card, var(--bg-base))" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: "1px solid var(--bg-hover)", flexShrink: 0, fontSize: 12, background: "var(--bg-card, var(--bg-base))" }}>
           <span style={{ color: "var(--text-faint)" }}>{addingNew ? "New" : "Edit"}:</span>
           <input
             ref={portInputRef}
