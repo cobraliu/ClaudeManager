@@ -302,34 +302,33 @@ _plan_pending_cache: dict[str, tuple[float, bool]] = {}
 
 
 def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
-    """Return True iff the session JSONL says a plan is awaiting user approval.
+    """Return True iff the session JSONL has an ExitPlanMode that the user
+    has not yet decided on (approve or reject).
 
-    Has to handle two distinct on-disk formats because Claude CLI changed how
-    plan mode is recorded:
+    Across CLI versions (legacy ≤ 2.1.144 and current 2.1.150+) the proposal
+    side is identical: an assistant message carries a
+    `{"type":"tool_use","name":"ExitPlanMode"}` block. The resolution side
+    has two forms that we treat as equivalent:
 
-    - **Legacy (CLI ≤ 2.1.144)**: plan approval was an `ExitPlanMode` tool_use.
-      An assistant message carried `{"type":"tool_use","name":"ExitPlanMode"}`,
-      and the user's Approve/Reject decision arrived as a `tool_result` with
-      a matching `tool_use_id`. Pending = at least one ExitPlanMode id has no
-      paired tool_result. Mirrors `ConversationPane.tsx` (`!toolResults.has`).
+    - **`tool_result` matching the `tool_use_id`** — fires on **both**
+      approve and reject. The result text differs ("User has approved your
+      plan..." vs "The user doesn't want to proceed with this tool use.
+      The tool use was rejected..."), but for badge purposes we only care
+      that the user decided.
 
-    - **Current (CLI 2.1.150+)**: ExitPlanMode is gone. Plan mode lifecycle is
-      written as two distinct streams of signals that both need to be tracked
-      as a *rolling* in-plan state — we can't pick one slot and call it the
-      winner, because approval doesn't always toggle the same slot it entered
-      on:
-        * `permission-mode` entries — `permissionMode == "plan"` enters,
-          anything else exits.
-        * `attachment` entries — `attachment.type == "plan_mode"` enters,
-          `attachment.type == "plan_mode_exit"` exits (this is what CLI
-          writes when the user clicks Approve — there is **no** matching
-          `permission-mode` flip-out, which is why the prior "latest
-          permission-mode wins" heuristic stuck on True after approval).
+    - **`plan_mode_exit` attachment** (2.1.150+ only) — fires only on
+      approve, because reject keeps plan mode on. We treat it as a
+      bulk-resolve signal: any ExitPlanMode IDs not yet matched by a
+      tool_result are marked resolved when this lands.
 
-      So we walk the file once and treat each in/out signal as a state
-      transition. The final `in_plan_state` after the scan is the answer.
+    Pending = at least one ExitPlanMode id has neither a matching
+    tool_result nor a subsequent plan_mode_exit attachment.
 
-    Either format counts as pending — covers users on either CLI release.
+    Note: this used to also track a rolling `in_plan_state` based on
+    `permission-mode` / `plan_mode` / `plan_mode_exit` signals. That was
+    wrong because reject (option 4 "Tell Claude what to change") keeps
+    `permission-mode == "plan"` and does NOT write `plan_mode_exit`, so
+    the rolling state stayed True forever and the badge never cleared.
     """
     import json as _json
     from app.services.claude_session_reader import _find_session_jsonl as _find_jsonl
@@ -344,24 +343,17 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
     if cached and cached[0] == mtime:
         return cached[1]
 
-    # Legacy-format accumulators.
-    legacy_plan_ids: set[str] = set()
-    legacy_resolved_ids: set[str] = set()
-    # New-format rolling state. Flipped True/False as we walk in/out signals
-    # in file order; whatever value it holds at EOF is the verdict.
-    in_plan_state = False
+    exit_plan_ids: set[str] = set()
+    resolved_ids: set[str] = set()
 
     try:
         with open(jsonl) as f:
             for raw in f:
-                # Quick substring pre-check: skip lines that can't contribute.
-                # We need ExitPlanMode (legacy), tool_result (legacy),
-                # permission-mode (new), or plan_mode / plan_mode_exit (new
-                # attachment — plan_mode_exit substring is covered by "plan_mode").
+                # Skip lines that can't contribute. `plan_mode_exit` substring
+                # is subsumed by `plan_mode`.
                 if (
                     "ExitPlanMode" not in raw
                     and '"tool_result"' not in raw
-                    and '"permission-mode"' not in raw
                     and "plan_mode" not in raw
                 ):
                     continue
@@ -370,27 +362,17 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
                 except Exception:
                     continue
 
-                # New format: top-level "permission-mode" toggles mode.
-                if d.get("type") == "permission-mode":
-                    pm = d.get("permissionMode")
-                    if isinstance(pm, str):
-                        in_plan_state = (pm == "plan")
-                    continue
-
-                # New format: "attachment" of type plan_mode / plan_mode_exit
-                # is the actual approve/reject signal CLI 2.1.150+ writes.
+                # plan_mode_exit attachment — approve path bulk-resolves any
+                # ExitPlanMode ids still outstanding at this point in the
+                # stream. Usually redundant with the matching tool_result,
+                # but kept as a fallback for any edge cases where the CLI
+                # writes plan_mode_exit without a paired tool_result.
                 if d.get("type") == "attachment":
                     att = d.get("attachment")
-                    if isinstance(att, dict):
-                        att_type = att.get("type")
-                        if att_type == "plan_mode":
-                            in_plan_state = True
-                        elif att_type == "plan_mode_exit":
-                            in_plan_state = False
+                    if isinstance(att, dict) and att.get("type") == "plan_mode_exit":
+                        resolved_ids |= exit_plan_ids
                     continue
 
-                # Legacy format: scan message.content for ExitPlanMode tool_use
-                # and any tool_result blocks.
                 msg = d.get("message")
                 if not isinstance(msg, dict):
                     continue
@@ -404,16 +386,16 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
                     if btype == "tool_use" and b.get("name") == "ExitPlanMode":
                         bid = b.get("id")
                         if isinstance(bid, str):
-                            legacy_plan_ids.add(bid)
+                            exit_plan_ids.add(bid)
                     elif btype == "tool_result":
                         tid = b.get("tool_use_id")
                         if isinstance(tid, str):
-                            legacy_resolved_ids.add(tid)
+                            resolved_ids.add(tid)
     except OSError:
         _plan_pending_cache[claude_session_id] = (mtime, False)
         return False
 
-    pending = in_plan_state or bool(legacy_plan_ids - legacy_resolved_ids)
+    pending = bool(exit_plan_ids - resolved_ids)
 
     _plan_pending_cache[claude_session_id] = (mtime, pending)
     return pending
