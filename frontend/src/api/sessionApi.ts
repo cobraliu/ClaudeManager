@@ -628,7 +628,7 @@ export async function uploadFile(
   }
 }
 
-export interface UploadedImage {
+export interface UploadedAttachment {
   /** Absolute path on the server; gets injected as `@<path>` into the prompt. */
   path: string;
   /** Original filename from the upload (display only). */
@@ -636,18 +636,20 @@ export interface UploadedImage {
   /** Stored filename (uuid + ext); used to reconstruct the serve URL. */
   stored_name: string;
   size: number;
-  /** Relative API path for <img src>; caller appends `?token=<jwt>`. */
-  url: string;
+  /** True for png/jpg/jpeg/gif/webp; drives thumbnail rendering. */
+  is_image: boolean;
+  /** Relative API path for <img src> — only present when is_image; caller appends `?token=<jwt>`. */
+  url?: string;
 }
 
-export async function uploadImage(
+export async function uploadAttachment(
   sessionId: string,
   file: File
-): Promise<UploadedImage> {
+): Promise<UploadedAttachment> {
   const token = localStorage.getItem("token") || "";
   const form = new FormData();
   form.append("file", file);
-  const resp = await fetch(apiPath(`/api/sessions/${sessionId}/upload-image`), {
+  const resp = await fetch(apiPath(`/api/sessions/${sessionId}/upload-attachment`), {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: form,
@@ -657,7 +659,7 @@ export async function uploadImage(
     const text = await resp.text();
     throw new Error(text || `HTTP ${resp.status}`);
   }
-  return (await resp.json()) as UploadedImage;
+  return (await resp.json()) as UploadedAttachment;
 }
 
 export interface DirInfoItem {

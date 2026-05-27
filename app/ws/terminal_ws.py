@@ -298,10 +298,31 @@ async def terminal_ws(
                                     "paste-buffer", "-d", "-p", "-r", "-b", buf_name, "-t", pane_target,
                                 )
                             if needs_enter:
+                                # Image-upload prompts arrive as multi-line text
+                                # containing "@<path>" file references. A single
+                                # send-keys Enter after the bracketed paste does
+                                # not actually submit — the text lands in Ink's
+                                # input box, cursor sits after the @<path>, but
+                                # the prompt never sends until the user hits
+                                # Enter manually a second time. Empirically the
+                                # cure is to fire a follow-up Enter ourselves.
+                                # We only do this when "@" is in the payload so
+                                # the plain-text path keeps its single Enter and
+                                # never injects a stray newline into the
+                                # conversation.
+                                needs_double_enter = "@" in text_part
+                                if text_part:
+                                    await asyncio.sleep(0.1)
                                 await loop.run_in_executor(
                                     None, tmux._run,
                                     "send-keys", "-t", pane_target, "Enter",
                                 )
+                                if needs_double_enter:
+                                    await asyncio.sleep(0.1)
+                                    await loop.run_in_executor(
+                                        None, tmux._run,
+                                        "send-keys", "-t", pane_target, "Enter",
+                                    )
                         except Exception as exc:
                             # Don't leave the client hanging on a silently dropped
                             # message. Bounce it back so the optimistic bubble
