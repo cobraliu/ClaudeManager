@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  deletePromptHistoryEntry,
   getPromptHistory,
   type PromptHistoryEntry,
 } from "../api/sessionApi";
@@ -154,19 +153,6 @@ export function PromptHistoryPopover({
     };
   }, [onClose]);
 
-  const handleDelete = useCallback(
-    async (id: number, e: React.MouseEvent) => {
-      e.stopPropagation();
-      try {
-        await deletePromptHistoryEntry(sessionId, id);
-        loadPage(pageIndex, query);
-      } catch (ex) {
-        alert(ex instanceof Error ? ex.message : String(ex));
-      }
-    },
-    [sessionId, loadPage, pageIndex, query],
-  );
-
   const handlePick = useCallback(
     (text: string) => {
       onPick(text);
@@ -311,7 +297,6 @@ export function PromptHistoryPopover({
             query={query}
             compact={mobile}
             onPick={() => handlePick(e.text)}
-            onDelete={(ev) => handleDelete(e.id, ev)}
           />
         ))}
       </div>
@@ -418,13 +403,11 @@ function HistoryRow({
   query,
   compact,
   onPick,
-  onDelete,
 }: {
   entry: PromptHistoryEntry;
   query: string;
   compact: boolean;
   onPick: () => void;
-  onDelete: (e: React.MouseEvent) => void;
 }) {
   const [hover, setHover] = useState(false);
   return (
@@ -435,7 +418,7 @@ function HistoryRow({
         padding: compact ? "8px 10px" : "10px 14px",
         borderBottom: "1px solid var(--text-faintest)",
         background: hover ? "var(--bg-hover)" : "transparent",
-        display: "flex", alignItems: "flex-start", gap: 8,
+        display: "flex", alignItems: "center", gap: 8,
       }}
     >
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -464,48 +447,24 @@ function HistoryRow({
           }}
         >{renderHighlighted(entry.text, query)}</div>
       </div>
-      <div
+      <button
+        onClick={(e) => { e.stopPropagation(); onPick(); }}
+        title="Fill into the input box"
         style={{
           flexShrink: 0,
-          display: "flex", flexDirection: "column", gap: 4,
-          alignItems: "stretch",
+          background: "var(--bg-base)",
+          border: "1px solid var(--text-faintest)",
+          color: "var(--text-body)",
+          fontSize: 13,
+          borderRadius: 6,
+          width: 28, height: 26, padding: 0,
+          cursor: "pointer",
+          lineHeight: 1,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
         }}
-      >
-        <button
-          onClick={(e) => { e.stopPropagation(); onPick(); }}
-          title="Fill into the input box"
-          style={{
-            background: "var(--bg-base)",
-            border: "1px solid var(--text-faintest)",
-            color: "var(--text-body)",
-            fontSize: 13,
-            borderRadius: 6,
-            width: 28, height: 26, padding: 0,
-            cursor: "pointer",
-            lineHeight: 1,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >→</button>
-        <button
-          onClick={onDelete}
-          title="Delete this entry"
-          style={{
-            background: "transparent",
-            border: 0,
-            color: "var(--text-faint)",
-            fontSize: 12,
-            width: 28, height: 22, padding: 0,
-            cursor: "pointer",
-            opacity: compact || hover ? 1 : 0.5,
-            transition: "opacity 120ms",
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >🗑</button>
-      </div>
+      >→</button>
     </div>
   );
 }

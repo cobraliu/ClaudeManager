@@ -5114,6 +5114,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
           sessionId={sessionId}
           anchorRect={historyPopover.rect}
           containerRect={historyPopover.container}
+          mobile={typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches}
           onPick={(text) => {
             setInput(text);
             try { saveDraft(sessionId, text); } catch {}
