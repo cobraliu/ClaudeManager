@@ -2467,6 +2467,12 @@ export function FileEditorModal({ sessionId, sessionCwd, onClose }: Props) {
                       style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 10, padding: "3px 6px", flexShrink: 0, display: "flex", alignItems: "center" }}
                     ><img src={gitIcon} style={{ width: 12, height: 12, filter: "invert(0.6)" }} /></button>
                     <button
+                      onClick={handleDownloadCwd}
+                      disabled={dlLoading}
+                      title="Download working directory as zip"
+                      style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 10, padding: "3px 6px", flexShrink: 0, display: "flex", alignItems: "center", opacity: dlLoading ? 0.5 : 1 }}
+                    ><img src={downloadIcon} style={{ width: 12, height: 12, filter: "invert(0.6)" }} /></button>
+                    <button
                       onClick={() => setShowHidden((v) => !v)}
                       title={showHidden ? "Hide dot-prefixed files" : "Show dot-prefixed files"}
                       style={{ background: showHidden ? "var(--accent-blue)" : "var(--bg-hover)", color: showHidden ? "#fff" : "var(--text-body)", fontSize: 10, padding: "3px 6px", flexShrink: 0 }}
