@@ -166,12 +166,17 @@ export function PromptHistoryPopover({
   // floating panel (PC) or a viewport bottom-sheet (mobile).
   let panelStyle: React.CSSProperties;
   if (mobile && containerRect) {
+    // Fill the chat container from its top edge down to just above the
+    // input bar — anchor the panel's bottom on the history button so the
+    // textarea stays visible and tappable.
     panelStyle = {
       position: "fixed",
       left: containerRect.left,
       top: containerRect.top,
       width: containerRect.width,
-      height: containerRect.height,
+      bottom: anchorRect
+        ? Math.max(8, window.innerHeight - anchorRect.top + 6)
+        : Math.max(8, window.innerHeight - containerRect.bottom),
     };
   } else if (containerRect) {
     const halfHeight = Math.max(220, Math.round(containerRect.height / 2));
