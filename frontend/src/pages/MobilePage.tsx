@@ -117,6 +117,7 @@ import { WsClient } from "../lib/wsClient";
 import { ClaudeCapsModal } from "../components/ClaudeCapsModal";
 import { JsonlPreviewModal } from "../components/JsonlPreviewModal";
 import { MemoryPanel } from "../components/MemoryPanel";
+import { ForwardsPanel } from "../components/ForwardsPanel";
 import { downloadConversationHtml } from "../lib/exportChat";
 import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
 import { GitGraph } from "../components/GitGraph";
@@ -4996,6 +4997,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const [showSettings, setShowSettings] = useState(false);
   const [showCaps, setShowCaps] = useState(false);
   const [showJsonl, setShowJsonl] = useState(false);
+  const [showForward, setShowForward] = useState(false);
   const [fontSize, setFontSize] = useState<number>(() => Number(localStorage.getItem("cm_mobile_font") || 13));
   const changeFontSize = (delta: number) => setFontSize(prev => {
     const next = Math.min(20, Math.max(10, prev + delta));
@@ -5059,6 +5061,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const showModelPickerRef = useRef(false);
   const showCapsRef = useRef(false);
   const showJsonlRef = useRef(false);
+  const showForwardRef = useRef(false);
   const stopResponseRef = useRef<(() => void) | null>(null);
   const convRefreshRef = useRef<(() => void) | null>(null);
   const showTasksRef = useRef(false);
@@ -5075,6 +5078,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   showModelPickerRef.current = showModelPicker;
   showCapsRef.current = showCaps;
   showJsonlRef.current = showJsonl;
+  showForwardRef.current = showForward;
 
   // Push history entry when this view mounts; handle all back navigation here.
   useEffect(() => {
@@ -5092,6 +5096,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
       if (showModelPickerRef.current) { setShowModelPicker(false); return; }
       if (showCapsRef.current) { setShowCaps(false); return; }
       if (showJsonlRef.current) { setShowJsonl(false); return; }
+      if (showForwardRef.current) { setShowForward(false); return; }
       onBack();
     };
     window.addEventListener("popstate", handlePop);
@@ -5111,6 +5116,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   useEffect(() => { if (showModelPicker) history.pushState({ mobileDetail: true, sub: "modelPicker" }, ""); }, [showModelPicker]);
   useEffect(() => { if (showCaps) history.pushState({ mobileDetail: true, sub: "caps" }, ""); }, [showCaps]);
   useEffect(() => { if (showJsonl) history.pushState({ mobileDetail: true, sub: "jsonl" }, ""); }, [showJsonl]);
+  useEffect(() => { if (showForward) history.pushState({ mobileDetail: true, sub: "forward" }, ""); }, [showForward]);
 
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTask[]>(initialSession.scheduled_tasks ?? []);
 
@@ -5282,6 +5288,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
               onClick: () => setShowJsonl(true),
               color: iconMuted, bg: "transparent",
             }] : []),
+            { icon: <span style={{ fontSize: 13 }}>🌐</span>, title: "Forwards (local dev server proxy)", onClick: () => setShowForward(true), color: iconMuted, bg: "transparent" },
           ];
           // With 12+ buttons, even-grid would shrink each below tap-target size on narrow
           // phones. Use flex with a min-width per button and let it scroll horizontally
@@ -5372,6 +5379,12 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
             sessionTitle={session.project}
             onClose={() => history.back()}
           />
+        </div>
+      )}
+
+      {showForward && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 3000, background: "var(--bg-base)", display: "flex", flexDirection: "column" }}>
+          <ForwardsPanel onClose={() => history.back()} />
         </div>
       )}
 

@@ -54,6 +54,12 @@ def _filter_response_headers(items) -> list[tuple[str, str]]:
         if kl in _HOP_BY_HOP or kl == "content-length":
             # Length is recomputed by StreamingResponse / framework.
             continue
+        if kl in ("x-frame-options", "content-security-policy", "content-security-policy-report-only"):
+            # The ForwardsPanel intentionally embeds upstreams in an iframe;
+            # passing through the upstream's framing policy would make every
+            # response on a different origin than its X-Frame-Options names
+            # (the browser sees our proxy origin) and break the preview.
+            continue
         out.append((k, v))
     return out
 

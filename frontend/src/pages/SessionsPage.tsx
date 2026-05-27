@@ -2806,20 +2806,6 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   🧠 Memory
                 </button>
               )}
-              <button
-                onClick={() => {
-                  if (inlineView === "forward") {
-                    setInlineView(null);
-                  } else {
-                    setInlineView("forward");
-                    setCodeFileView(null);
-                  }
-                }}
-                title="Preview local dev servers via reverse-proxy forwards"
-                style={{ fontSize: 11, padding: "2px 10px", background: inlineView === "forward" ? "var(--bg-hover)" : "transparent", color: inlineView === "forward" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (inlineView === "forward" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
-              >
-                🌐 Forward
-              </button>
               {(() => {
                 const isActive = rightMode === "bubble" && !inlineView && !codeFileView;
                 return (
@@ -2862,6 +2848,20 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
                   style={{ fontSize: 11, padding: "2px 10px", background: userConfig.terminalOpen ? "var(--bg-hover)" : "transparent", color: userConfig.terminalOpen ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (userConfig.terminalOpen ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
                 >
                   &gt;_ Term
+                </button>
+                <button
+                  onClick={() => {
+                    if (inlineView === "forward") {
+                      setInlineView(null);
+                    } else {
+                      setInlineView("forward");
+                      setCodeFileView(null);
+                    }
+                  }}
+                  title="Preview local dev servers via reverse-proxy forwards"
+                  style={{ fontSize: 11, padding: "2px 10px", background: inlineView === "forward" ? "var(--bg-hover)" : "transparent", color: inlineView === "forward" ? "var(--text-body)" : "var(--text-faint)", border: "1px solid " + (inlineView === "forward" ? "var(--text-faint)" : "transparent"), borderRadius: 4 }}
+                >
+                  🌐 Forward
                 </button>
               </div>
               <FullscreenClock />
