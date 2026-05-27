@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMe
 import { createPortal } from "react-dom";
 import hljs from "highlight.js/lib/common";
 import { marked, renderMarkdown } from "../lib/markdown";
-import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, uploadAttachment, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta, type UploadedAttachment } from "../api/sessionApi";
+import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, approvePlan, rewindSession, readClaudePlan, resolveCodexAuq, uploadAttachment, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta, type UploadedAttachment } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
 import { apiPath } from "../lib/baseUrl";
 import {
@@ -1708,11 +1708,14 @@ function PlanApprovalBlock({ blockId, planText, planPath, onSubmit }: {
   blockId: string;
   planText?: string;
   planPath?: string;
-  onSubmit: (text: string) => void;
+  onSubmit: (decision: "approve" | "reject") => void;
 }) {
   const [dismissed, setDismissed] = useState(false);
-  type Mode = "normal" | "edit" | "reject";
-  const [mode, setMode] = useState<Mode>("normal");
+  // Two-stage confirmation: clicking Approve/Reject parks in a "confirm-*"
+  // state so a stray click can't accidentally send a Claude CLI keystroke
+  // sequence. The user has to click the second confirm to actually fire.
+  type Confirm = "none" | "approve" | "reject";
+  const [confirm, setConfirm] = useState<Confirm>("none");
   const [fetched, setFetched] = useState<string | undefined>(
     planPath ? _planContentCache.get(planPath) : undefined,
   );
@@ -1729,21 +1732,14 @@ function PlanApprovalBlock({ blockId, planText, planPath, onSubmit }: {
     return () => { cancelled = true; };
   }, [planText, planPath, fetched]);
   const body = planText ?? fetched;
-  const [editedPlan, setEditedPlan] = useState(planText ?? "");
-  // Once the fetch resolves, seed the edit textarea with the real plan so
-  // "Edit → Approve" doesn't silently send an empty string upstream.
-  useEffect(() => {
-    if (!editedPlan && body) setEditedPlan(body);
-  }, [body, editedPlan]);
-  const [feedback, setFeedback] = useState("");
 
   if (dismissed || _dismissedPlan.has(blockId)) return null;
 
-  const dismiss = (text: string) => {
+  const submit = (decision: "approve" | "reject") => {
     _dismissedPlan.add(blockId);
     _planPersist(_dismissedPlan);
     setDismissed(true);
-    onSubmit(text);
+    onSubmit(decision);
   };
 
   const baseBtn: React.CSSProperties = {
@@ -1758,17 +1754,16 @@ function PlanApprovalBlock({ blockId, planText, planPath, onSubmit }: {
         <span style={{ fontWeight: 600, fontSize: 13, color: "#c4b5fd" }}>Plan ready for approval</span>
         <span style={{ fontSize: 10, color: "#6d28d9", marginLeft: "auto", fontFamily: "monospace" }}>ExitPlanMode</span>
       </div>
-      {/* Plan content (rendered when not in edit mode). The body resolves
-          from the tool input (legacy) or, when absent, from the on-disk plan
-          file fetched via planPath. */}
-      {body && mode !== "edit" && (
+      {/* Plan content. Body resolves from the tool input (legacy) or, when
+          absent, from the on-disk plan file fetched via planPath. */}
+      {body && (
         <div
           className="conv-markdown"
           dangerouslySetInnerHTML={{ __html: renderMarkdown(body) }}
           style={{ padding: "12px 16px", maxHeight: "55vh", overflowY: "auto", fontSize: 13, lineHeight: 1.65, borderBottom: "1px solid #2a1f3d" }}
         />
       )}
-      {!body && mode !== "edit" && (
+      {!body && (
         <div style={{ padding: "10px 14px", fontSize: 12, color: "var(--text-muted)", fontStyle: "italic", borderBottom: "1px solid #2a1f3d" }}>
           {fetchError
             ? `Could not load plan file: ${fetchError}`
@@ -1777,58 +1772,24 @@ function PlanApprovalBlock({ blockId, planText, planPath, onSubmit }: {
               : "Plan body not available — approve to view via tool result"}
         </div>
       )}
-      {/* Edit mode: editable textarea */}
-      {mode === "edit" && (
-        <div style={{ padding: "10px 14px 6px" }}>
-          <textarea
-            value={editedPlan}
-            onChange={(e) => setEditedPlan(e.target.value)}
-            autoFocus
-            style={{
-              width: "100%", minHeight: 200, boxSizing: "border-box",
-              background: "var(--bg-base)", border: "1px solid #4c1d95", borderRadius: 4,
-              color: "var(--text-primary)", fontSize: 12.5, padding: "8px 12px",
-              resize: "vertical", outline: "none", fontFamily: "monospace", lineHeight: 1.6,
-            }}
-          />
-        </div>
-      )}
-      {/* Reject mode: feedback textarea */}
-      {mode === "reject" && (
-        <div style={{ padding: "10px 14px 6px" }}>
-          <textarea
-            value={feedback}
-            onChange={(e) => setFeedback(e.target.value)}
-            placeholder="Tell Claude what to change…"
-            autoFocus
-            style={{
-              width: "100%", minHeight: 72, boxSizing: "border-box",
-              background: "var(--bg-base)", border: "1px solid #7f1d1d", borderRadius: 4,
-              color: "var(--text-primary)", fontSize: 12.5, padding: "6px 10px",
-              resize: "vertical", outline: "none", fontFamily: "inherit", lineHeight: 1.5,
-            }}
-          />
-        </div>
-      )}
       {/* Actions */}
       <div style={{ padding: "8px 14px", display: "flex", gap: 8, justifyContent: "flex-end" }}>
-        {mode === "normal" && (
+        {confirm === "none" && (
           <>
-            <button onClick={() => setMode("reject")} style={{ ...baseBtn, background: "#3a1a1a", color: "#f87171", borderColor: "#7f1d1d" }}>Reject</button>
-            {body && <button onClick={() => setMode("edit")} style={{ ...baseBtn, background: "#1e0f44", color: "#c4b5fd", borderColor: "#4c1d95" }}>Edit</button>}
-            <button onClick={() => dismiss("Approved")} style={{ ...baseBtn, background: "#1a3a1a", color: "#4ade80", borderColor: "#166534" }}>Approve ✓</button>
+            <button onClick={() => setConfirm("reject")} style={{ ...baseBtn, background: "#3a1a1a", color: "#f87171", borderColor: "#7f1d1d" }}>Reject</button>
+            <button onClick={() => setConfirm("approve")} style={{ ...baseBtn, background: "#1a3a1a", color: "#4ade80", borderColor: "#166534" }}>Approve ✓</button>
           </>
         )}
-        {mode === "edit" && (
+        {confirm === "approve" && (
           <>
-            <button onClick={() => setMode("normal")} style={{ ...baseBtn, background: "var(--bg-hover)", color: "var(--text-secondary)", borderColor: "var(--border)" }}>Cancel</button>
-            <button onClick={() => dismiss(editedPlan.trim() || "Approved")} style={{ ...baseBtn, background: "#1a3a1a", color: "#4ade80", borderColor: "#166534" }}>Approve edited ✓</button>
+            <button onClick={() => setConfirm("none")} style={{ ...baseBtn, background: "var(--bg-hover)", color: "var(--text-secondary)", borderColor: "var(--border)" }}>Cancel</button>
+            <button onClick={() => submit("approve")} style={{ ...baseBtn, background: "#1a3a1a", color: "#4ade80", borderColor: "#166534" }}>Confirm Approve ✓</button>
           </>
         )}
-        {mode === "reject" && (
+        {confirm === "reject" && (
           <>
-            <button onClick={() => setMode("normal")} style={{ ...baseBtn, background: "var(--bg-hover)", color: "var(--text-secondary)", borderColor: "var(--border)" }}>Back</button>
-            <button onClick={() => dismiss(feedback.trim() || "Rejected")} style={{ ...baseBtn, background: "#3a1a1a", color: "#f87171", borderColor: "#7f1d1d" }}>Reject plan</button>
+            <button onClick={() => setConfirm("none")} style={{ ...baseBtn, background: "var(--bg-hover)", color: "var(--text-secondary)", borderColor: "var(--border)" }}>Cancel</button>
+            <button onClick={() => submit("reject")} style={{ ...baseBtn, background: "#3a1a1a", color: "#f87171", borderColor: "#7f1d1d" }}>Confirm Reject</button>
           </>
         )}
       </div>
@@ -4621,6 +4582,18 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                 requestAnimationFrame(() => scrollToBottom(true));
               };
 
+              // ExitPlanMode goes through a dedicated POST that drives the
+              // tmux modal directly (Down × n + Enter). The previous chat-
+              // channel path paste-buffered free text ("Approved"/"Rejected"),
+              // which matched no option — the trailing Enter then submitted
+              // the modal's default-highlighted option 1 (approve + bypass
+              // perms), so Reject was silently approving.
+              const submitPlanDecision = (decision: "approve" | "reject") => {
+                approvePlan(sessionId, decision).catch(() => {});
+                stickToBottom.current = true;
+                requestAnimationFrame(() => scrollToBottom(true));
+              };
+
               // ExitPlanMode (unanswered) — show plan approval card. Runs
               // independently of isLast/isStreaming so transient entries
               // landing after the assistant's ExitPlanMode (compact_boundary,
@@ -4653,7 +4626,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                         blockId={exitPlanBlock.id!}
                         planText={planText}
                         planPath={planPath}
-                        onSubmit={sendAnswer}
+                        onSubmit={submitPlanDecision}
                       />
                     </React.Fragment>
                   );

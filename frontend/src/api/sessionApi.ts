@@ -412,6 +412,13 @@ export function approveToolRequest(sessionId: string, decision: "allow" | "deny"
   });
 }
 
+export function approvePlan(sessionId: string, decision: "approve" | "reject"): Promise<{ ok: boolean }> {
+  return request(`/api/sessions/${sessionId}/plan-approve`, {
+    method: "POST",
+    body: JSON.stringify({ decision }),
+  });
+}
+
 export interface SessionStatusListResponse {
   items: SessionStatusItem[];
   total: number;
