@@ -5032,11 +5032,14 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
               wsStatus !== "connected" ||
               hasUnansweredAuq;
             const uploadDisabled = wsStatus !== "connected" || isUploadingAttachment;
-            // PC: 32×32 paired buttons, side-by-side, same border-radius / fontSize.
-            // Disabled treatment via opacity so both buttons read the same visual language.
+            // PC: 32×32 paired buttons. Side-by-side when textarea is short;
+            // stack vertically (attachment above send) once the textarea is
+            // tall enough to host both buttons + gap (≥72px). The transition
+            // keeps the bottom-aligned send button anchored in place.
+            const stack = inputHeight >= 72;
             return (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, flexShrink: 0 }}>
-                <div style={{ display: "flex", gap: 4 }}>
+                <div style={{ display: "flex", flexDirection: stack ? "column" : "row", gap: 4 }}>
                   <button
                     onClick={handlePickAttachment}
                     onPointerDown={(e) => e.preventDefault()}
