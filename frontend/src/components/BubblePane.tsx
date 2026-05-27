@@ -364,7 +364,7 @@ export function BubblePane({ sessionId, tool }: Props) {
                     display: "flex", alignItems: "center", justifyContent: "center",
                   }}
                   title="Sent history"
-                >🕐</button>
+                >↺</button>
                 <button
                   onClick={sendPrompt}
                   disabled={sendDisabled}

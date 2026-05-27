@@ -159,9 +159,6 @@ export function PromptHistoryPopover({
       e.stopPropagation();
       try {
         await deletePromptHistoryEntry(sessionId, id);
-        // Reload the current page so total + entries stay correct
-        // (deleting the last entry on a page would otherwise leave an
-        // empty page).
         loadPage(pageIndex, query);
       } catch (ex) {
         alert(ex instanceof Error ? ex.message : String(ex));
@@ -178,12 +175,19 @@ export function PromptHistoryPopover({
     [onPick, onClose],
   );
 
-  // Positioning. When a containerRect is supplied, the panel spans the
-  // chat area's full width and takes half its height, anchored just above
-  // the input bar. Without one, fall back to a viewport-sized bottom sheet
-  // (mobile) or a comfortable floating panel (PC).
+  // Positioning. Mobile fills the entire chat container; PC takes the
+  // upper half above the input bar. Without a container, fall back to a
+  // floating panel (PC) or a viewport bottom-sheet (mobile).
   let panelStyle: React.CSSProperties;
-  if (containerRect) {
+  if (mobile && containerRect) {
+    panelStyle = {
+      position: "fixed",
+      left: containerRect.left,
+      top: containerRect.top,
+      width: containerRect.width,
+      height: containerRect.height,
+    };
+  } else if (containerRect) {
     const halfHeight = Math.max(220, Math.round(containerRect.height / 2));
     const bottomOffset = anchorRect
       ? Math.max(8, window.innerHeight - anchorRect.top + 8)
@@ -215,17 +219,6 @@ export function PromptHistoryPopover({
     };
   }
 
-  const pagerProps: PagerProps = {
-    pageIndex,
-    totalPages,
-    total,
-    loading,
-    onFirst: goFirst,
-    onPrev: goPrev,
-    onNext: goNext,
-    onLast: goLast,
-  };
-
   return (
     <div
       ref={panelRef}
@@ -241,11 +234,16 @@ export function PromptHistoryPopover({
       }}
     >
       <div style={{
-        display: "flex", alignItems: "center", gap: 8,
-        padding: "8px 12px", borderBottom: "1px solid var(--text-faintest)",
+        display: "flex", alignItems: "center", gap: 6,
+        padding: mobile ? "6px 8px" : "8px 12px",
+        borderBottom: "1px solid var(--text-faintest)",
         fontSize: 12, color: "var(--text-secondary)",
       }}>
-        <span style={{ whiteSpace: "nowrap" }}>Sent history</span>
+        {!mobile && (
+          <span style={{ whiteSpace: "nowrap" }}>
+            Sent history{total > 0 ? ` · ${total}` : ""}
+          </span>
+        )}
         <input
           type="text"
           value={rawQuery}
@@ -260,6 +258,7 @@ export function PromptHistoryPopover({
             fontSize: 12,
             color: "var(--text-body)",
             outline: "none",
+            minWidth: 0,
           }}
         />
         {rawQuery && (
@@ -270,34 +269,36 @@ export function PromptHistoryPopover({
               fontSize: 12, cursor: "pointer", padding: "0 4px",
             }}
             title="Clear search"
-          >clear</button>
+          >×</button>
         )}
         <button
           onClick={onClose}
           style={{
-            background: "transparent", border: 0, color: "var(--text-secondary)",
-            fontSize: 14, cursor: "pointer", padding: "0 4px",
+            background: "transparent",
+            border: "1px solid var(--text-faintest)",
+            color: "var(--text-secondary)",
+            borderRadius: 4,
+            fontSize: 12,
+            cursor: "pointer",
+            padding: "1px 6px",
           }}
           title="Close"
-        >×</button>
+        >✕</button>
       </div>
-
-      {/* Sticky top pager — always visible while the list scrolls. */}
-      <PagerBar {...pagerProps} />
 
       <div ref={listRef} style={{ overflowY: "auto", flex: 1 }}>
         {entries === null && !err && (
-          <div style={{ padding: 16, fontSize: 12, color: "var(--text-faint)" }}>
+          <div style={{ padding: 12, fontSize: 12, color: "var(--text-faint)" }}>
             Loading…
           </div>
         )}
         {err && (
-          <div style={{ padding: 16, fontSize: 12, color: "#d33" }}>
+          <div style={{ padding: 12, fontSize: 12, color: "#d33" }}>
             {err}
           </div>
         )}
         {entries !== null && entries.length === 0 && !err && (
-          <div style={{ padding: 16, fontSize: 12, color: "var(--text-faint)" }}>
+          <div style={{ padding: 12, fontSize: 12, color: "var(--text-faint)" }}>
             {query
               ? `No prompts match "${query}".`
               : "No prompts sent yet in this session."}
@@ -308,22 +309,22 @@ export function PromptHistoryPopover({
             key={e.id}
             entry={e}
             query={query}
+            compact={mobile}
             onPick={() => handlePick(e.text)}
             onDelete={(ev) => handleDelete(e.id, ev)}
           />
         ))}
       </div>
 
-      {/* Bottom pager mirrors the top one so the user does not have to
-          scroll back up after reading a long page. */}
-      <PagerBar {...pagerProps} />
-
-      <div style={{
-        padding: "6px 12px", borderTop: "1px solid var(--text-faintest)",
-        fontSize: 10, color: "var(--text-faint)",
-      }}>
-        Click the → button to fill an entry back into the input box. It will NOT auto-send.
-      </div>
+      <PagerBar
+        pageIndex={pageIndex}
+        totalPages={totalPages}
+        loading={loading}
+        onFirst={goFirst}
+        onPrev={goPrev}
+        onNext={goNext}
+        onLast={goLast}
+      />
     </div>
   );
 }
@@ -331,7 +332,6 @@ export function PromptHistoryPopover({
 interface PagerProps {
   pageIndex: number;
   totalPages: number;
-  total: number;
   loading: boolean;
   onFirst: () => void;
   onPrev: () => void;
@@ -342,7 +342,6 @@ interface PagerProps {
 function PagerBar({
   pageIndex,
   totalPages,
-  total,
   loading,
   onFirst,
   onPrev,
@@ -359,22 +358,21 @@ function PagerBar({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        gap: 4,
-        padding: "6px 8px",
+        gap: 3,
+        padding: "4px 6px",
         borderTop: "1px solid var(--text-faintest)",
-        borderBottom: "1px solid var(--text-faintest)",
         background: "var(--bg-subtle, transparent)",
-        fontSize: 12,
+        fontSize: 11,
         color: "var(--text-secondary)",
       }}
     >
-      <PagerButton onClick={onFirst} disabled={atFirst || loading} title="First page">« First</PagerButton>
-      <PagerButton onClick={onPrev} disabled={atFirst || loading} title="Previous page">‹ Prev</PagerButton>
-      <span style={{ padding: "0 8px", whiteSpace: "nowrap" }}>
-        Page {displayPage} / {totalPages} · {total} total
+      <PagerButton onClick={onFirst} disabled={atFirst || loading} title="First page">«</PagerButton>
+      <PagerButton onClick={onPrev} disabled={atFirst || loading} title="Previous page">‹</PagerButton>
+      <span style={{ padding: "0 6px", whiteSpace: "nowrap", minWidth: 36, textAlign: "center" }}>
+        {displayPage} / {totalPages}
       </span>
-      <PagerButton onClick={onNext} disabled={atLast || loading} title="Next page">Next ›</PagerButton>
-      <PagerButton onClick={onLast} disabled={atLast || loading} title="Last page">Last »</PagerButton>
+      <PagerButton onClick={onNext} disabled={atLast || loading} title="Next page">›</PagerButton>
+      <PagerButton onClick={onLast} disabled={atLast || loading} title="Last page">»</PagerButton>
     </div>
   );
 }
@@ -400,10 +398,16 @@ function PagerButton({
         border: "1px solid var(--text-faintest)",
         color: disabled ? "var(--text-faint)" : "var(--text-body)",
         borderRadius: 4,
-        padding: "2px 8px",
+        width: 24,
+        height: 22,
+        padding: 0,
         fontSize: 12,
+        lineHeight: 1,
         cursor: disabled ? "default" : "pointer",
         opacity: disabled ? 0.5 : 1,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
       }}
     >{children}</button>
   );
@@ -412,11 +416,13 @@ function PagerButton({
 function HistoryRow({
   entry,
   query,
+  compact,
   onPick,
   onDelete,
 }: {
   entry: PromptHistoryEntry;
   query: string;
+  compact: boolean;
   onPick: () => void;
   onDelete: (e: React.MouseEvent) => void;
 }) {
@@ -426,17 +432,17 @@ function HistoryRow({
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
-        padding: "10px 14px",
+        padding: compact ? "8px 10px" : "10px 14px",
         borderBottom: "1px solid var(--text-faintest)",
         background: hover ? "var(--bg-hover)" : "transparent",
-        display: "flex", alignItems: "flex-start", gap: 10,
+        display: "flex", alignItems: "flex-start", gap: 8,
       }}
     >
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{
           fontSize: 11, color: "var(--text-faint)",
-          marginBottom: 4,
-          display: "flex", gap: 8, alignItems: "baseline",
+          marginBottom: 3,
+          display: "flex", gap: 6, alignItems: "baseline",
         }}>
           <span>{relTime(entry.sent_at)}</span>
           {absTime(entry.sent_at) && (
@@ -461,24 +467,27 @@ function HistoryRow({
       <div
         style={{
           flexShrink: 0,
-          display: "flex", flexDirection: "column", gap: 6,
+          display: "flex", flexDirection: "column", gap: 4,
           alignItems: "stretch",
         }}
       >
         <button
           onClick={(e) => { e.stopPropagation(); onPick(); }}
-          title="Fill this prompt into the input box"
+          title="Fill into the input box"
           style={{
             background: "var(--bg-base)",
             border: "1px solid var(--text-faintest)",
             color: "var(--text-body)",
             fontSize: 13,
             borderRadius: 6,
-            padding: "4px 10px",
+            width: 28, height: 26, padding: 0,
             cursor: "pointer",
-            whiteSpace: "nowrap",
+            lineHeight: 1,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
           }}
-        >→ Fill</button>
+        >→</button>
         <button
           onClick={onDelete}
           title="Delete this entry"
@@ -486,11 +495,14 @@ function HistoryRow({
             background: "transparent",
             border: 0,
             color: "var(--text-faint)",
-            fontSize: 14,
-            padding: "2px 4px",
+            fontSize: 12,
+            width: 28, height: 22, padding: 0,
             cursor: "pointer",
-            opacity: hover ? 1 : 0.5,
+            opacity: compact || hover ? 1 : 0.5,
             transition: "opacity 120ms",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
           }}
         >🗑</button>
       </div>

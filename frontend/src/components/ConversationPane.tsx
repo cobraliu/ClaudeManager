@@ -5064,7 +5064,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                     onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
                     onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-base)"; }}
                     title="Sent history — recover prompts the TUI ate"
-                  >🕐</button>
+                  >↺</button>
                   <button
                     onClick={handlePickAttachment}
                     onPointerDown={(e) => e.preventDefault()}
