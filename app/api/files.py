@@ -393,17 +393,27 @@ def read_file(
 MAX_DOWNLOAD_SIZE = 16 * 1024 * 1024   # 16 MB
 MAX_UPLOAD_SIZE   = 16 * 1024 * 1024   # 16 MB
 
-# Image uploads for in-chat AI analysis. Stored under
+# Attachment uploads for in-chat AI analysis (images for visual analysis,
+# any other file for the model to read/parse via Read). Stored under
 # <session.cwd>/.claude/uploads/ so they sit alongside other Claude tooling
 # state and are typically already gitignored. The absolute path is returned
 # to the frontend so it can inject `@<path>` into the next prompt — Claude
-# CLI's reference syntax then embeds the image content block.
-MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
+# CLI's reference syntax then embeds image content blocks for image
+# extensions, and the model reads non-image attachments via the Read tool.
+MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024  # 50 MB — matches MAX_TRANSFER_BYTES
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-IMAGE_UPLOAD_SUBDIR = Path(".claude") / "uploads"
-# Pattern matching the filenames upload_image writes: 32-hex uuid + ext.
-# Used as the load-bearing path-traversal guard for the serve endpoint.
+ATTACHMENT_UPLOAD_SUBDIR = Path(".claude") / "uploads"
+# Legacy aliases for the original image-only endpoint. Kept so older imports
+# don't break; new code should use the ATTACHMENT_* names.
+MAX_IMAGE_SIZE = MAX_ATTACHMENT_SIZE
+IMAGE_UPLOAD_SUBDIR = ATTACHMENT_UPLOAD_SUBDIR
+# Pattern matching the filenames serve_uploaded_image accepts: 32-hex uuid
+# + image extension. Load-bearing path-traversal guard for inline rendering.
 _IMAGE_FILENAME_RE = re.compile(r"^[a-f0-9]{32}\.(?:png|jpg|jpeg|gif|webp)$")
+# Allowed shape of a stored attachment extension: alphanumeric, ≤ 16 chars.
+# We sanitize at write time so the filename on disk is always safe to embed
+# in shell arguments / log lines and so `@<path>` stays parseable.
+_EXT_SANITIZE_RE = re.compile(r"[^A-Za-z0-9]")
 
 
 @router.get("/{session_id}/fs/raw")
@@ -509,15 +519,36 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/{session_id}/upload-image")
-async def upload_image(
+def _sanitize_attachment_ext(filename: str) -> str:
+    """Return the extension (with leading dot) we should store on disk.
+
+    Mirrors the original suffix exactly when it is purely alphanumeric and
+    ≤ 16 chars; otherwise we strip out non-alphanumeric chars and truncate.
+    An empty/missing suffix returns "" so the stored filename is just the
+    uuid hex — `@<path>` still works without an extension.
+    """
+    raw = Path(filename).suffix
+    if not raw:
+        return ""
+    # Drop the leading dot for sanitization, then re-add.
+    body = raw[1:].lower()
+    body = _EXT_SANITIZE_RE.sub("", body)
+    if not body:
+        return ""
+    return "." + body[:16]
+
+
+@router.post("/{session_id}/upload-attachment")
+async def upload_attachment(
     session_id: str,
     file: UploadFile = File(...),
     user_id: CurrentUser = None,  # type: ignore[assignment]
 ) -> dict:
-    """Upload an image for AI analysis. Stored under
-    <session.cwd>/.claude/uploads/<uuid>.<ext>; the absolute path is
-    returned so the frontend can inject `@<path>` into the next prompt."""
+    """Upload any file for AI analysis. Stored under
+    <session.cwd>/.claude/uploads/<uuid>.<ext> with the original extension
+    preserved; the absolute path is returned so the frontend can inject
+    `@<path>` into the next prompt. Image extensions additionally get a
+    `url` field for inline thumbnail rendering."""
     store = _get_store()
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
@@ -525,26 +556,16 @@ async def upload_image(
     if not file.filename:
         raise HTTPException(status_code=400, detail="filename required")
 
-    ext = Path(file.filename).suffix.lower()
-    if ext not in IMAGE_EXTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"unsupported image type {ext!r} (allowed: {sorted(IMAGE_EXTS)})",
-        )
-    # content_type check is defense in depth — extension is the load-bearing
-    # gate because browsers sometimes report application/octet-stream.
-    ctype = (file.content_type or "").lower()
-    if ctype and not ctype.startswith("image/"):
-        raise HTTPException(status_code=400, detail=f"content-type must be image/* (got {ctype!r})")
+    ext = _sanitize_attachment_ext(file.filename)
 
     content = await file.read()
-    if len(content) > MAX_IMAGE_SIZE:
+    if len(content) > MAX_ATTACHMENT_SIZE:
         raise HTTPException(
             status_code=413,
-            detail=f"image too large (>{MAX_IMAGE_SIZE // 1024 // 1024}MB)",
+            detail=f"file too large (>{MAX_ATTACHMENT_SIZE // 1024 // 1024}MB)",
         )
 
-    target_dir = Path(session.cwd).resolve() / IMAGE_UPLOAD_SUBDIR
+    target_dir = Path(session.cwd).resolve() / ATTACHMENT_UPLOAD_SUBDIR
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         stored_name = f"{uuid.uuid4().hex}{ext}"
@@ -553,16 +574,31 @@ async def upload_image(
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return {
+    is_image = ext in IMAGE_EXTS
+    result = {
         "path": str(target),
         "filename": file.filename,
         "stored_name": stored_name,
         "size": len(content),
+        "is_image": is_image,
+    }
+    if is_image:
         # Browsers can't send Authorization headers on <img src>, so the
         # frontend appends ?token=<jwt> at render time. The path here is
         # session-scoped and validates filename format on the way out.
-        "url": f"/api/sessions/{session_id}/uploaded-image/{stored_name}",
-    }
+        result["url"] = f"/api/sessions/{session_id}/uploaded-image/{stored_name}"
+    return result
+
+
+# Legacy image-only endpoint. Kept so older frontend bundles (image-only)
+# keep working; new code uses /upload-attachment.
+@router.post("/{session_id}/upload-image")
+async def upload_image(
+    session_id: str,
+    file: UploadFile = File(...),
+    user_id: CurrentUser = None,  # type: ignore[assignment]
+) -> dict:
+    return await upload_attachment(session_id, file, user_id)
 
 
 @router.get("/{session_id}/uploaded-image/{filename}")

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMe
 import { createPortal } from "react-dom";
 import hljs from "highlight.js/lib/common";
 import { marked, renderMarkdown } from "../lib/markdown";
-import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, uploadImage, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta, type UploadedImage } from "../api/sessionApi";
+import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, uploadAttachment, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta, type UploadedAttachment } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
 import { apiPath } from "../lib/baseUrl";
 import {
@@ -276,7 +276,7 @@ function normalizeBreaks(s: string): string {
 // `.claude/uploads/<stored_name>` matters for rebuilding the serve URL.
 const UPLOADED_IMAGE_REF_RE = /^@(.+\/\.claude\/uploads\/([a-f0-9]{32}\.(?:png|jpg|jpeg|gif|webp)))\s*$/;
 
-function buildUploadedImageUrl(sessionId: string, storedName: string): string {
+function buildUploadedAttachmentUrl(sessionId: string, storedName: string): string {
   const token = localStorage.getItem("token") || "";
   return apiPath(`/api/sessions/${sessionId}/uploaded-image/${storedName}?token=${encodeURIComponent(token)}`);
 }
@@ -302,7 +302,7 @@ function renderPromptWithImages(text: string, sessionId: string): React.ReactNod
       parts.push(
         <img
           key={`img${i}`}
-          src={buildUploadedImageUrl(sessionId, storedName)}
+          src={buildUploadedAttachmentUrl(sessionId, storedName)}
           alt="attached"
           style={{ display: "block", maxWidth: "100%", maxHeight: 300, borderRadius: 6, marginTop: parts.length > 0 ? 8 : 0 }}
         />
@@ -3726,16 +3726,16 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   // Pending image uploads — attached to the next prompt and rendered as
   // chips above the textarea. Cleared on send. Holds the upload response
   // so we have the absolute path that gets injected as `@<path>`.
-  const [pendingImages, setPendingImages] = useState<UploadedImage[]>([]);
-  const [imageUploadError, setImageUploadError] = useState<string | null>(null);
-  const [isUploadingImage, setIsUploadingImage] = useState(false);
+  const [pendingAttachments, setPendingAttachments] = useState<UploadedAttachment[]>([]);
+  const [attachmentUploadError, setAttachmentUploadError] = useState<string | null>(null);
+  const [isUploadingAttachment, setIsUploadingAttachment] = useState(false);
   const wsRef = useRef<WsClient | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const loadMoreAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
   const seenCompactUuidsRef = useRef<Set<string>>(new Set());
   // Input height resizable via top-edge grip (drag up to enlarge).
   const [inputHeight, setInputHeight] = useState<number>(() => loadInputHeight(sessionId));
@@ -4409,7 +4409,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     const textPart = input.trim();
     // Allow image-only sends: if user only attached images without typing,
     // still send so Claude has something to analyze.
-    if (!textPart && pendingImages.length === 0) return;
+    if (!textPart && pendingAttachments.length === 0) return;
     if (!wsRef.current || wsStatus !== "connected") return;
     if (hasUnansweredAuq) return;  // Ink would eat the keystrokes — see hasUnansweredAuq comment.
     // wsStatus is a React state set from onClose, so it lags real readyState
@@ -4417,12 +4417,12 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     // the optimistic bubble, clear the input, then drop the WS send — the
     // user sees "sending..." for 120s and loses their draft.
     if (!wsRef.current.isOpen()) return;
-    // Append `@<abs-path>` references for any attached images. Claude CLI
-    // parses the `@` syntax and embeds the image as a content block; if it
-    // fails to resolve, the model still sees the path and can call Read.
-    const imageRefs = pendingImages.map((img) => `@${img.path}`).join("\n");
-    const text = imageRefs
-      ? (textPart ? `${textPart}\n\n${imageRefs}` : imageRefs)
+    // Append `@<abs-path>` references for any attached files. Claude CLI
+    // parses the `@` syntax — for images it embeds an image content block;
+    // for other files the model sees the path and uses the Read tool.
+    const attachmentRefs = pendingAttachments.map((att) => `@${att.path}`).join("\n");
+    const text = attachmentRefs
+      ? (textPart ? `${textPart}\n\n${attachmentRefs}` : attachmentRefs)
       : textPart;
     // Optimistic: show immediately before JSONL poll confirms it
     setOptimisticMsgs((prev) => [
@@ -4430,48 +4430,48 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
       { id: _randomId(), text, sentAt: Date.now(), status: "pending" },
     ]);
     setInput("");
-    setPendingImages([]);
-    setImageUploadError(null);
+    setPendingAttachments([]);
+    setAttachmentUploadError(null);
     inputDrafts.delete(sessionId);
     clearDraft(sessionId);
     wsRef.current.sendPrompt(text);
     stickToBottom.current = true;
     requestAnimationFrame(() => scrollToBottom(false));
-  }, [input, wsStatus, hasUnansweredAuq, scrollToBottom, pendingImages, sessionId]);
+  }, [input, wsStatus, hasUnansweredAuq, scrollToBottom, pendingAttachments, sessionId]);
 
   const stopResponse = useCallback(() => {
     if (!wsRef.current) return;
     wsRef.current.sendInput("\x03");
   }, []);
 
-  const handlePickImage = useCallback(() => {
-    imageInputRef.current?.click();
+  const handlePickAttachment = useCallback(() => {
+    attachmentInputRef.current?.click();
   }, []);
 
-  const handleImageFiles = useCallback(async (files: FileList | null) => {
+  const handleAttachmentFiles = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    setImageUploadError(null);
-    setIsUploadingImage(true);
+    setAttachmentUploadError(null);
+    setIsUploadingAttachment(true);
     try {
       // Sequential upload — keeps the order of chips matching the user's
       // selection order, and small images are fast enough that parallel
       // upload isn't worth the complexity here.
       for (const f of Array.from(files)) {
         try {
-          const uploaded = await uploadImage(sessionId, f);
-          setPendingImages((prev) => [...prev, uploaded]);
+          const uploaded = await uploadAttachment(sessionId, f);
+          setPendingAttachments((prev) => [...prev, uploaded]);
         } catch (e) {
-          setImageUploadError(e instanceof Error ? e.message : String(e));
+          setAttachmentUploadError(e instanceof Error ? e.message : String(e));
           break;
         }
       }
     } finally {
-      setIsUploadingImage(false);
+      setIsUploadingAttachment(false);
     }
   }, [sessionId]);
 
-  const removePendingImage = useCallback((path: string) => {
-    setPendingImages((prev) => prev.filter((p) => p.path !== path));
+  const removePendingAttachment = useCallback((path: string) => {
+    setPendingAttachments((prev) => prev.filter((p) => p.path !== path));
   }, []);
 
   const resendLostMsg = useCallback((id: string, text: string) => {
@@ -4933,26 +4933,26 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
         >
           <div style={{ width: 40, height: 3, borderRadius: 2, background: "var(--text-faintest)" }} />
         </div>
-        {/* Hidden file input for image attach — triggered by 📎 button below. */}
+        {/* Hidden file input for attachment upload — triggered by 📎 button below. */}
         <input
-          ref={imageInputRef}
+          ref={attachmentInputRef}
           type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
+          accept="*/*"
           multiple
           style={{ display: "none" }}
           onChange={(e) => {
             const files = e.target.files;
-            void handleImageFiles(files);
+            void handleAttachmentFiles(files);
             // Reset so selecting the same file again re-fires onChange
             if (e.target) e.target.value = "";
           }}
         />
-        {(pendingImages.length > 0 || imageUploadError) && (
+        {(pendingAttachments.length > 0 || attachmentUploadError) && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 12px 6px", alignItems: "center" }}>
-            {pendingImages.map((img) => (
+            {pendingAttachments.map((att) => (
               <span
-                key={img.path}
-                title={`${img.filename} — ${img.path}`}
+                key={att.path}
+                title={`${att.filename} — ${att.path}`}
                 style={{
                   display: "inline-flex", alignItems: "center", gap: 4,
                   background: "var(--bg-hover)", border: "1px solid var(--text-faintest)",
@@ -4960,19 +4960,30 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                   color: "var(--text-body)", maxWidth: 240,
                 }}
               >
-                <img
-                  src={buildUploadedImageUrl(sessionId, img.stored_name)}
-                  alt={img.filename}
-                  style={{
-                    width: 28, height: 28, objectFit: "cover", borderRadius: 4,
-                    flexShrink: 0,
-                  }}
-                />
+                {att.is_image && att.url ? (
+                  <img
+                    src={buildUploadedAttachmentUrl(sessionId, att.stored_name)}
+                    alt={att.filename}
+                    style={{
+                      width: 28, height: 28, objectFit: "cover", borderRadius: 4,
+                      flexShrink: 0,
+                    }}
+                  />
+                ) : (
+                  <span
+                    style={{
+                      width: 28, height: 28, borderRadius: 4, flexShrink: 0,
+                      background: "var(--bg-base)", border: "1px solid var(--text-faintest)",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      fontSize: 14,
+                    }}
+                  >📄</span>
+                )}
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {img.filename}
+                  {att.filename}
                 </span>
                 <button
-                  onClick={() => removePendingImage(img.path)}
+                  onClick={() => removePendingAttachment(att.path)}
                   title="Remove"
                   style={{
                     background: "transparent", border: "none", color: "var(--text-faint)",
@@ -4981,9 +4992,9 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                 >×</button>
               </span>
             ))}
-            {imageUploadError && (
+            {attachmentUploadError && (
               <span style={{ fontSize: 11, color: "#f85149" }}>
-                upload failed: {imageUploadError}
+                upload failed: {attachmentUploadError}
               </span>
             )}
           </div>
@@ -5017,14 +5028,14 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
           />
           {(() => {
             const sendDisabled =
-              (!input.trim() && pendingImages.length === 0) ||
+              (!input.trim() && pendingAttachments.length === 0) ||
               wsStatus !== "connected" ||
               hasUnansweredAuq;
-            const uploadDisabled = wsStatus !== "connected" || isUploadingImage;
+            const uploadDisabled = wsStatus !== "connected" || isUploadingAttachment;
             return (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flexShrink: 0 }}>
                 <button
-                  onClick={handlePickImage}
+                  onClick={handlePickAttachment}
                   onPointerDown={(e) => e.preventDefault()}
                   disabled={uploadDisabled}
                   style={{
@@ -5035,8 +5046,8 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                     cursor: uploadDisabled ? "default" : "pointer",
                     display: "flex", alignItems: "center", justifyContent: "center",
                   }}
-                  title={isUploadingImage ? "Uploading…" : "Attach image (PNG/JPG/GIF/WebP, ≤10MB)"}
-                >{isUploadingImage ? "…" : "📎"}</button>
+                  title={isUploadingAttachment ? "Uploading…" : "Attach file (any type, ≤50MB)"}
+                >{isUploadingAttachment ? "…" : "📎"}</button>
                 <button
                   onClick={sendPrompt}
                   onPointerDown={(e) => e.preventDefault()}
