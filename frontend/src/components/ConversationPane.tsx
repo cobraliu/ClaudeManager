@@ -4948,7 +4948,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
           }}
         />
         {(pendingAttachments.length > 0 || attachmentUploadError) && (
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 12px 6px", alignItems: "center" }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, padding: "0 10px 4px", alignItems: "center" }}>
             {pendingAttachments.map((att) => (
               <span
                 key={att.path}
@@ -4965,17 +4965,17 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                     src={buildUploadedAttachmentUrl(sessionId, att.stored_name)}
                     alt={att.filename}
                     style={{
-                      width: 28, height: 28, objectFit: "cover", borderRadius: 4,
+                      width: 24, height: 24, objectFit: "cover", borderRadius: 4,
                       flexShrink: 0,
                     }}
                   />
                 ) : (
                   <span
                     style={{
-                      width: 28, height: 28, borderRadius: 4, flexShrink: 0,
+                      width: 24, height: 24, borderRadius: 4, flexShrink: 0,
                       background: "var(--bg-base)", border: "1px solid var(--text-faintest)",
                       display: "flex", alignItems: "center", justifyContent: "center",
-                      fontSize: 14,
+                      fontSize: 13,
                     }}
                   >📄</span>
                 )}
@@ -4999,7 +4999,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
             )}
           </div>
         )}
-        <div style={{ display: "flex", gap: 8, alignItems: "flex-end", padding: "2px 12px 10px" }}>
+        <div style={{ display: "flex", gap: 6, alignItems: "flex-end", padding: "2px 10px 8px" }}>
           <textarea
             ref={textareaRef}
             value={input}
@@ -5032,36 +5032,49 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
               wsStatus !== "connected" ||
               hasUnansweredAuq;
             const uploadDisabled = wsStatus !== "connected" || isUploadingAttachment;
+            // PC: 32×32 paired buttons, side-by-side, same border-radius / fontSize.
+            // Disabled treatment via opacity so both buttons read the same visual language.
             return (
-              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flexShrink: 0 }}>
-                <button
-                  onClick={handlePickAttachment}
-                  onPointerDown={(e) => e.preventDefault()}
-                  disabled={uploadDisabled}
-                  style={{
-                    background: "var(--bg-hover)",
-                    color: uploadDisabled ? "var(--text-faint)" : "var(--text-body)",
-                    border: "1px solid var(--text-faintest)", borderRadius: 6,
-                    width: 28, height: 28, fontSize: 13,
-                    cursor: uploadDisabled ? "default" : "pointer",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                  }}
-                  title={isUploadingAttachment ? "Uploading…" : "Attach file (any type, ≤50MB)"}
-                >{isUploadingAttachment ? "…" : "📎"}</button>
-                <button
-                  onClick={sendPrompt}
-                  onPointerDown={(e) => e.preventDefault()}
-                  disabled={sendDisabled}
-                  style={{
-                    background: sendDisabled ? "var(--bg-hover)" : "#238636",
-                    color: sendDisabled ? "var(--text-faint)" : "#fff",
-                    border: "none", borderRadius: 6,
-                    width: 34, height: 34, fontSize: 15,
-                    cursor: sendDisabled ? "default" : "pointer",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                  }}
-                  title={hasUnansweredAuq ? "Answer the question above first" : "Send (Ctrl+Enter)"}
-                >↑</button>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, flexShrink: 0 }}>
+                <div style={{ display: "flex", gap: 4 }}>
+                  <button
+                    onClick={handlePickAttachment}
+                    onPointerDown={(e) => e.preventDefault()}
+                    disabled={uploadDisabled}
+                    style={{
+                      background: "var(--bg-base)",
+                      color: "var(--text-body)",
+                      border: "1px solid var(--text-faintest)", borderRadius: 8,
+                      width: 32, height: 32, fontSize: 14,
+                      cursor: uploadDisabled ? "default" : "pointer",
+                      opacity: uploadDisabled ? 0.45 : 1,
+                      transition: "background 120ms",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                    }}
+                    onMouseEnter={(e) => { if (!uploadDisabled) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-base)"; }}
+                    title={isUploadingAttachment ? "Uploading…" : "Attach file (any type, ≤50MB)"}
+                  >{isUploadingAttachment ? "…" : "📎"}</button>
+                  <button
+                    onClick={sendPrompt}
+                    onPointerDown={(e) => e.preventDefault()}
+                    disabled={sendDisabled}
+                    style={{
+                      background: sendDisabled ? "var(--bg-hover)" : "#238636",
+                      color: sendDisabled ? "var(--text-faint)" : "#fff",
+                      border: sendDisabled ? "1px solid var(--text-faintest)" : "1px solid #238636",
+                      borderRadius: 8,
+                      width: 32, height: 32, fontSize: 14,
+                      cursor: sendDisabled ? "default" : "pointer",
+                      opacity: sendDisabled ? 0.6 : 1,
+                      transition: "background 120ms",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                    }}
+                    onMouseEnter={(e) => { if (!sendDisabled) e.currentTarget.style.background = "#2ea043"; }}
+                    onMouseLeave={(e) => { if (!sendDisabled) e.currentTarget.style.background = "#238636"; }}
+                    title={hasUnansweredAuq ? "Answer the question above first" : "Send (Ctrl+Enter)"}
+                  >↑</button>
+                </div>
                 <span style={{ fontSize: 9, color: wsColor }}>{wsLabel}</span>
               </div>
             );

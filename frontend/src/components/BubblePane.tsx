@@ -315,8 +315,8 @@ export function BubblePane({ sessionId, tool }: Props) {
       </div>
 
       {/* Input bar */}
-      <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)", background: "var(--bg-surface)", padding: "8px 12px 10px" }}>
-        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+      <div style={{ flexShrink: 0, borderTop: "1px solid var(--bg-hover)", background: "var(--bg-surface)", padding: "6px 10px 8px" }}>
+        <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
           <textarea
             ref={textareaRef}
             value={input}
@@ -329,8 +329,8 @@ export function BubblePane({ sessionId, tool }: Props) {
               flex: 1,
               background: "var(--bg-base)",
               border: "1px solid var(--text-faintest)",
-              borderRadius: 10,
-              padding: "8px 12px",
+              borderRadius: 8,
+              padding: "7px 11px",
               color: "var(--text-body)",
               fontSize: 13,
               resize: "none",
@@ -340,27 +340,34 @@ export function BubblePane({ sessionId, tool }: Props) {
               opacity: wsStatus !== "connected" ? 0.5 : 1,
             }}
           />
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flexShrink: 0 }}>
-            <button
-              onClick={sendPrompt}
-              disabled={!input.trim() || wsStatus !== "connected"}
-              style={{
-                background: !input.trim() || wsStatus !== "connected" ? "var(--bg-hover)" : "#238636",
-                color: !input.trim() || wsStatus !== "connected" ? "var(--text-faint)" : "#fff",
-                border: "none",
-                borderRadius: 8,
-                width: 36,
-                height: 36,
-                fontSize: 16,
-                cursor: !input.trim() || wsStatus !== "connected" ? "default" : "pointer",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-              title="Send (Ctrl+Enter)"
-            >↑</button>
-            <span style={{ fontSize: 9, color: wsColor }}>{wsLabel}</span>
-          </div>
+          {(() => {
+            const sendDisabled = !input.trim() || wsStatus !== "connected";
+            return (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, flexShrink: 0 }}>
+                <button
+                  onClick={sendPrompt}
+                  disabled={sendDisabled}
+                  style={{
+                    background: sendDisabled ? "var(--bg-hover)" : "#238636",
+                    color: sendDisabled ? "var(--text-faint)" : "#fff",
+                    border: sendDisabled ? "1px solid var(--text-faintest)" : "1px solid #238636",
+                    borderRadius: 8,
+                    width: 36,
+                    height: 36,
+                    fontSize: 16,
+                    cursor: sendDisabled ? "default" : "pointer",
+                    opacity: sendDisabled ? 0.6 : 1,
+                    transition: "background 120ms",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                  title="Send (Ctrl+Enter)"
+                >↑</button>
+                <span style={{ fontSize: 9, color: wsColor }}>{wsLabel}</span>
+              </div>
+            );
+          })()}
         </div>
       </div>
     </div>
