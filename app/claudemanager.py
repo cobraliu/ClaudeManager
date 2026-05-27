@@ -25,6 +25,7 @@ from app.api import files as files_api
 from app.api import fs as fs_api
 from app.api import memory as memory_api
 from app.api import sessions as sessions_api
+from app.api import server_forward as server_forward_api
 from app.api import usage_api
 from app.config import (
     get_claude_bin,
@@ -735,6 +736,7 @@ app.include_router(shell_ws.router)
 app.include_router(term_ws.router)
 app.include_router(terminals_api.router)
 app.include_router(admin_terminals_api.router)
+app.include_router(server_forward_api.router)
 
 
 @app.get("/health")
