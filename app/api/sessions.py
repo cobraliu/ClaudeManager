@@ -756,6 +756,10 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
         pid_state = get_pid_waiting_state(s.claude_proc_pid) if s.status == SessionStatus.RUNNING else None
         tui_auq_data: dict | None = None
         tui_approve_data: dict | None = None
+        # Plan-modal TUI signal: set when PID is waiting AND the visible screen
+        # shows the ExitPlanMode modal. Merged below with the JSONL-based plan
+        # detection — either signal is enough to surface the badge.
+        tui_plan_pending_via_screen = False
         if pid_state:
             hook_entry = _read_session_hooks(s.agent_session_id) if s.agent_session_id else {"auq": None, "approve": None}
             if pid_state[1] == "auq":
@@ -765,17 +769,47 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
                     if screen:
                         tui_auq_data = parse_auq_from_screen(screen)
             elif pid_state[1] == "approve":
-                # Under --dangerously-skip-permissions (always set by ClaudeManager
-                # in tmux_service.py) Claude CLI still briefly writes the tool name
-                # to ~/.claude/sessions/{pid}.json:waitingFor while it's executing
-                # a tool — even though no approval prompt is actually rendered.
-                # Combined with the hook file's "approve" slot (which is just the
-                # most recent non-AUQ tool call, with no resolved-check), this
-                # produces a ghost approval card. Verify the approval widget is
-                # actually on screen before surfacing it.
+                # `waitingFor: "permission prompt"` is a generic flag covering at
+                # least three on-screen modals; we disambiguate by scanning the
+                # visible pane. Without on-screen confirmation we'd surface ghost
+                # cards because under --dangerously-skip-permissions (always set
+                # in tmux_service.py) the CLI briefly writes a tool name to the
+                # PID file while *executing* a tool, with no actual modal drawn.
+                #
+                # Known modal fingerprints (visible-pane substrings):
+                #   1. "Claude has written up a plan"
+                #        → ExitPlanMode plan-approval modal. Sets the plan flag;
+                #          merged with the JSONL-based check below so that a
+                #          re-rendered modal (after a prior decision was already
+                #          settled in JSONL) still surfaces the badge. Must be
+                #          tested FIRST since plan-modal options also start with
+                #          "❯ 1. Yes, ..." and would otherwise match the generic
+                #          numbered-modal fingerprint below.
+                #   2. "Claude wants to use"
+                #        → legacy generic tool-approval modal (rare under skip-
+                #          permissions, but still happens for some tools).
+                #   3. Numbered-option modal: "Esc to cancel" footer + an arrow
+                #      pointing at `1. Yes` — covers
+                #        • high-risk "Approve only if you trust it" bash
+                #          escalation (Anthropic's safety floor that the skip
+                #          flag intentionally cannot bypass);
+                #        • Write/Edit "Do you want to create XYZ?" 3-option
+                #          dialog with `Yes / Yes, allow all edits / No`.
+                #      For both #2 and #3 we surface the same hook-file entry;
+                #      the frontend cares about tool_name + tool_input, not the
+                #      modal flavor.
                 screen = tmux.capture_visible_screen(s.tmux_session_name)
-                if screen and "Claude wants to use" in screen:
-                    tui_approve_data = hook_entry.get("approve")
+                if screen:
+                    if "Claude has written up a plan" in screen:
+                        tui_plan_pending_via_screen = True
+                    elif (
+                        "Claude wants to use" in screen
+                        or (
+                            "Esc to cancel" in screen
+                            and re.search(r"❯\s*1\.\s*Yes", screen)
+                        )
+                    ):
+                        tui_approve_data = hook_entry.get("approve")
         # Fallback path: AUQ from hooks when the PID file didn't flag waiting.
         # We only consider a hook AUQ "pending" if its tool_use_id has no
         # corresponding tool_result in the JSONL yet.
@@ -854,11 +888,18 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
                 is_compacting = True
                 compacting_progress = pct
                 break
-        # Plan-approval attention: scan JSONL for ExitPlanMode tool_use without
-        # a matching tool_result. Cheap (mtime-cached) and covers sessions
-        # nobody has attached to.
-        tui_plan_pending = False
-        if eligible and s.agent_session_id:
+        # Plan-approval attention. Two independent signals; either one fires
+        # the badge:
+        #   (a) JSONL — ExitPlanMode tool_use without a matching tool_result.
+        #       Cheap (mtime-cached) and works for unattended sessions that
+        #       nobody has the TUI open for.
+        #   (b) Visible screen — set above when the pane shows the plan modal.
+        #       Catches the case where JSONL already has tool_result (decision
+        #       was logged) but the CLI re-rendered the modal and is still
+        #       blocking on input (e.g. user dismissed the feedback input box
+        #       via Esc, sending the user back to the original modal).
+        tui_plan_pending = tui_plan_pending_via_screen
+        if not tui_plan_pending and eligible and s.agent_session_id:
             try:
                 tui_plan_pending = _pending_plan_from_jsonl(s.agent_session_id, s.cwd)
             except Exception:
@@ -2740,23 +2781,67 @@ class _ToolApproveBody(BaseModel):
 
 @router.post("/{session_id}/tool-approve")
 def tool_approve(session_id: str, body: _ToolApproveBody, user_id: CurrentUser) -> dict:
-    """Approve or deny a pending tool permission request from Chat mode."""
+    """Approve or deny a pending tool permission request from Chat mode.
+
+    The CLI shows two families of permission modal that share the same PID
+    `waitingFor: "permission prompt"` state but take different keystrokes.
+    We capture the pane once and dispatch on the on-screen fingerprint.
+
+    1. Legacy modal — pane contains "Claude wants to use ...":
+       y/n keyboard shortcuts + Enter.
+
+    2. Numbered-option modals — pane footer contains "Esc to cancel" and the
+       body is an arrow-list like `❯ 1. Yes / 2. No` (or 3-option variant
+       `1. Yes / 2. Yes, allow all edits / 3. No` for Write/Edit, or the
+       high-risk warning "Approve only if you trust it" for bash with shell
+       redirects / curl|sh / cross-dir cd — Anthropic's safety floor that
+       `--dangerously-skip-permissions` cannot bypass). Selection defaults
+       to option 1, so:
+         Allow → Enter (confirms the default Yes)
+         Deny  → Down × (N_no − 1) + Enter, where N_no is the line number
+                 of the option whose label starts with "No" — parsed from
+                 the screen so 2-option and 3-option layouts both work.
+
+    Sending `y`/`n` to a numbered modal silently drops the letter, and Enter
+    then confirms the default-highlighted Yes — Deny would execute as Allow,
+    which is a safety bug. If neither fingerprint matches we refuse to send
+    keys at all (409 Conflict) rather than risk hitting a default-Yes.
+    """
     store = _get_store()
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
         raise HTTPException(status_code=404, detail="session not found")
     tmux = _get_tmux()
     pane = f"{session.tmux_session_name}:0.0"
-    if body.decision == "allow":
-        # Claude Code approve dialog: press "y" then Enter
-        tmux._run("send-keys", "-t", pane, "y")
+    screen = tmux.capture_visible_screen(session.tmux_session_name) or ""
+    if "Claude wants to use" in screen:
+        # Legacy modal: y/n shortcuts.
+        key = "y" if body.decision == "allow" else "n"
+        tmux._run("send-keys", "-t", pane, key)
         time.sleep(0.05)
         tmux._run("send-keys", "-t", pane, "Enter")
+    elif "Esc to cancel" in screen and re.search(r"❯\s*1\.\s*Yes", screen):
+        if body.decision == "allow":
+            tmux._run("send-keys", "-t", pane, "Enter")
+        else:
+            # Locate the "No" line in the numbered list — it sits at index 2
+            # in 2-option modals and index 3 in 3-option modals.
+            no_match = re.search(r"^\s*(\d+)\.\s+No\b", screen, re.MULTILINE)
+            if not no_match:
+                raise HTTPException(
+                    status_code=409,
+                    detail="numbered modal detected but 'No' option not found",
+                )
+            no_idx = int(no_match.group(1))
+            for _ in range(no_idx - 1):
+                tmux._run("send-keys", "-t", pane, "Down")
+                time.sleep(0.05)
+            tmux._run("send-keys", "-t", pane, "Enter")
     else:
-        # Deny: press "n" then Enter (or Escape)
-        tmux._run("send-keys", "-t", pane, "n")
-        time.sleep(0.05)
-        tmux._run("send-keys", "-t", pane, "Enter")
+        raise HTTPException(
+            status_code=409,
+            detail="no recognized tool-approval modal is currently displayed",
+        )
     return {"ok": True}
 
 
