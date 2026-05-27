@@ -39,7 +39,6 @@ import {
 } from "../api/sessionApi";
 // SessionMeta used for fileEditorSession state
 import { TuiPane } from "../components/TuiPane";
-import { BubblePane } from "../components/BubblePane";
 import { ConversationPane } from "../components/ConversationPane";
 import { CodePane, FileViewerPane, FileSidePanel, ScratchEditorPane } from "../components/CodePane";
 import { SessionCard, PromptText } from "../components/SessionCard";

@@ -17,6 +17,7 @@ import {
   DRAFT_HEARTBEAT_MS,
   DRAFT_CLEANUP_MS,
 } from "../lib/sessionInputPersist";
+import { PromptHistoryPopover } from "./PromptHistoryPopover";
 
 const POLL_MS = 1500;
 const DEFAULT_TAIL = 100;
@@ -3736,6 +3737,9 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
+  const paneContainerRef = useRef<HTMLDivElement>(null);
+  const [historyPopover, setHistoryPopover] = useState<{ rect: DOMRect | null; container: DOMRect | null } | null>(null);
   const seenCompactUuidsRef = useRef<Set<string>>(new Set());
   // Input height resizable via top-edge grip (drag up to enlarge).
   const [inputHeight, setInputHeight] = useState<number>(() => loadInputHeight(sessionId));
@@ -4532,7 +4536,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const canLoadMore = total > tail;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)", position: "relative" }}>
+    <div ref={paneContainerRef} style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", background: "var(--bg-base)", position: "relative" }}>
       {/* Lost-prompt toast (appears once per lost transition; 3s auto-dismiss) */}
       {lostToast && (
         <div style={{
@@ -5041,6 +5045,27 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, flexShrink: 0 }}>
                 <div style={{ display: "flex", flexDirection: stack ? "column" : "row", gap: 4 }}>
                   <button
+                    ref={historyButtonRef}
+                    onClick={() => {
+                      const rect = historyButtonRef.current?.getBoundingClientRect() ?? null;
+                      const container = paneContainerRef.current?.getBoundingClientRect() ?? null;
+                      setHistoryPopover(historyPopover ? null : { rect, container });
+                    }}
+                    onPointerDown={(e) => e.preventDefault()}
+                    style={{
+                      background: "var(--bg-base)",
+                      color: "var(--text-body)",
+                      border: "1px solid var(--text-faintest)", borderRadius: 8,
+                      width: 32, height: 32, fontSize: 14,
+                      cursor: "pointer",
+                      transition: "background 120ms",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-base)"; }}
+                    title="Sent history — recover prompts the TUI ate"
+                  >↺</button>
+                  <button
                     onClick={handlePickAttachment}
                     onPointerDown={(e) => e.preventDefault()}
                     disabled={uploadDisabled}
@@ -5084,6 +5109,20 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
           })()}
         </div>
       </div>}
+      {historyPopover && (
+        <PromptHistoryPopover
+          sessionId={sessionId}
+          anchorRect={historyPopover.rect}
+          containerRect={historyPopover.container}
+          mobile={typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches}
+          onPick={(text) => {
+            setInput(text);
+            try { saveDraft(sessionId, text); } catch {}
+            textareaRef.current?.focus();
+          }}
+          onClose={() => setHistoryPopover(null)}
+        />
+      )}
     </div>
   );
 }

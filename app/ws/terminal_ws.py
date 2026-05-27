@@ -286,6 +286,18 @@ async def terminal_ws(
                     #       as one message.
                     needs_enter = data.endswith(("\r", "\n"))
                     if text_part or needs_enter:
+                        # Record the outgoing prompt so the user can fish it
+                        # back out from the history panel if the TUI eats it
+                        # (auto-compact races, paste hiccups, etc.). Only the
+                        # real text content gets stored — bare-Enter presses
+                        # and AUQ-rejected sends never reach this branch.
+                        if text_part:
+                            try:
+                                store.append_prompt_history(
+                                    session_id, text_part, time.time(), str(msg.pane)
+                                )
+                            except Exception:
+                                logger.exception("append_prompt_history failed")
                         buf_name = f"cm-{session_id[:8]}-{int(time.time() * 1000)}"
                         try:
                             if text_part:

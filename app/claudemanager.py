@@ -42,6 +42,7 @@ from app.models.user import UserRole
 from app.models.session import SessionStatus
 from app.observability import configure_logging
 from app.services.bash_term_service import TerminalManager
+from app.services.prompt_history_backfill import run_loop as prompt_history_backfill_loop
 from app.services.proxy_tap_cleanup import run_once as proxy_tap_cleanup_once
 from app.services.session_store import SessionStore
 from app.services.tmux_service import TmuxService
@@ -671,11 +672,16 @@ async def lifespan(app: FastAPI):
                 logger.exception("proxy_tap cleanup error")
             await asyncio.sleep(30)
 
+    prompt_backfill_stop = asyncio.Event()
     watchdog = asyncio.create_task(_session_watchdog())
     scheduler = asyncio.create_task(_task_scheduler())
     proxy_tap_cleaner = asyncio.create_task(_proxy_tap_cleanup_loop())
+    prompt_backfill = asyncio.create_task(
+        prompt_history_backfill_loop(session_store, prompt_backfill_stop)
+    )
     yield
-    for t in (watchdog, scheduler, proxy_tap_cleaner):
+    prompt_backfill_stop.set()
+    for t in (watchdog, scheduler, proxy_tap_cleaner, prompt_backfill):
         t.cancel()
         try:
             await t

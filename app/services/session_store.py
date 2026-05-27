@@ -72,6 +72,18 @@ CREATE TABLE IF NOT EXISTS session_views (
     last_viewed_at TEXT NOT NULL,
     PRIMARY KEY (session_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS prompt_history (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    sent_at    REAL NOT NULL,
+    pane       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_history_session ON prompt_history(session_id, sent_at DESC);
+CREATE TABLE IF NOT EXISTS prompt_history_backfill (
+    session_id   TEXT PRIMARY KEY,
+    completed_at REAL NOT NULL
+);
 """
 
 
@@ -523,6 +535,12 @@ class SessionStore:
             self._conn.execute(
                 "DELETE FROM session_views WHERE session_id = ?", (session_id,)
             )
+            self._conn.execute(
+                "DELETE FROM prompt_history WHERE session_id = ?", (session_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM prompt_history_backfill WHERE session_id = ?", (session_id,)
+            )
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -670,4 +688,112 @@ class SessionStore:
 
     def get_tui_hint(self, session_id: str) -> str | None:
         return self._tui_hints.get(session_id)
+
+    # ── Prompt history ────────────────────────────────────────────────────────
+
+    def append_prompt_history(
+        self,
+        session_id: str,
+        text: str,
+        sent_at: float,
+        pane: str | None = None,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO prompt_history (session_id, text, sent_at, pane) VALUES (?, ?, ?, ?)",
+                (session_id, text, sent_at, pane),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    @staticmethod
+    def _escape_like(q: str) -> str:
+        # Escape SQL LIKE metacharacters so user queries can't smuggle
+        # wildcards. The `\` is the ESCAPE char declared in the SQL.
+        return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def list_prompt_history(
+        self,
+        session_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        query: str | None = None,
+    ) -> list[dict]:
+        """Most recent first. Pagination via (limit, offset) over the same
+        session-scoped, sent_at-descending ordering. `query` is an optional
+        case-insensitive substring filter on the prompt text."""
+        capped_limit = max(1, min(limit, 500))
+        capped_offset = max(0, offset)
+        where = "session_id = ?"
+        params: list = [session_id]
+        if query:
+            where += " AND text LIKE ? ESCAPE '\\'"
+            params.append(f"%{self._escape_like(query)}%")
+        sql = (
+            "SELECT id, text, sent_at, pane FROM prompt_history "
+            f"WHERE {where} ORDER BY sent_at DESC, id DESC LIMIT ? OFFSET ?"
+        )
+        params.extend([capped_limit, capped_offset])
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+            return [
+                {"id": r["id"], "text": r["text"], "sent_at": r["sent_at"], "pane": r["pane"]}
+                for r in rows
+            ]
+
+    def count_prompt_history(
+        self,
+        session_id: str,
+        query: str | None = None,
+    ) -> int:
+        where = "session_id = ?"
+        params: list = [session_id]
+        if query:
+            where += " AND text LIKE ? ESCAPE '\\'"
+            params.append(f"%{self._escape_like(query)}%")
+        sql = f"SELECT COUNT(*) AS n FROM prompt_history WHERE {where}"
+        with self._lock:
+            row = self._conn.execute(sql, tuple(params)).fetchone()
+            return int(row["n"]) if row else 0
+
+    def delete_prompt_history_entry(self, session_id: str, entry_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM prompt_history WHERE session_id = ? AND id = ?",
+                (session_id, entry_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def bulk_insert_prompt_history(
+        self,
+        session_id: str,
+        entries: list[tuple[str, float, str | None]],
+    ) -> int:
+        """entries: list of (text, sent_at, pane). Returns inserted row count."""
+        if not entries:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO prompt_history (session_id, text, sent_at, pane) VALUES (?, ?, ?, ?)",
+                [(session_id, t, ts, pane) for (t, ts, pane) in entries],
+            )
+            self._conn.commit()
+            return len(entries)
+
+    def is_prompt_history_backfilled(self, session_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM prompt_history_backfill WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None
+
+    def mark_prompt_history_backfilled(self, session_id: str, completed_at: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO prompt_history_backfill (session_id, completed_at) VALUES (?, ?)",
+                (session_id, completed_at),
+            )
+            self._conn.commit()
 
