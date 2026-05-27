@@ -6,13 +6,14 @@ import {
   listFiles, fetchRawFileBlob,
   getGitInfo,
   searchFiles, createDir, uploadFile, renameEntry, moveEntry, deleteEntry, writeFile, FileWriteConflictError,
-  downloadFile, readFile,
+  downloadFile, downloadDirZip, getDirInfo, readFile,
   getFileGitLog, getFileGitShow, getFileGitDiff,
   getCodeSubdirs, checkCodePathExists,
-  type ChangedFile, type ChangedFilesWarning, type FileData, type FileEntry,
+  type ChangedFile, type ChangedFilesWarning, type DirInfoResponse, type FileData, type FileEntry,
   type GitLogEntry,
 } from "../api/sessionApi";
 import { SqliteViewer, CsvViewer, ArchiveViewer, JsonlViewer, copyText, DirPicker } from "./FileEditorModal";
+import { DownloadExclusionModal } from "./DownloadExclusionModal";
 import { CodeMirrorEditor, type CodeMirrorEditorHandle } from "./CodeMirrorEditor";
 import { GitPanel, CommitDetailModal } from "./GitPanel";
 import { GitBranchPicker, GitPullButton } from "./GitBranchPicker";
@@ -27,6 +28,11 @@ const MAX_TRANSFER_MB = 16;
 const MAX_TRANSFER_BYTES = MAX_TRANSFER_MB * 1024 * 1024;
 
 const POLL_MS = 8000;
+
+const DOWNLOAD_MAX_MB = 100;
+const DOWNLOAD_COMPRESS_MB = 16;
+// Shared with FileEditorModal so the hidden-files preference syncs across both UIs.
+const SHOW_HIDDEN_KEY = (sid: string) => `fileEditor.showHidden.${sid}`;
 
 function humanBytes(n: number): string {
   if (!Number.isFinite(n) || n < 0) return "";
@@ -153,7 +159,7 @@ interface DirState {
 }
 
 function FileTreeDir({
-  sessionId, entry, depth, selected, changed, onSelect, onEntryContextMenu, revealPath, refreshKey,
+  sessionId, entry, depth, selected, changed, onSelect, onEntryContextMenu, revealPath, refreshKey, showHidden,
 }: {
   sessionId: string;
   entry: FileEntry;
@@ -164,6 +170,7 @@ function FileTreeDir({
   onEntryContextMenu?: (e: React.MouseEvent, entry: FileEntry) => void;
   revealPath?: string | null;
   refreshKey?: number;
+  showHidden?: boolean;
 }) {
   const [state, setState] = useState<DirState>({ entries: [], loaded: false, loading: false, open: depth === 0 });
 
@@ -176,7 +183,7 @@ function FileTreeDir({
     if (!state.loaded && !state.loading) {
       setState((s) => ({ ...s, loading: true }));
       try {
-        const res = await listFiles(sessionId, entry.path);
+        const res = await listFiles(sessionId, entry.path, showHidden);
         setState((s) => ({ ...s, entries: res.entries, loaded: true, loading: false }));
       } catch {
         setState((s) => ({ ...s, loaded: true, loading: false }));
@@ -189,21 +196,20 @@ function FileTreeDir({
     if (!revealPath) return;
     if (!revealPath.startsWith(entry.path + "/")) return;
     setState((s) => s.open ? s : { ...s, open: true });
-    listFiles(sessionId, entry.path).then((res) => {
+    listFiles(sessionId, entry.path, showHidden).then((res) => {
       setState((s) => s.loaded ? s : { ...s, entries: res.entries, loaded: true, loading: false });
     }).catch(() => {
       setState((s) => s.loaded ? s : { ...s, loaded: true, loading: false });
     });
-  }, [revealPath, entry.path, sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [revealPath, entry.path, sessionId, showHidden]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Re-fetch when refreshKey bumps (new files may have appeared)
+  // Re-fetch when refreshKey or showHidden changes
   useEffect(() => {
-    if (refreshKey === undefined || refreshKey === 0) return;
     if (!state.loaded || !state.open) return;
-    listFiles(sessionId, entry.path).then((res) => {
+    listFiles(sessionId, entry.path, showHidden).then((res) => {
       setState((s) => ({ ...s, entries: res.entries }));
     }).catch(() => {});
-  }, [refreshKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [refreshKey, showHidden]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const indent = depth * 14 + 6;
   const isChanged = changed.has(entry.path);
@@ -241,7 +247,7 @@ function FileTreeDir({
             child.type === "dir" ? (
               <FileTreeDir
                 key={child.path} sessionId={sessionId} entry={child}
-                depth={depth + 1} selected={selected} changed={changed} onSelect={onSelect} onEntryContextMenu={onEntryContextMenu} revealPath={revealPath} refreshKey={refreshKey}
+                depth={depth + 1} selected={selected} changed={changed} onSelect={onSelect} onEntryContextMenu={onEntryContextMenu} revealPath={revealPath} refreshKey={refreshKey} showHidden={showHidden}
               />
             ) : (
               <FileTreeFile
@@ -298,7 +304,7 @@ function FileTreeFile({
 // ── Root tree (loads top-level entries once) ──────────────────────────────
 
 function FileTree({
-  sessionId, selected, changed, onSelect, onEntryContextMenu, revealPath, refreshKey,
+  sessionId, selected, changed, onSelect, onEntryContextMenu, revealPath, refreshKey, showHidden,
 }: {
   sessionId: string;
   selected: string | null;
@@ -307,13 +313,14 @@ function FileTree({
   onEntryContextMenu?: (e: React.MouseEvent, entry: FileEntry) => void;
   revealPath?: string | null;
   refreshKey?: number;
+  showHidden?: boolean;
 }) {
   const [entries, setEntries] = useState<FileEntry[] | null>(null);
 
   useEffect(() => {
     setEntries(null);
-    listFiles(sessionId).then((r) => setEntries(r.entries)).catch(() => setEntries([]));
-  }, [sessionId, refreshKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    listFiles(sessionId, undefined, showHidden).then((r) => setEntries(r.entries)).catch(() => setEntries([]));
+  }, [sessionId, refreshKey, showHidden]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (entries === null) return <div style={{ padding: "8px 12px", color: "var(--text-faint)", fontSize: 11 }}>Loading…</div>;
   if (entries.length === 0) return <div style={{ padding: "8px 12px", color: "var(--text-faint)", fontSize: 11 }}>Empty</div>;
@@ -324,7 +331,7 @@ function FileTree({
         e.type === "dir" ? (
           <FileTreeDir
             key={e.path} sessionId={sessionId} entry={e}
-            depth={0} selected={selected} changed={changed} onSelect={onSelect} onEntryContextMenu={onEntryContextMenu} revealPath={revealPath} refreshKey={refreshKey}
+            depth={0} selected={selected} changed={changed} onSelect={onSelect} onEntryContextMenu={onEntryContextMenu} revealPath={revealPath} refreshKey={refreshKey} showHidden={showHidden}
           />
         ) : (
           <FileTreeFile
@@ -2292,6 +2299,31 @@ export function CodePane({
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   // History search by path
   const [historySearchPath, setHistorySearchPath] = useState("");
+  // Hidden files toggle (persisted, shared with FileEditorModal)
+  const [showHidden, setShowHiddenState] = useState<boolean>(() => {
+    try { return localStorage.getItem(SHOW_HIDDEN_KEY(sessionId)) === "true"; }
+    catch { return false; }
+  });
+  const setShowHidden = useCallback((v: boolean) => {
+    setShowHiddenState(v);
+    try { localStorage.setItem(SHOW_HIDDEN_KEY(sessionId), v ? "true" : "false"); } catch {}
+  }, [sessionId]);
+  // Download exclusion modal state
+  const [dlModal, setDlModal] = useState<{ path: string; info: DirInfoResponse } | null>(null);
+  const [dlLoading, setDlLoading] = useState(false);
+  const handleDownloadCwd = useCallback(async () => {
+    setDlLoading(true);
+    try {
+      const info = await getDirInfo(sessionId, "");
+      if (info.total_size > DOWNLOAD_MAX_MB * 1024 * 1024) {
+        setDlModal({ path: "", info });
+      } else {
+        const compress = info.total_size > DOWNLOAD_COMPRESS_MB * 1024 * 1024;
+        await downloadDirZip(sessionId, "", [], compress);
+      }
+    } catch (e) { alert(String(e)); }
+    finally { setDlLoading(false); }
+  }, [sessionId]);
   // Context menu (on tree entries)
   const [ctxMenu, setCtxMenu] = useState<{ entry: FileEntry; x: number; y: number } | null>(null);
   // Rename / move / delete / git-history modals
@@ -2417,7 +2449,7 @@ export function CodePane({
           if (topPath !== selectedEntry?.path) {
             const dir = topPath.includes("/") ? topPath.split("/").slice(0, -1).join("/") : "";
             try {
-              const res = await listFiles(sessionId, dir || undefined);
+              const res = await listFiles(sessionId, dir || undefined, showHidden);
               const name = topPath.split("/").pop() ?? topPath;
               const entry = res.entries.find((e) => e.name === name) ?? {
                 name, path: topPath, type: "file" as const, size: null, is_text: true, is_skipped: false, is_sqlite: false, is_archive: false,
@@ -2580,7 +2612,9 @@ export function CodePane({
     { key: "newFile",   label: "New file",     icon: "+",  active: toolForm === "newFile",   onClick: () => setToolForm(toolForm === "newFile" ? null : "newFile") },
     { key: "newFolder", label: "New folder",   icon: "📁", active: toolForm === "newFolder", onClick: () => setToolForm(toolForm === "newFolder" ? null : "newFolder") },
     { key: "upload",    label: "Upload file",  icon: "⬆", active: toolForm === "upload",    onClick: () => setToolForm(toolForm === "upload" ? null : "upload") },
-  ], [toolForm]);
+    { key: "downloadCwd", label: dlLoading ? "Preparing zip…" : "Download cwd as zip", icon: "📦", active: false, onClick: dlLoading ? () => {} : handleDownloadCwd },
+    { key: "showHidden",  label: showHidden ? "Hide dot-prefixed files" : "Show dot-prefixed files", icon: ".*", active: showHidden, onClick: () => setShowHidden(!showHidden) },
+  ], [toolForm, dlLoading, handleDownloadCwd, showHidden, setShowHidden]);
 
   const branchMaxWidth = useMemo(() => {
     if (toolbarWidth <= 0) return undefined;
@@ -2728,6 +2762,7 @@ export function CodePane({
                 onEntryContextMenu={onEntryContextMenu}
                 revealPath={highlightedPath}
                 refreshKey={filesRefreshKey}
+                showHidden={showHidden}
               />
             )}
           </div>
@@ -2992,6 +3027,14 @@ export function CodePane({
             </div>
           </div>
         </div>
+      )}
+      {dlModal && (
+        <DownloadExclusionModal
+          sessionId={sessionId}
+          basePath={dlModal.path}
+          info={dlModal.info}
+          onClose={() => setDlModal(null)}
+        />
       )}
     </div>
   );
