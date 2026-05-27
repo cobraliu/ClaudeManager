@@ -44,6 +44,42 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
+// MEMORY.md uses both standard markdown links `[label](name.md)` and
+// wiki-style `[[name]]` to cross-reference other memory files. Marked
+// understands the first; convert the second into the first before parsing
+// so a single click handler can intercept either.
+function wikiLinkToMarkdown(text: string): string {
+  return text.replace(/\[\[([^\]\n]+)\]\]/g, (_, name: string) => {
+    const n = name.trim();
+    return `[${n}](${n})`;
+  });
+}
+
+// Resolve a link target to an actual file in the memory directory. Tolerates
+// the `_` vs `-` drift between filenames (`project_codex_appserver.md`) and
+// wiki-link slugs (`[[claude-cli-jsonl-semantics]]`) and the optional `.md`
+// suffix. Returns null if no plausible match exists.
+function resolveMemoryName(target: string, files: { name: string }[]): string | null {
+  if (!target) return null;
+  // Strip relative-path noise, query strings, fragments
+  const clean = target.replace(/^\.\/+/, "").replace(/^\/+/, "").split("?")[0].split("#")[0];
+  if (!clean) return null;
+  const tryNames = new Set<string>();
+  tryNames.add(clean);
+  const withMd = clean.endsWith(".md") ? clean : `${clean}.md`;
+  tryNames.add(withMd);
+  const stem = withMd.slice(0, -3);
+  tryNames.add(`${stem.replace(/_/g, "-")}.md`);
+  tryNames.add(`${stem.replace(/-/g, "_")}.md`);
+  for (const candidate of tryNames) {
+    if (files.some((f) => f.name === candidate)) return candidate;
+  }
+  // Case-insensitive last resort
+  const lower = withMd.toLowerCase();
+  const ci = files.find((f) => f.name.toLowerCase() === lower);
+  return ci ? ci.name : null;
+}
+
 export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPanelProps) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const bodyFont = fontSize ?? 13;
@@ -56,12 +92,69 @@ export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPan
   const [listError, setListError] = useState<string | null>(null);
   const [contentError, setContentError] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState<number>(loadSidebarWidth);
+  // Cross-link navigation history — push on internal link click, pop on
+  // back. Sidebar / picker selections clear the stack since they're a fresh
+  // entry point rather than a step in a chain.
+  const [historyStack, setHistoryStack] = useState<string[]>([]);
 
   // Splitter drag state — kept in refs so we don't re-run mousemove
   // listeners on every state tick.
   const dragging = useRef(false);
   const dragStartX = useRef(0);
   const dragStartW = useRef(0);
+  // Refs for the markdown body scroll containers (compact + desktop) so we
+  // can reset scroll position whenever the selected file changes.
+  const bodyRefCompact = useRef<HTMLDivElement | null>(null);
+  const bodyRefDesktop = useRef<HTMLDivElement | null>(null);
+
+  // Reset scroll to top on every file change — without this the new file
+  // inherits the scroll offset of the previous one which is disorienting.
+  useEffect(() => {
+    if (bodyRefCompact.current) bodyRefCompact.current.scrollTop = 0;
+    if (bodyRefDesktop.current) bodyRefDesktop.current.scrollTop = 0;
+  }, [selected]);
+
+  // Internal-link navigation: remember where we came from so ← can return.
+  const navigateToFile = useCallback((name: string) => {
+    setHistoryStack((prev) => (selected && selected !== name ? [...prev, selected] : prev));
+    setSelected(name);
+  }, [selected]);
+
+  // Sidebar / picker selection — explicit choice, not part of a chain.
+  const pickFile = useCallback((name: string) => {
+    setSelected(name);
+    setHistoryStack([]);
+  }, []);
+
+  const goBack = useCallback(() => {
+    setHistoryStack((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      setSelected(last);
+      return prev.slice(0, -1);
+    });
+  }, []);
+
+  // Intercept clicks on internal memory links rendered inside the markdown
+  // body. External links (http://, mailto:, anchor) keep default behaviour.
+  const handleBodyClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const a = target.closest("a") as HTMLAnchorElement | null;
+    if (!a) return;
+    const href = a.getAttribute("href") || "";
+    if (!href) return;
+    if (/^(https?:|mailto:|tel:)/i.test(href) || href.startsWith("#")) return;
+    e.preventDefault();
+    const resolved = resolveMemoryName(href, files);
+    if (resolved) {
+      navigateToFile(resolved);
+    } else {
+      // Surface the miss in the console — file may have been deleted or
+      // renamed; the index entry is stale.
+      console.warn("[MemoryPanel] no memory file matches link:", href);
+    }
+  }, [files, navigateToFile]);
 
   const reloadList = useCallback(async () => {
     setListLoading(true);
@@ -156,6 +249,15 @@ export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPan
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderBottom: "1px solid var(--border)", background: "var(--bg-surface)", flexShrink: 0 }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-body)" }}>🧠 Memory</span>
+        {historyStack.length > 0 && (
+          <button
+            onClick={goBack}
+            title={`Back to ${historyStack[historyStack.length - 1]}`}
+            style={{ background: "var(--bg-hover)", color: "var(--text-body)", fontSize: 11, padding: "2px 8px", border: "1px solid transparent", borderRadius: 4, flexShrink: 0 }}
+          >
+            ← Back
+          </button>
+        )}
         {dirPath && (
           <span title={dirPath} style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
             {dirPath}
@@ -232,7 +334,7 @@ export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPan
                   return (
                     <button
                       key={f.name}
-                      onClick={() => { setSelected(f.name); setPickerOpen(false); }}
+                      onClick={() => { pickFile(f.name); setPickerOpen(false); }}
                       style={{
                         width: "100%",
                         background: isActive ? "var(--bg-hover)" : "transparent",
@@ -257,7 +359,7 @@ export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPan
             )}
           </div>
           {/* Body — full width */}
-          <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "auto", padding: "12px 14px" }}>
+          <div ref={bodyRefCompact} style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "auto", padding: "12px 14px" }}>
             {contentLoading ? (
               <div style={{ color: "var(--text-faint)", fontSize: bodyFont }}>Loading…</div>
             ) : contentError ? (
@@ -266,7 +368,8 @@ export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPan
               <div
                 className="conv-markdown"
                 style={{ fontSize: bodyFont, lineHeight: 1.6, color: "var(--text-body)" }}
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+                onClick={handleBodyClick}
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(wikiLinkToMarkdown(content)) }}
               />
             ) : files.length === 0 ? (
               <div style={{ color: "var(--text-faint)", fontSize: bodyFont }}>
@@ -299,7 +402,7 @@ export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPan
                   return (
                     <button
                       key={f.name}
-                      onClick={() => setSelected(f.name)}
+                      onClick={() => pickFile(f.name)}
                       style={{
                         width: "100%",
                         textAlign: "left",
@@ -337,7 +440,7 @@ export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPan
           />
 
           {/* Markdown content */}
-          <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "auto", padding: "12px 16px" }}>
+          <div ref={bodyRefDesktop} style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "auto", padding: "12px 16px" }}>
             {contentLoading ? (
               <div style={{ color: "var(--text-faint)", fontSize: 12 }}>Loading…</div>
             ) : contentError ? (
@@ -346,7 +449,8 @@ export function MemoryPanel({ sessionId, compact, fontSize, onClose }: MemoryPan
               <div
                 className="conv-markdown"
                 style={{ fontSize: 13, lineHeight: 1.6, color: "var(--text-body)" }}
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+                onClick={handleBodyClick}
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(wikiLinkToMarkdown(content)) }}
               />
             ) : (
               <div style={{ color: "var(--text-faint)", fontSize: 12 }}>Select a file to preview.</div>
