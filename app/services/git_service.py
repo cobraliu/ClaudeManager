@@ -96,6 +96,9 @@ desktop.ini
 .vscode/
 *.suo
 *.user
+
+# ClaudeManager runtime
+.claude/
 """
 
 

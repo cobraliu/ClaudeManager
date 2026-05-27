@@ -38,3 +38,6 @@ Thumbs.db
 
 # ── Legacy (pre-restructure) ───────────────────────────
 backend/
+
+# ── ClaudeManager runtime ──────────────────────────────
+.claude/
