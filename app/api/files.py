@@ -4,6 +4,7 @@ import gzip
 import bz2
 import lzma
 import os
+import re
 import shutil
 import sqlite3
 import tarfile
@@ -400,6 +401,9 @@ MAX_UPLOAD_SIZE   = 16 * 1024 * 1024   # 16 MB
 MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 IMAGE_UPLOAD_SUBDIR = Path(".claude") / "uploads"
+# Pattern matching the filenames upload_image writes: 32-hex uuid + ext.
+# Used as the load-bearing path-traversal guard for the serve endpoint.
+_IMAGE_FILENAME_RE = re.compile(r"^[a-f0-9]{32}\.(?:png|jpg|jpeg|gif|webp)$")
 
 
 @router.get("/{session_id}/fs/raw")
@@ -543,7 +547,8 @@ async def upload_image(
     target_dir = Path(session.cwd).resolve() / IMAGE_UPLOAD_SUBDIR
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{uuid.uuid4().hex}{ext}"
+        stored_name = f"{uuid.uuid4().hex}{ext}"
+        target = target_dir / stored_name
         target.write_bytes(content)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -551,8 +556,50 @@ async def upload_image(
     return {
         "path": str(target),
         "filename": file.filename,
+        "stored_name": stored_name,
         "size": len(content),
+        # Browsers can't send Authorization headers on <img src>, so the
+        # frontend appends ?token=<jwt> at render time. The path here is
+        # session-scoped and validates filename format on the way out.
+        "url": f"/api/sessions/{session_id}/uploaded-image/{stored_name}",
     }
+
+
+@router.get("/{session_id}/uploaded-image/{filename}")
+def serve_uploaded_image(
+    session_id: str,
+    filename: str,
+    token: str = Query(...),
+) -> FileResponse:
+    """Serve an uploaded image so the frontend can render it via <img src>.
+
+    Auth is via query token (`<img>` can't send Authorization headers).
+    Filename is restricted to the pattern upload_image writes — that's the
+    primary path-traversal guard. The store ownership check is the
+    secondary layer.
+    """
+    try:
+        claims = _decode_token(token)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    user_id = claims.get("sub", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    if not _IMAGE_FILENAME_RE.match(filename):
+        raise HTTPException(status_code=400, detail="invalid filename")
+
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    target = Path(session.cwd).resolve() / IMAGE_UPLOAD_SUBDIR / filename
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="image not found")
+
+    mime, _ = mimetypes.guess_type(str(target))
+    return FileResponse(target, media_type=mime or "application/octet-stream")
 
 
 @router.put("/{session_id}/fs/write")

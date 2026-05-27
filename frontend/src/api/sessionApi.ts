@@ -629,9 +629,15 @@ export async function uploadFile(
 }
 
 export interface UploadedImage {
+  /** Absolute path on the server; gets injected as `@<path>` into the prompt. */
   path: string;
+  /** Original filename from the upload (display only). */
   filename: string;
+  /** Stored filename (uuid + ext); used to reconstruct the serve URL. */
+  stored_name: string;
   size: number;
+  /** Relative API path for <img src>; caller appends `?token=<jwt>`. */
+  url: string;
 }
 
 export async function uploadImage(

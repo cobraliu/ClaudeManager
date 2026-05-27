@@ -4,6 +4,7 @@ import hljs from "highlight.js/lib/common";
 import { marked, renderMarkdown } from "../lib/markdown";
 import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, uploadImage, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta, type UploadedImage } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
+import { apiPath } from "../lib/baseUrl";
 import {
   inputDrafts,
   loadDraft,
@@ -269,7 +270,53 @@ function normalizeBreaks(s: string): string {
   return s.replace(/\r\n?/g, "\n");
 }
 
-function UserBubble({ text, ts, onRewind }: { text: string; ts?: string; onRewind?: () => void }) {
+// Match `@<abs-path>` references that point at our upload directory. The
+// 32-hex filename is the load-bearing match — it's what upload_image emits
+// (uuid4().hex + ext). The path may live anywhere on disk; only the suffix
+// `.claude/uploads/<stored_name>` matters for rebuilding the serve URL.
+const UPLOADED_IMAGE_REF_RE = /^@(.+\/\.claude\/uploads\/([a-f0-9]{32}\.(?:png|jpg|jpeg|gif|webp)))\s*$/;
+
+function buildUploadedImageUrl(sessionId: string, storedName: string): string {
+  const token = localStorage.getItem("token") || "";
+  return apiPath(`/api/sessions/${sessionId}/uploaded-image/${storedName}?token=${encodeURIComponent(token)}`);
+}
+
+// Split a prompt body into text segments and inline image nodes. Each
+// `@<path>` reference on its own line is converted to an <img>; everything
+// else passes through untouched (joined with newlines so pre-wrap layout
+// still works).
+function renderPromptWithImages(text: string, sessionId: string): React.ReactNode {
+  const lines = text.split("\n");
+  const parts: React.ReactNode[] = [];
+  let textBuf: string[] = [];
+  const flushText = (keyHint: number) => {
+    if (textBuf.length === 0) return;
+    parts.push(<span key={`t${keyHint}`}>{textBuf.join("\n")}</span>);
+    textBuf = [];
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const m = UPLOADED_IMAGE_REF_RE.exec(lines[i]);
+    if (m) {
+      flushText(i);
+      const storedName = m[2];
+      parts.push(
+        <img
+          key={`img${i}`}
+          src={buildUploadedImageUrl(sessionId, storedName)}
+          alt="attached"
+          style={{ display: "block", maxWidth: "100%", maxHeight: 300, borderRadius: 6, marginTop: parts.length > 0 ? 8 : 0 }}
+        />
+      );
+    } else {
+      // Preserve blank lines between text and images for spacing.
+      textBuf.push(lines[i]);
+    }
+  }
+  flushText(lines.length);
+  return <>{parts}</>;
+}
+
+function UserBubble({ text, ts, sessionId, onRewind }: { text: string; ts?: string; sessionId?: string; onRewind?: () => void }) {
   const [hovered, setHovered] = useState(false);
   text = normalizeBreaks(text);
   return (
@@ -307,7 +354,7 @@ function UserBubble({ text, ts, onRewind }: { text: string; ts?: string; onRewin
           wordBreak: "break-word",
           textAlign: "left",
         }}>
-          {text}
+          {sessionId ? renderPromptWithImages(text, sessionId) : text}
         </div>
       </div>
       {ts && <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 2, paddingRight: 2 }}>{ts}</div>}
@@ -3338,7 +3385,7 @@ function MessageEntry({
     const ets = formatTs(entry.timestamp);
     if (content.startsWith("<task-notification>")) return <TaskNotificationBlock text={content} ts={ets} />;
     if (content.startsWith("<system-reminder>")) return <SystemReminderBlock text={content} ts={ets} />;
-    return <UserBubble text={content} ts={ets} />;
+    return <UserBubble text={content} ts={ets} sessionId={sessionId} />;
   }
 
   // queued_command attachment — user prompt submitted mid-response, OR a system-
@@ -3358,7 +3405,7 @@ function MessageEntry({
       if (mode === "system-reminder" || text.startsWith("<system-reminder>")) {
         return <SystemReminderBlock text={text} ts={ets} />;
       }
-      return <UserBubble text={text} ts={ets} />;
+      return <UserBubble text={text} ts={ets} sessionId={sessionId} />;
     }
     return null;
   }
@@ -3441,7 +3488,7 @@ function MessageEntry({
     const handleRewind = chatOnly && onRewindMessage && entry.uuid
       ? () => onRewindMessage(entry.uuid!)
       : undefined;
-    return <UserBubble text={text} ts={ts} onRewind={handleRewind} />;
+    return <UserBubble text={text} ts={ts} sessionId={sessionId} onRewind={handleRewind} />;
   }
 
   if (msg.role === "assistant") {
@@ -4700,7 +4747,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                       color: "var(--text-default)", fontSize: 13, lineHeight: 1.6,
                       whiteSpace: "pre-wrap", wordBreak: "break-word",
                     }}>
-                      <span style={{ marginRight: 6 }}>⚠️</span>{o.text}
+                      <span style={{ marginRight: 6 }}>⚠️</span>{renderPromptWithImages(o.text, sessionId)}
                     </div>
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4, paddingRight: 2 }}>
                       <span style={{ fontSize: 10, color: "var(--accent-red, #c0392b)" }}>Send failed — likely eaten by auto-compact</span>
@@ -4733,7 +4780,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                     color: "#cce5ff", fontSize: 13, lineHeight: 1.6,
                     whiteSpace: "pre-wrap", wordBreak: "break-word",
                   }}>
-                    {o.text}
+                    {renderPromptWithImages(o.text, sessionId)}
                   </div>
                   <span style={{ fontSize: 10, color: "var(--text-faintest)", marginTop: 2, paddingRight: 2 }}>sending…</span>
                 </div>
@@ -4905,16 +4952,24 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
             {pendingImages.map((img) => (
               <span
                 key={img.path}
-                title={img.path}
+                title={`${img.filename} — ${img.path}`}
                 style={{
                   display: "inline-flex", alignItems: "center", gap: 4,
                   background: "var(--bg-hover)", border: "1px solid var(--text-faintest)",
-                  borderRadius: 12, padding: "2px 4px 2px 8px", fontSize: 11,
-                  color: "var(--text-body)", maxWidth: 220,
+                  borderRadius: 6, padding: "2px 4px 2px 4px", fontSize: 11,
+                  color: "var(--text-body)", maxWidth: 240,
                 }}
               >
+                <img
+                  src={buildUploadedImageUrl(sessionId, img.stored_name)}
+                  alt={img.filename}
+                  style={{
+                    width: 28, height: 28, objectFit: "cover", borderRadius: 4,
+                    flexShrink: 0,
+                  }}
+                />
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  📎 {img.filename}
+                  {img.filename}
                 </span>
                 <button
                   onClick={() => removePendingImage(img.path)}
