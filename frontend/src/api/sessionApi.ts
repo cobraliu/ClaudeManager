@@ -628,6 +628,38 @@ export async function uploadFile(
   }
 }
 
+export interface UploadedImage {
+  /** Absolute path on the server; gets injected as `@<path>` into the prompt. */
+  path: string;
+  /** Original filename from the upload (display only). */
+  filename: string;
+  /** Stored filename (uuid + ext); used to reconstruct the serve URL. */
+  stored_name: string;
+  size: number;
+  /** Relative API path for <img src>; caller appends `?token=<jwt>`. */
+  url: string;
+}
+
+export async function uploadImage(
+  sessionId: string,
+  file: File
+): Promise<UploadedImage> {
+  const token = localStorage.getItem("token") || "";
+  const form = new FormData();
+  form.append("file", file);
+  const resp = await fetch(apiPath(`/api/sessions/${sessionId}/upload-image`), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  if (resp.status === 401) { localStorage.removeItem("token"); window.location.reload(); throw new Error("unauthorized"); }
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(text || `HTTP ${resp.status}`);
+  }
+  return (await resp.json()) as UploadedImage;
+}
+
 export interface DirInfoItem {
   name: string;
   path: string;

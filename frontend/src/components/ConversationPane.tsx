@@ -2,8 +2,9 @@ import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMe
 import { createPortal } from "react-dom";
 import hljs from "highlight.js/lib/common";
 import { marked, renderMarkdown } from "../lib/markdown";
-import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta } from "../api/sessionApi";
+import { getRawMessages, attachSession, getSubAgents, getSubAgentLines, submitAuqAnswers, approveToolRequest, rewindSession, readClaudePlan, resolveCodexAuq, uploadImage, type RawMessage, type RawContentBlock, type RawUsage, type SubAgentMeta, type UploadedImage } from "../api/sessionApi";
 import { WsClient } from "../lib/wsClient";
+import { apiPath } from "../lib/baseUrl";
 import {
   inputDrafts,
   loadDraft,
@@ -269,7 +270,53 @@ function normalizeBreaks(s: string): string {
   return s.replace(/\r\n?/g, "\n");
 }
 
-function UserBubble({ text, ts, onRewind }: { text: string; ts?: string; onRewind?: () => void }) {
+// Match `@<abs-path>` references that point at our upload directory. The
+// 32-hex filename is the load-bearing match — it's what upload_image emits
+// (uuid4().hex + ext). The path may live anywhere on disk; only the suffix
+// `.claude/uploads/<stored_name>` matters for rebuilding the serve URL.
+const UPLOADED_IMAGE_REF_RE = /^@(.+\/\.claude\/uploads\/([a-f0-9]{32}\.(?:png|jpg|jpeg|gif|webp)))\s*$/;
+
+function buildUploadedImageUrl(sessionId: string, storedName: string): string {
+  const token = localStorage.getItem("token") || "";
+  return apiPath(`/api/sessions/${sessionId}/uploaded-image/${storedName}?token=${encodeURIComponent(token)}`);
+}
+
+// Split a prompt body into text segments and inline image nodes. Each
+// `@<path>` reference on its own line is converted to an <img>; everything
+// else passes through untouched (joined with newlines so pre-wrap layout
+// still works).
+function renderPromptWithImages(text: string, sessionId: string): React.ReactNode {
+  const lines = text.split("\n");
+  const parts: React.ReactNode[] = [];
+  let textBuf: string[] = [];
+  const flushText = (keyHint: number) => {
+    if (textBuf.length === 0) return;
+    parts.push(<span key={`t${keyHint}`}>{textBuf.join("\n")}</span>);
+    textBuf = [];
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const m = UPLOADED_IMAGE_REF_RE.exec(lines[i]);
+    if (m) {
+      flushText(i);
+      const storedName = m[2];
+      parts.push(
+        <img
+          key={`img${i}`}
+          src={buildUploadedImageUrl(sessionId, storedName)}
+          alt="attached"
+          style={{ display: "block", maxWidth: "100%", maxHeight: 300, borderRadius: 6, marginTop: parts.length > 0 ? 8 : 0 }}
+        />
+      );
+    } else {
+      // Preserve blank lines between text and images for spacing.
+      textBuf.push(lines[i]);
+    }
+  }
+  flushText(lines.length);
+  return <>{parts}</>;
+}
+
+function UserBubble({ text, ts, sessionId, onRewind }: { text: string; ts?: string; sessionId?: string; onRewind?: () => void }) {
   const [hovered, setHovered] = useState(false);
   text = normalizeBreaks(text);
   return (
@@ -307,7 +354,7 @@ function UserBubble({ text, ts, onRewind }: { text: string; ts?: string; onRewin
           wordBreak: "break-word",
           textAlign: "left",
         }}>
-          {text}
+          {sessionId ? renderPromptWithImages(text, sessionId) : text}
         </div>
       </div>
       {ts && <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 2, paddingRight: 2 }}>{ts}</div>}
@@ -3338,7 +3385,7 @@ function MessageEntry({
     const ets = formatTs(entry.timestamp);
     if (content.startsWith("<task-notification>")) return <TaskNotificationBlock text={content} ts={ets} />;
     if (content.startsWith("<system-reminder>")) return <SystemReminderBlock text={content} ts={ets} />;
-    return <UserBubble text={content} ts={ets} />;
+    return <UserBubble text={content} ts={ets} sessionId={sessionId} />;
   }
 
   // queued_command attachment — user prompt submitted mid-response, OR a system-
@@ -3358,7 +3405,7 @@ function MessageEntry({
       if (mode === "system-reminder" || text.startsWith("<system-reminder>")) {
         return <SystemReminderBlock text={text} ts={ets} />;
       }
-      return <UserBubble text={text} ts={ets} />;
+      return <UserBubble text={text} ts={ets} sessionId={sessionId} />;
     }
     return null;
   }
@@ -3441,7 +3488,7 @@ function MessageEntry({
     const handleRewind = chatOnly && onRewindMessage && entry.uuid
       ? () => onRewindMessage(entry.uuid!)
       : undefined;
-    return <UserBubble text={text} ts={ts} onRewind={handleRewind} />;
+    return <UserBubble text={text} ts={ts} sessionId={sessionId} onRewind={handleRewind} />;
   }
 
   if (msg.role === "assistant") {
@@ -3676,12 +3723,19 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const [lostToast, setLostToast] = useState<string | null>(null);
   const [newCompactUuids, setNewCompactUuids] = useState<Set<string>>(new Set());
   const [subagents, setSubagents] = useState<SubAgentMeta[]>([]);
+  // Pending image uploads — attached to the next prompt and rendered as
+  // chips above the textarea. Cleared on send. Holds the upload response
+  // so we have the absolute path that gets injected as `@<path>`.
+  const [pendingImages, setPendingImages] = useState<UploadedImage[]>([]);
+  const [imageUploadError, setImageUploadError] = useState<string | null>(null);
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
   const wsRef = useRef<WsClient | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const loadMoreAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const seenCompactUuidsRef = useRef<Set<string>>(new Set());
   // Input height resizable via top-edge grip (drag up to enlarge).
   const [inputHeight, setInputHeight] = useState<number>(() => loadInputHeight(sessionId));
@@ -4352,30 +4406,72 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   // ── Input / control ───────────────────────────────────────────────────────
 
   const sendPrompt = useCallback(() => {
-    const text = input.trim();
-    if (!text || !wsRef.current || wsStatus !== "connected") return;
+    const textPart = input.trim();
+    // Allow image-only sends: if user only attached images without typing,
+    // still send so Claude has something to analyze.
+    if (!textPart && pendingImages.length === 0) return;
+    if (!wsRef.current || wsStatus !== "connected") return;
     if (hasUnansweredAuq) return;  // Ink would eat the keystrokes — see hasUnansweredAuq comment.
     // wsStatus is a React state set from onClose, so it lags real readyState
     // by a render. Without this check, a silently-closed WS lets us create
     // the optimistic bubble, clear the input, then drop the WS send — the
     // user sees "sending..." for 120s and loses their draft.
     if (!wsRef.current.isOpen()) return;
+    // Append `@<abs-path>` references for any attached images. Claude CLI
+    // parses the `@` syntax and embeds the image as a content block; if it
+    // fails to resolve, the model still sees the path and can call Read.
+    const imageRefs = pendingImages.map((img) => `@${img.path}`).join("\n");
+    const text = imageRefs
+      ? (textPart ? `${textPart}\n\n${imageRefs}` : imageRefs)
+      : textPart;
     // Optimistic: show immediately before JSONL poll confirms it
     setOptimisticMsgs((prev) => [
       ...prev,
       { id: _randomId(), text, sentAt: Date.now(), status: "pending" },
     ]);
     setInput("");
+    setPendingImages([]);
+    setImageUploadError(null);
     inputDrafts.delete(sessionId);
     clearDraft(sessionId);
     wsRef.current.sendPrompt(text);
     stickToBottom.current = true;
     requestAnimationFrame(() => scrollToBottom(false));
-  }, [input, wsStatus, hasUnansweredAuq, scrollToBottom]);
+  }, [input, wsStatus, hasUnansweredAuq, scrollToBottom, pendingImages, sessionId]);
 
   const stopResponse = useCallback(() => {
     if (!wsRef.current) return;
     wsRef.current.sendInput("\x03");
+  }, []);
+
+  const handlePickImage = useCallback(() => {
+    imageInputRef.current?.click();
+  }, []);
+
+  const handleImageFiles = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setImageUploadError(null);
+    setIsUploadingImage(true);
+    try {
+      // Sequential upload — keeps the order of chips matching the user's
+      // selection order, and small images are fast enough that parallel
+      // upload isn't worth the complexity here.
+      for (const f of Array.from(files)) {
+        try {
+          const uploaded = await uploadImage(sessionId, f);
+          setPendingImages((prev) => [...prev, uploaded]);
+        } catch (e) {
+          setImageUploadError(e instanceof Error ? e.message : String(e));
+          break;
+        }
+      }
+    } finally {
+      setIsUploadingImage(false);
+    }
+  }, [sessionId]);
+
+  const removePendingImage = useCallback((path: string) => {
+    setPendingImages((prev) => prev.filter((p) => p.path !== path));
   }, []);
 
   const resendLostMsg = useCallback((id: string, text: string) => {
@@ -4651,7 +4747,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                       color: "var(--text-default)", fontSize: 13, lineHeight: 1.6,
                       whiteSpace: "pre-wrap", wordBreak: "break-word",
                     }}>
-                      <span style={{ marginRight: 6 }}>⚠️</span>{o.text}
+                      <span style={{ marginRight: 6 }}>⚠️</span>{renderPromptWithImages(o.text, sessionId)}
                     </div>
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4, paddingRight: 2 }}>
                       <span style={{ fontSize: 10, color: "var(--accent-red, #c0392b)" }}>Send failed — likely eaten by auto-compact</span>
@@ -4684,7 +4780,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
                     color: "#cce5ff", fontSize: 13, lineHeight: 1.6,
                     whiteSpace: "pre-wrap", wordBreak: "break-word",
                   }}>
-                    {o.text}
+                    {renderPromptWithImages(o.text, sessionId)}
                   </div>
                   <span style={{ fontSize: 10, color: "var(--text-faintest)", marginTop: 2, paddingRight: 2 }}>sending…</span>
                 </div>
@@ -4837,6 +4933,61 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
         >
           <div style={{ width: 40, height: 3, borderRadius: 2, background: "var(--text-faintest)" }} />
         </div>
+        {/* Hidden file input for image attach — triggered by 📎 button below. */}
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept="image/png,image/jpeg,image/gif,image/webp"
+          multiple
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const files = e.target.files;
+            void handleImageFiles(files);
+            // Reset so selecting the same file again re-fires onChange
+            if (e.target) e.target.value = "";
+          }}
+        />
+        {(pendingImages.length > 0 || imageUploadError) && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 12px 6px", alignItems: "center" }}>
+            {pendingImages.map((img) => (
+              <span
+                key={img.path}
+                title={`${img.filename} — ${img.path}`}
+                style={{
+                  display: "inline-flex", alignItems: "center", gap: 4,
+                  background: "var(--bg-hover)", border: "1px solid var(--text-faintest)",
+                  borderRadius: 6, padding: "2px 4px 2px 4px", fontSize: 11,
+                  color: "var(--text-body)", maxWidth: 240,
+                }}
+              >
+                <img
+                  src={buildUploadedImageUrl(sessionId, img.stored_name)}
+                  alt={img.filename}
+                  style={{
+                    width: 28, height: 28, objectFit: "cover", borderRadius: 4,
+                    flexShrink: 0,
+                  }}
+                />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {img.filename}
+                </span>
+                <button
+                  onClick={() => removePendingImage(img.path)}
+                  title="Remove"
+                  style={{
+                    background: "transparent", border: "none", color: "var(--text-faint)",
+                    cursor: "pointer", padding: "0 4px", fontSize: 13, lineHeight: 1,
+                  }}
+                >×</button>
+              </span>
+            ))}
+            {imageUploadError && (
+              <span style={{ fontSize: 11, color: "#f85149" }}>
+                upload failed: {imageUploadError}
+              </span>
+            )}
+          </div>
+        )}
         <div style={{ display: "flex", gap: 8, alignItems: "flex-end", padding: "2px 12px 10px" }}>
           <textarea
             ref={textareaRef}
@@ -4864,23 +5015,46 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
               opacity: wsStatus !== "connected" ? 0.5 : 1,
             }}
           />
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flexShrink: 0 }}>
-            <button
-              onClick={sendPrompt}
-              onPointerDown={(e) => e.preventDefault()}
-              disabled={!input.trim() || wsStatus !== "connected" || hasUnansweredAuq}
-              style={{
-                background: !input.trim() || wsStatus !== "connected" || hasUnansweredAuq ? "var(--bg-hover)" : "#238636",
-                color: !input.trim() || wsStatus !== "connected" || hasUnansweredAuq ? "var(--text-faint)" : "#fff",
-                border: "none", borderRadius: 6,
-                width: 34, height: 34, fontSize: 15,
-                cursor: !input.trim() || wsStatus !== "connected" || hasUnansweredAuq ? "default" : "pointer",
-                display: "flex", alignItems: "center", justifyContent: "center",
-              }}
-              title={hasUnansweredAuq ? "Answer the question above first" : "Send (Ctrl+Enter)"}
-            >↑</button>
-            <span style={{ fontSize: 9, color: wsColor }}>{wsLabel}</span>
-          </div>
+          {(() => {
+            const sendDisabled =
+              (!input.trim() && pendingImages.length === 0) ||
+              wsStatus !== "connected" ||
+              hasUnansweredAuq;
+            const uploadDisabled = wsStatus !== "connected" || isUploadingImage;
+            return (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                <button
+                  onClick={handlePickImage}
+                  onPointerDown={(e) => e.preventDefault()}
+                  disabled={uploadDisabled}
+                  style={{
+                    background: "var(--bg-hover)",
+                    color: uploadDisabled ? "var(--text-faint)" : "var(--text-body)",
+                    border: "1px solid var(--text-faintest)", borderRadius: 6,
+                    width: 28, height: 28, fontSize: 13,
+                    cursor: uploadDisabled ? "default" : "pointer",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}
+                  title={isUploadingImage ? "Uploading…" : "Attach image (PNG/JPG/GIF/WebP, ≤10MB)"}
+                >{isUploadingImage ? "…" : "📎"}</button>
+                <button
+                  onClick={sendPrompt}
+                  onPointerDown={(e) => e.preventDefault()}
+                  disabled={sendDisabled}
+                  style={{
+                    background: sendDisabled ? "var(--bg-hover)" : "#238636",
+                    color: sendDisabled ? "var(--text-faint)" : "#fff",
+                    border: "none", borderRadius: 6,
+                    width: 34, height: 34, fontSize: 15,
+                    cursor: sendDisabled ? "default" : "pointer",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}
+                  title={hasUnansweredAuq ? "Answer the question above first" : "Send (Ctrl+Enter)"}
+                >↑</button>
+                <span style={{ fontSize: 9, color: wsColor }}>{wsLabel}</span>
+              </div>
+            );
+          })()}
         </div>
       </div>}
     </div>
