@@ -64,6 +64,13 @@ def configure_logging() -> None:
         logger.setLevel(logging.INFO)
         logger.propagate = False
 
+    # The watchfiles library logs an INFO line for every batch of detected
+    # changes ("1 change detected"). With one fs/watch WS per session × three
+    # frontend hooks (MobilePage, FileEditorModal, CodePane), the log file
+    # can balloon to tens of MB per day. Drop these to WARNING — real
+    # problems (filter errors, rust notify exceptions) still surface.
+    logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
+
 
 def audit_event(user_id: str, action: str, session_id: str, extra: dict[str, Any] | None = None) -> None:
     payload = {

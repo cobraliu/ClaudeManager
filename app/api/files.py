@@ -1142,7 +1142,20 @@ async def fs_watch_ws(
         flush_task = None
 
     try:
-        async for raw_changes in awatch(str(cwd), stop_event=asyncio.Event()):
+        # step=500: poll the rust receiver every 500 ms instead of the default
+        # 50 ms — cuts asyncio wake-ups 10× across N sessions × 3 frontend
+        # hooks. inotify itself is push-based, so this only adds at most ~450
+        # ms of detection latency.
+        # debounce=2000: wait 2 s after the last event before flushing the
+        # batch (default 1600 ms). A single "save" often triggers several
+        # inotify events (modify, attrib, rename) — letting them coalesce
+        # avoids fan-out into multiple WS messages.
+        async for raw_changes in awatch(
+            str(cwd),
+            stop_event=asyncio.Event(),
+            step=500,
+            debounce=2000,
+        ):
             for change, path_str in raw_changes:
                 p = Path(path_str)
                 try:
