@@ -59,9 +59,9 @@ if os.environ.get("CLAUDE_PROXY_DISABLED", "").strip() in ("1", "true", "True", 
 else:
     _anthropic_proxy_port = int(os.environ.get("CLAUDE_PROXY_PORT", "19098"))
 tmux = TmuxService(
-    claude_bin=get_claude_bin(),
-    claude_shell=get_claude_shell(),
-    cursor_bin=get_cursor_bin(),
+    claude_bin_getter=get_claude_bin,
+    claude_shell_getter=get_claude_shell,
+    cursor_bin_getter=get_cursor_bin,
     anthropic_proxy_port=_anthropic_proxy_port,
 )
 term_mgr = TerminalManager(

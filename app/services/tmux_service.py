@@ -15,6 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -120,19 +121,20 @@ class TmuxService:
     def __init__(
         self,
         socket_name: str = "claude-web",
-        claude_bin: str = "claude",
-        claude_shell: str = "",
-        cursor_bin: str = "agent",
+        claude_bin_getter: Callable[[], str] = lambda: "claude",
+        claude_shell_getter: Callable[[], str] = lambda: "",
+        cursor_bin_getter: Callable[[], str] = lambda: "agent",
         anthropic_proxy_port: int = 0,
     ) -> None:
         self.socket_name = socket_name
         self._tmux = os.getenv("TMUX_BIN", "tmux")
-        self.claude_bin = claude_bin or "claude"
-        self.cursor_bin = cursor_bin or "agent"
+        # Hot-reloaded on every read so admin edits to config (claude_bin,
+        # cursor_bin, claude_shell) take effect for the next create/resume
+        # without a backend restart. Already-running tmux panes are unaffected.
+        self._claude_bin_getter = claude_bin_getter
+        self._cursor_bin_getter = cursor_bin_getter
+        self._claude_shell_getter = claude_shell_getter
         self.anthropic_proxy_port = anthropic_proxy_port
-        # Optional shell wrapper, e.g. "bash -l" for WSL/nvm users whose PATH
-        # is only set up in .profile/.bashrc (login shell).
-        self.claude_shell = claude_shell or ""
         # Ensure tmux server uses latest-client window sizing
         try:
             self._run("set-option", "-g", "window-size", "latest")
@@ -171,8 +173,9 @@ class TmuxService:
         if "PATH" not in merged:
             merged["PATH"] = os.environ.get("PATH", "")
         # If claude_bin is an absolute path, prepend its directory to PATH.
-        if os.path.isabs(self.claude_bin):
-            bin_dir = str(Path(self.claude_bin).parent)
+        claude_bin = self._claude_bin_getter() or "claude"
+        if os.path.isabs(claude_bin):
+            bin_dir = str(Path(claude_bin).parent)
             if bin_dir not in merged["PATH"].split(os.pathsep):
                 merged["PATH"] = f"{bin_dir}{os.pathsep}{merged['PATH']}"
         parts: list[str] = ["env"]
@@ -223,9 +226,9 @@ class TmuxService:
             model=claude_model,
             resume_session_id=resume_session_id,
             inner_id=inner_id,
-            claude_bin=self.claude_bin,
-            cursor_bin=self.cursor_bin,
-            claude_shell=self.claude_shell,
+            claude_bin=self._claude_bin_getter() or "claude",
+            cursor_bin=self._cursor_bin_getter() or "agent",
+            claude_shell=self._claude_shell_getter() or "",
         )
 
         # Prefix `env K=V ...` so the spawned process gets exactly the env we
