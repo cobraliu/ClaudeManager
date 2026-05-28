@@ -14,7 +14,7 @@ const PAGE = 100;
 const NEAR_BOTTOM_PX = 600;
 type Theme = "light" | "dark";
 
-/* Page-frame background for the area outside the centered 920px column
+/* Page-frame background for the area outside the centered content column
  * (index.css paints html/#root with the app's dark var; override per theme). */
 const PAGE_BG: Record<Theme, string> = { light: "#fafafa", dark: "#1a1a1a" };
 
@@ -26,6 +26,11 @@ function savedTheme(hash: string): Theme | null {
   const s = localStorage.getItem(themeKey(hash));
   return s === "light" || s === "dark" ? s : null;
 }
+
+/* Widen the page cap past exportChat's 1080px reading column — mainly so the
+ * Files tab gets room on PC. body is block-level, so max-width:1920 resolves to
+ * min(1920px, viewport width). */
+const PAGE_MAX = 1920;
 
 interface Props {
   hash: string;
@@ -170,6 +175,7 @@ export function ShareViewer({ hash, shareType }: Props) {
       `html,body,#root{height:auto!important;overflow:visible!important;}\n` +
       `${themeCss}\n` +
       `html,#root{background:${PAGE_BG[theme]}!important;}\n` +
+      `body{max-width:${PAGE_MAX}px!important;}\n` +
       `:root{color-scheme:${theme};}`;
     document.head.appendChild(style);
     return () => { style.remove(); };
