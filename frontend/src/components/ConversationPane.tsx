@@ -3278,7 +3278,12 @@ function CodexTokenCountBlock({ info }: { info: Record<string, unknown> }) {
   );
 }
 
-function MessageEntry({
+// Memoized: the parent re-renders on every poll (1.5s) and on every keystroke
+// in the input box. All object/function props below are referentially stable
+// (useMemo on [messages]/[subagents], useCallback), and `entry` comes from a
+// memoized list, so a shallow compare lets unchanged rows skip re-render — that
+// is what keeps typing responsive when the transcript is long.
+const MessageEntry = React.memo(function MessageEntry({
   entry,
   toolResults,
   codexToolResults,
@@ -3538,7 +3543,7 @@ function MessageEntry({
   }
 
   return null;
-}
+});
 
 // ── Main component ────────────────────────────────────────────────────────────
 
@@ -3702,6 +3707,9 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const paneContainerRef = useRef<HTMLDivElement>(null);
   const [historyPopover, setHistoryPopover] = useState<{ rect: DOMRect | null; container: DOMRect | null } | null>(null);
   const seenCompactUuidsRef = useRef<Set<string>>(new Set());
+  // Signature of the last fetched window — lets the 1.5s poll skip setMessages
+  // (and the full re-render it triggers) when the server returned identical data.
+  const prevMsgSigRef = useRef("");
   // Input height resizable via top-edge grip (drag up to enlarge).
   const [inputHeight, setInputHeight] = useState<number>(() => loadInputHeight(sessionId));
 
@@ -4094,33 +4102,45 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   const fetchMessages = useCallback(async (currentTail: number) => {
     try {
       const data = await getRawMessages(sessionId, currentTail);
-      setMessages(data.messages);
-      setTotal(data.total);
       setLoadingMore(false);
-      // Track newly-appeared compact_boundary entries so we can flash them.
-      const freshUuids: string[] = [];
-      for (const m of data.messages) {
-        if (m.type === "system" && (m as unknown as Record<string, unknown>).subtype === "compact_boundary" && m.uuid) {
-          if (!seenCompactUuidsRef.current.has(m.uuid)) {
-            seenCompactUuidsRef.current.add(m.uuid);
-            freshUuids.push(m.uuid);
+      // Skip the state update (and the full message-list re-render it forces)
+      // when the server returned the same window as last poll. The signature is
+      // total + count + an exact stringify of the last two entries — append,
+      // truncate (rewind), streaming growth, and stop_reason all change one of
+      // these; nothing earlier than the tail mutates in this append-only model
+      // except rewind, which changes the count.
+      const n = data.messages.length;
+      const sig = `${data.total}|${n}|${JSON.stringify(data.messages.slice(Math.max(0, n - 2)))}`;
+      const changed = sig !== prevMsgSigRef.current;
+      if (changed) {
+        prevMsgSigRef.current = sig;
+        setMessages(data.messages);
+        setTotal(data.total);
+        // Track newly-appeared compact_boundary entries so we can flash them.
+        const freshUuids: string[] = [];
+        for (const m of data.messages) {
+          if (m.type === "system" && (m as unknown as Record<string, unknown>).subtype === "compact_boundary" && m.uuid) {
+            if (!seenCompactUuidsRef.current.has(m.uuid)) {
+              seenCompactUuidsRef.current.add(m.uuid);
+              freshUuids.push(m.uuid);
+            }
           }
         }
-      }
-      if (freshUuids.length > 0) {
-        setNewCompactUuids((prev) => {
-          const next = new Set(prev);
-          freshUuids.forEach((id) => next.add(id));
-          return next;
-        });
-        // Clear the flash after 3 seconds.
-        setTimeout(() => {
+        if (freshUuids.length > 0) {
           setNewCompactUuids((prev) => {
             const next = new Set(prev);
-            freshUuids.forEach((id) => next.delete(id));
+            freshUuids.forEach((id) => next.add(id));
             return next;
           });
-        }, 3000);
+          // Clear the flash after 3 seconds.
+          setTimeout(() => {
+            setNewCompactUuids((prev) => {
+              const next = new Set(prev);
+              freshUuids.forEach((id) => next.delete(id));
+              return next;
+            });
+          }, 3000);
+        }
       }
       // Reconcile: pair each pending optimistic bubble with a real user-input
       // entry in the JSONL. Exact text-equality is unreliable because Claude
@@ -4220,6 +4240,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     setOptimisticMsgs([]);
     setNewCompactUuids(new Set());
     seenCompactUuidsRef.current = new Set();
+    prevMsgSigRef.current = "";
     setSubagents([]);
   }, [sessionId]);
 
