@@ -726,7 +726,7 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
         if s.tool == "codex" and s.codex_transport == "app_server":
             from app.agents import get_adapter
             ws = None
-            if s.status == SessionStatus.RUNNING:
+            if s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED):
                 try:
                     ws = get_adapter("codex").get_waiting_state(
                         agent_session_id=s.agent_session_id,
@@ -756,10 +756,17 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
                 )
             )
             continue
+        # A session keeps its Claude process — and thus its PID file, hooks and
+        # tmux pane — alive while DETACHED; only the browser has gone away. So
+        # detect AUQ / approval for DETACHED too, not just RUNNING, otherwise a
+        # session waiting for a decision vanishes from the session list and the
+        # notifier the moment you switch away from it. (Plan/compact detection
+        # below already uses this same RUNNING|DETACHED eligibility.)
+        eligible = s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)
         # PID file is checked first, but Claude Code 2.1.142+ no longer reliably
         # sets waitingFor for AUQ, so we additionally consult the PreToolUse hook
         # file — it captures the AUQ call before the user answers.
-        pid_state = get_pid_waiting_state(s.claude_proc_pid) if s.status == SessionStatus.RUNNING else None
+        pid_state = get_pid_waiting_state(s.claude_proc_pid) if eligible else None
         tui_auq_data: dict | None = None
         tui_approve_data: dict | None = None
         # Plan-modal TUI signal: set when PID is waiting AND the visible screen
@@ -819,7 +826,7 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
         # Fallback path: AUQ from hooks when the PID file didn't flag waiting.
         # We only consider a hook AUQ "pending" if its tool_use_id has no
         # corresponding tool_result in the JSONL yet.
-        if tui_auq_data is None and s.status == SessionStatus.RUNNING and s.agent_session_id:
+        if tui_auq_data is None and eligible and s.agent_session_id:
             pending = _pending_auq_from_hooks(s.agent_session_id, s.cwd)
             if pending:
                 tui_auq_data = pending
@@ -841,7 +848,6 @@ def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
         compacting_progress: str | None = None
         tui_screen_for_hook: str | None = None
 
-        eligible = s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)
         # Capture the TUI once if recent activity warrants it — feeds both
         # the percentage scan and the hook helper's "no longer in TUI" check.
         if (
