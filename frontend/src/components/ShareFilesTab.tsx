@@ -184,7 +184,10 @@ function FileContent({ hash, entry, pal, theme }: { hash: string; entry: ShareFi
     } else if (!raw && isMd(entry.name)) {
       inner = <div className="md" style={{ padding: 16, color: pal.text }} dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} />;
     } else if (!raw && isHtml(entry.name)) {
-      inner = <iframe title={entry.name} srcDoc={content} sandbox="allow-same-origin"
+      // allow-scripts WITHOUT allow-same-origin: the page runs its JS as an
+      // opaque origin (interactive) but cannot reach our cookies/API. Same
+      // sandbox the in-session HtmlViewer uses.
+      inner = <iframe title={entry.name} srcDoc={content} sandbox="allow-scripts"
         style={{ width: "100%", height: "70vh", border: "none", background: "#fff" }} />;
     } else {
       inner = <CodeBlock code={content} lang={HLJS_LANGS[ext(entry.name)]} pal={pal} theme={theme} />;
@@ -285,6 +288,7 @@ export function ShareFilesTab({ hash, theme }: { hash: string; theme: Theme }) {
   const [err, setErr] = useState<string | null>(null);
   const [selected, setSelected] = useState<ShareFileEntry | null>(null);
   const [narrow, setNarrow] = useState(() => window.innerWidth < 700);
+  const [treeCollapsed, setTreeCollapsed] = useState(false);
   const styleRef = useRef<HTMLStyleElement | null>(null);
 
   useEffect(() => {
@@ -309,7 +313,7 @@ export function ShareFilesTab({ hash, theme }: { hash: string; theme: Theme }) {
   }, [hash]);
 
   const tree = (
-    <div style={{ overflowY: "auto", padding: 6 }}>
+    <div style={{ overflowY: "auto", padding: 6, flex: 1, minHeight: 0 }}>
       {err ? (
         <div style={{ padding: 12, fontSize: 12, color: "#c0392b" }}>{err}</div>
       ) : roots === null ? (
@@ -348,7 +352,27 @@ export function ShareFilesTab({ hash, theme }: { hash: string; theme: Theme }) {
 
   return (
     <div style={{ display: "flex", border: `1px solid ${pal.border}`, borderRadius: 8, overflow: "hidden", background: pal.bg, minHeight: 360 }}>
-      <div style={{ width: 260, flexShrink: 0, borderRight: `1px solid ${pal.border}`, background: pal.panel, maxHeight: "78vh" }}>{tree}</div>
+      {treeCollapsed ? (
+        <button
+          onClick={() => setTreeCollapsed(false)}
+          title="展开目录树"
+          style={{ width: 34, flexShrink: 0, borderRight: `1px solid ${pal.border}`, background: pal.panel, color: pal.muted, border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 6, padding: "10px 0", fontSize: 13 }}
+        >
+          <span>📁</span><span>▶</span>
+        </button>
+      ) : (
+        <div style={{ width: 260, flexShrink: 0, borderRight: `1px solid ${pal.border}`, background: pal.panel, maxHeight: "78vh", display: "flex", flexDirection: "column" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "5px 8px 5px 10px", borderBottom: `1px solid ${pal.border}`, flexShrink: 0 }}>
+            <span style={{ fontSize: 12, color: pal.muted }}>文件</span>
+            <button
+              onClick={() => setTreeCollapsed(true)}
+              title="收起目录树"
+              style={{ fontSize: 12, padding: "2px 8px", cursor: "pointer", background: pal.bg, color: pal.text, border: `1px solid ${pal.border}`, borderRadius: 4 }}
+            >◀ 收起</button>
+          </div>
+          {tree}
+        </div>
+      )}
       <div style={{ flex: 1, minWidth: 0, maxHeight: "78vh", overflow: "auto" }}>{content}</div>
     </div>
   );
