@@ -44,6 +44,10 @@ function absoluteUrl(url: string): string {
   return /^https?:/i.test(url) ? url : window.location.origin + url;
 }
 
+function shareTypeLabel(t: ShareType): string {
+  return t === "full" ? "全程同步" : t === "chat" ? "Chat（可对话）" : "限制到截止点";
+}
+
 const labelStyle: React.CSSProperties = { fontSize: 12, color: "var(--text-secondary)", marginBottom: 6, display: "block" };
 const fieldStyle: React.CSSProperties = {
   fontSize: 13, padding: "6px 10px", background: "var(--bg-surface)",
@@ -133,7 +137,9 @@ export function ShareModal({ session, onClose }: Props) {
         expires_at,
         cutoff_after_uuid: shareType === "limited" ? cutoffUuid : undefined,
         default_theme: defaultTheme,
-        file_access: hasFiles ? fileAccess : undefined,
+        // chat shares always expose the whole project; the backend forces
+        // file_access, so don't send a client value.
+        file_access: shareType === "chat" ? undefined : (hasFiles ? fileAccess : undefined),
       });
       setCreated(rec);
       if (tab === "history") loadHistory();
@@ -204,15 +210,25 @@ export function ShareModal({ session, onClose }: Props) {
             <>
               <div>
                 <label style={labelStyle}>分享类型</label>
-                <div style={{ display: "flex", gap: 16 }}>
+                <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
                   <label style={{ fontSize: 13, color: "var(--text-body)", cursor: "pointer" }}>
                     <input type="radio" checked={shareType === "full"} onChange={() => setShareType("full")} /> 全程同步（后续对话持续可见）
                   </label>
                   <label style={{ fontSize: 13, color: "var(--text-body)", cursor: "pointer" }}>
                     <input type="radio" checked={shareType === "limited"} onChange={() => setShareType("limited")} /> 限制到截止点
                   </label>
+                  <label style={{ fontSize: 13, color: "var(--text-body)", cursor: "pointer" }}>
+                    <input type="radio" checked={shareType === "chat"} onChange={() => setShareType("chat")} /> Chat
+                  </label>
                 </div>
               </div>
+
+              {shareType === "chat" && (
+                <div style={{ border: "1px solid #e05260", background: "rgba(224,82,96,0.10)", borderRadius: 8, padding: "10px 12px", fontSize: 12.5, lineHeight: 1.6, color: "#e05260" }}>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>⚠️ 高危：可对话分享</div>
+                  任何拿到此链接的人都能<b>向该活跃会话发送对话指令</b>（Claude 可执行命令、修改文件），并<b>只读浏览整个项目的全部文件</b>。链接即权限，请仅分享给可信任的人。
+                </div>
+              )}
 
               <div>
                 <label style={labelStyle}>失效时间</label>
@@ -235,10 +251,16 @@ export function ShareModal({ session, onClose }: Props) {
                 </div>
               </div>
 
-              <div>
-                <label style={labelStyle}>可公开查看的文件（可选 · 勾选后分享页出现 Files 标签）</label>
-                <ShareFileSelector sessionId={session.id} value={fileAccess} onChange={setFileAccess} />
-              </div>
+              {shareType === "chat" ? (
+                <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                  📁 Chat 分享自动开放整个项目（只读，自动排除 .git / node_modules 等），无需单独勾选文件。
+                </div>
+              ) : (
+                <div>
+                  <label style={labelStyle}>可公开查看的文件（可选 · 勾选后分享页出现 Files 标签）</label>
+                  <ShareFileSelector sessionId={session.id} value={fileAccess} onChange={setFileAccess} />
+                </div>
+              )}
 
               {shareType === "limited" && (
                 <div>
@@ -277,7 +299,7 @@ export function ShareModal({ session, onClose }: Props) {
               {created && (
                 <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
                   <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                    {created.share_type === "full" ? "全程同步" : "限制到截止点"} · 失效：{fmtExpiry(created.expires_at)}
+                    {shareTypeLabel(created.share_type)} · 失效：{fmtExpiry(created.expires_at)}
                   </div>
                   <input readOnly value={absoluteUrl(created.url)} style={{ ...fieldStyle, fontFamily: "monospace" }} onFocus={(e) => e.currentTarget.select()} />
                   {linkRow(created, "created")}
@@ -321,7 +343,7 @@ export function ShareModal({ session, onClose }: Props) {
                                 {isExpanded ? full : full.slice(0, 32) + (full.length > 32 ? "…" : "")}
                               </span>
                             ) : (
-                              <span style={{ color: "var(--text-faint)" }}>—（全程同步）</span>
+                              <span style={{ color: "var(--text-faint)" }}>—（{shareTypeLabel(rec.share_type)}）</span>
                             )}
                           </td>
                           <td style={{ padding: "6px 8px" }}>{linkRow(rec, rec.hash)}</td>

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.agents import get_adapter
 from app.api.files import (
@@ -27,8 +28,14 @@ from app.api.files import (
     _is_text,
     _resolve,
 )
-from app.api.sessions import _get_store
-from app.models.session import FileAccessSpec
+from app.api.sessions import _get_store, _get_tmux
+from app.models.session import FileAccessSpec, SessionStatus
+from app.services.chat_delivery import (
+    AuqPendingError,
+    PromptDeliveryError,
+    SessionOfflineError,
+    deliver_chat_prompt,
+)
 from app.services.claude_session_reader import _parse_ts, read_raw_messages_page
 from app.services.share_cache import share_cache
 
@@ -57,6 +64,9 @@ def get_share_meta(hash: str) -> dict:
     store = _get_store()
     session = store.get(rec.session_id)
     has_files = bool(rec.file_access and (rec.file_access.full or rec.file_access.files))
+    session_alive = bool(
+        session and session.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)
+    )
     return {
         "hash": rec.hash,
         "share_type": rec.share_type,
@@ -66,6 +76,9 @@ def get_share_meta(hash: str) -> dict:
         "cutoff_ts": rec.cutoff_ts,
         "default_theme": rec.default_theme,
         "has_files": has_files,
+        # chat shares: lets the viewer disable the composer when the session
+        # is no longer accepting input.
+        "session_alive": session_alive,
     }
 
 
@@ -94,9 +107,12 @@ def get_share_messages(
     cutoff = rec.cutoff_ts if rec.share_type == "limited" else None
     adapter, chat_sid, jsonl_path = _resolve_jsonl(session)
 
+    session_alive = session.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)
+
     def _resp(messages: list, total: int) -> dict:
         return {"messages": messages, "total": total, "title": session.name,
-                "share_type": rec.share_type, "expires_at": rec.expires_at}
+                "share_type": rec.share_type, "expires_at": rec.expires_at,
+                "session_alive": session_alive}
 
     # Codex stores its transcript outside the line-based JSONL the helper reads;
     # its reader already returns renderer-compatible messages.
@@ -331,3 +347,34 @@ def get_share_raw(hash: str, path: str = Query(..., max_length=500)) -> Streamin
                 yield chunk
 
     return StreamingResponse(_iter_file(target), media_type=mime or "application/octet-stream")
+
+
+# ── Public chat input (chat shares only) ─────────────────────────────────────
+# A "chat" share is interactive: anyone holding the link can send a chat-mode
+# prompt to the live session. Delivery, the AUQ guard, per-session locking, and
+# the liveness check all live in `deliver_chat_prompt`; this route only resolves
+# the share and maps failures to HTTP statuses.
+
+
+class SharePromptRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=50_000)
+
+
+@public_router.post("/{hash}/prompt")
+def post_share_prompt(hash: str, body: SharePromptRequest) -> dict:
+    rec = share_cache.get(hash)
+    if rec is None or rec.share_type != "chat":
+        raise HTTPException(status_code=404, detail="share not found or not interactive")
+    store = _get_store()
+    session = store.get(rec.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session no longer exists")
+    try:
+        deliver_chat_prompt(session, body.text, tmux=_get_tmux(), store=store)
+    except AuqPendingError:
+        raise HTTPException(status_code=409, detail="auq_pending")
+    except SessionOfflineError:
+        raise HTTPException(status_code=409, detail="offline")
+    except PromptDeliveryError as exc:
+        raise HTTPException(status_code=500, detail=f"send failed: {exc}") from exc
+    return {"ok": True}

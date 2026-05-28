@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   getPublicShareMeta,
   getPublicShareMessages,
+  postPublicSharePrompt,
   type RawMessage,
   type ShareType,
 } from "../api/sessionApi";
@@ -145,6 +146,112 @@ function attachInteractions(root: HTMLElement): () => void {
   return () => root.removeEventListener("click", onClick);
 }
 
+/* Bottom composer for chat shares — injects a chat-mode prompt into the live
+ * session. No optimistic bubble: the 1.5s poll pulls the real message back, so
+ * a successful send just clears the box and waits. Uses viewer-static colors
+ * (not app CSS vars) since the share viewer runs outside <App>. */
+function ShareChatComposer({ hash, theme, sessionAlive }: { hash: string; theme: Theme; sessionAlive: boolean }) {
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [hint, setHint] = useState<string | null>(null);
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const dark = theme === "dark";
+  const c = {
+    barBg: dark ? "rgba(26,26,26,0.96)" : "rgba(250,250,250,0.96)",
+    border: dark ? "#444" : "#ddd",
+    inputBg: dark ? "#0d1117" : "#fff",
+    inputText: dark ? "#e6e6e6" : "#222",
+    accent: dark ? "#58a6ff" : "#2563eb",
+    accentText: "#fff",
+    muted: dark ? "#888" : "#999",
+    err: dark ? "#ff7b72" : "#c0392b",
+  };
+
+  const disabled = !sessionAlive;
+
+  const send = useCallback(async () => {
+    const value = text.trim();
+    if (!value || sending) return;
+    setSending(true);
+    setHint(null);
+    try {
+      await postPublicSharePrompt(hash, value);
+      setText("");
+      if (taRef.current) taRef.current.style.height = "auto";
+    } catch (e) {
+      const msg = String((e as Error)?.message || e || "");
+      if (msg.includes("auq_pending")) setHint("会话正在等待确认，请稍后再试");
+      else if (msg.includes("offline")) setHint("会话已离线");
+      else setHint("发送失败，请重试");
+    } finally {
+      setSending(false);
+    }
+  }, [text, sending, hash]);
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void send();
+    }
+  };
+
+  const autoGrow = (el: HTMLTextAreaElement) => {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  };
+
+  return (
+    <div
+      style={{
+        position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 50,
+        background: c.barBg, borderTop: `1px solid ${c.border}`,
+        backdropFilter: "blur(6px)",
+        padding: "10px 12px",
+        boxSizing: "border-box",
+      }}
+    >
+      <div style={{ maxWidth: 1080, margin: "0 auto" }}>
+        {hint && (
+          <div style={{ fontSize: 12, color: c.err, marginBottom: 6, fontFamily: "sans-serif" }}>{hint}</div>
+        )}
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+          <textarea
+            ref={taRef}
+            value={text}
+            disabled={disabled || sending}
+            onChange={(e) => { setText(e.target.value); autoGrow(e.target); }}
+            onKeyDown={onKeyDown}
+            placeholder={disabled ? "会话已离线，无法发送" : "输入消息，Enter 发送 / Shift+Enter 换行"}
+            rows={1}
+            style={{
+              flex: 1, resize: "none", minHeight: 38, maxHeight: 160,
+              padding: "8px 10px", borderRadius: 8,
+              border: `1px solid ${c.border}`, background: c.inputBg, color: c.inputText,
+              fontSize: 14, lineHeight: 1.4, fontFamily: "sans-serif",
+              outline: "none", boxSizing: "border-box",
+              opacity: disabled ? 0.6 : 1,
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => void send()}
+            disabled={disabled || sending || text.trim().length === 0}
+            style={{
+              flex: "0 0 auto", height: 38, padding: "0 18px", borderRadius: 8,
+              border: "none", cursor: disabled || sending || text.trim().length === 0 ? "default" : "pointer",
+              background: disabled || sending || text.trim().length === 0 ? c.muted : c.accent,
+              color: c.accentText, fontSize: 14, fontFamily: "sans-serif", whiteSpace: "nowrap",
+            }}
+          >
+            {sending ? "发送中…" : "发送"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function ShareViewer({ hash, shareType }: Props) {
   const [title, setTitle] = useState("Shared conversation");
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
@@ -158,6 +265,12 @@ export function ShareViewer({ hash, shareType }: Props) {
   const themeOverriddenRef = useRef(savedTheme(hash) !== null);
   const [hasFiles, setHasFiles] = useState(false);
   const [activeTab, setActiveTab] = useState<"chat" | "files">("chat");
+  const [sessionAlive, setSessionAlive] = useState(true);
+
+  // chat shares are live (poll for new messages, follow bottom) like full,
+  // and additionally expose a composer that injects prompts into the session.
+  const isChat = shareType === "chat";
+  const live = shareType === "full" || shareType === "chat";
 
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const loadedRef = useRef<RawMessage[]>([]);
@@ -196,6 +309,7 @@ export function ShareViewer({ hash, shareType }: Props) {
         setExpiresAt(m.expires_at);
         setCutoffTs(m.cutoff_ts ?? null);
         setHasFiles(Boolean(m.has_files));
+        if (typeof m.session_alive === "boolean") setSessionAlive(m.session_alive);
         if (!themeOverriddenRef.current && (m.default_theme === "light" || m.default_theme === "dark")) {
           setTheme(m.default_theme);
         }
@@ -217,20 +331,21 @@ export function ShareViewer({ hash, shareType }: Props) {
       setTotal(data.total);
       setTitle((prev) => data.title || prev);
       setExpiresAt(data.expires_at);
+      if (typeof data.session_alive === "boolean") setSessionAlive(data.session_alive);
       if (data.messages.length > 0) {
         const wasAtBottom = nearBottom();
         loadedRef.current = loadedRef.current.concat(data.messages);
         setLoadedCount(loadedRef.current.length);
         const html = await renderConversationBody(loadedRef.current);
         setBodyHtml(html);
-        if (shareType === "full" && wasAtBottom && userScrolledRef.current) {
+        if (live && wasAtBottom && userScrolledRef.current) {
           requestAnimationFrame(() => window.scrollTo(0, document.documentElement.scrollHeight));
         }
       }
     } finally {
       busyRef.current = false;
     }
-  }, [hash, shareType]);
+  }, [hash, live]);
 
   // Initial load.
   useEffect(() => {
@@ -254,12 +369,13 @@ export function ShareViewer({ hash, shareType }: Props) {
     return () => window.removeEventListener("scroll", onScroll);
   }, [error, fetchForward]);
 
-  // Full-sync polling — pick up newly appended messages (limited shares are frozen).
+  // Live polling — pick up newly appended messages (full + chat; limited shares
+  // are frozen).
   useEffect(() => {
-    if (shareType !== "full" || error) return;
+    if (!live || error) return;
     const id = window.setInterval(() => { void fetchForward(true); }, POLL_MS);
     return () => window.clearInterval(id);
-  }, [shareType, error, fetchForward]);
+  }, [live, error, fetchForward]);
 
   // Re-wire copy/expand interactions whenever the rendered body changes.
   useEffect(() => {
@@ -300,7 +416,9 @@ export function ShareViewer({ hash, shareType }: Props) {
       <header>
         <h1>{title}</h1>
         <div className="meta">
-          {shareType === "full" ? (
+          {isChat ? (
+            <span>💬 Chat · 可对话{sessionAlive ? "" : "（会话已离线）"}</span>
+          ) : shareType === "full" ? (
             <span>🟢 实时同步</span>
           ) : (
             <span>⏸ 截止于 {cutoffTs ? fmtTime(cutoffTs) : "—"}</span>
@@ -347,7 +465,7 @@ export function ShareViewer({ hash, shareType }: Props) {
         {hasFiles && activeTab === "files" && <ShareFilesTab hash={hash} theme={theme} />}
       </div>
 
-      <div style={{ display: hasFiles && activeTab === "files" ? "none" : "block" }}>
+      <div style={{ display: hasFiles && activeTab === "files" ? "none" : "block", paddingBottom: isChat ? 88 : 0 }}>
         {loading && !bodyHtml ? (
           <div style={{ color: "#888", fontSize: 13, fontFamily: "sans-serif" }}>加载中…</div>
         ) : (
@@ -361,6 +479,10 @@ export function ShareViewer({ hash, shareType }: Props) {
           </>
         )}
       </div>
+
+      {isChat && activeTab === "chat" && (
+        <ShareChatComposer hash={hash} theme={theme} sessionAlive={sessionAlive} />
+      )}
     </div>
   );
 }
