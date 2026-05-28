@@ -284,9 +284,6 @@ export function ShareViewer({ hash, shareType }: Props) {
     return next;
   });
 
-  const expandAll = () => bodyRef.current?.querySelectorAll("details").forEach((d) => { (d as HTMLDetailsElement).open = true; });
-  const collapseAll = () => bodyRef.current?.querySelectorAll("details").forEach((d) => { (d as HTMLDetailsElement).open = false; });
-
   if (error) {
     return (
       <div style={{ maxWidth: 920, margin: "0 auto", padding: "80px 20px", textAlign: "center", color: "#888", fontFamily: "sans-serif" }}>
@@ -311,36 +308,36 @@ export function ShareViewer({ hash, shareType }: Props) {
           {expiresAt != null && <span> · {fmtExpiry(expiresAt)}</span>}
           {total > 0 && <span> · 共 {total} 条</span>}
         </div>
-        {hasFiles && (
-          <div className="share-tabs" style={{ display: "flex", gap: 6, marginTop: 12 }}>
-            {(["chat", "files"] as const).map((id) => {
-              const on = activeTab === id;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => setActiveTab(id)}
-                  style={{
-                    fontSize: 13, padding: "6px 16px", borderRadius: 6, cursor: "pointer",
-                    border: `1px solid ${on ? (theme === "dark" ? "#58a6ff" : "#2563eb") : (theme === "dark" ? "#444" : "#ddd")}`,
-                    background: on ? (theme === "dark" ? "rgba(88,166,255,0.15)" : "rgba(37,99,235,0.08)") : "transparent",
-                    color: on ? (theme === "dark" ? "#58a6ff" : "#2563eb") : (theme === "dark" ? "#aaa" : "#666"),
-                  }}
-                >
-                  {id === "chat" ? "💬 Chat" : "📁 Files"}
-                </button>
-              );
-            })}
-          </div>
-        )}
-        <div className="toolbar">
-          {(!hasFiles || activeTab === "chat") && (
-            <>
-              <button type="button" onClick={expandAll}>Expand all</button>
-              <button type="button" onClick={collapseAll}>Collapse all</button>
-            </>
-          )}
-          <button type="button" onClick={toggleTheme} title="切换深色 / 浅色">
+        <div className="share-tabs" style={{ display: "flex", gap: 6, marginTop: 12, alignItems: "center", flexWrap: "wrap" }}>
+          {hasFiles && (["chat", "files"] as const).map((id) => {
+            const on = activeTab === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setActiveTab(id)}
+                style={{
+                  fontSize: 13, padding: "6px 16px", borderRadius: 6, cursor: "pointer",
+                  border: `1px solid ${on ? (theme === "dark" ? "#58a6ff" : "#2563eb") : (theme === "dark" ? "#444" : "#ddd")}`,
+                  background: on ? (theme === "dark" ? "rgba(88,166,255,0.15)" : "rgba(37,99,235,0.08)") : "transparent",
+                  color: on ? (theme === "dark" ? "#58a6ff" : "#2563eb") : (theme === "dark" ? "#aaa" : "#666"),
+                }}
+              >
+                {id === "chat" ? "💬 Chat" : "📁 Files"}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={toggleTheme}
+            title="切换深色 / 浅色"
+            style={{
+              fontSize: 13, padding: "6px 16px", borderRadius: 6, cursor: "pointer",
+              border: `1px solid ${theme === "dark" ? "#444" : "#ddd"}`,
+              background: "transparent",
+              color: theme === "dark" ? "#aaa" : "#666",
+            }}
+          >
             {theme === "dark" ? "☀️ 浅色" : "🌙 深色"}
           </button>
         </div>
