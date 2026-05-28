@@ -308,17 +308,6 @@ export function ShareViewer({ hash, shareType }: Props) {
           {expiresAt != null && <span> · {fmtExpiry(expiresAt)}</span>}
           {total > 0 && <span> · 共 {total} 条</span>}
         </div>
-        <div className="toolbar">
-          {(!hasFiles || activeTab === "chat") && (
-            <>
-              <button type="button" onClick={expandAll}>Expand all</button>
-              <button type="button" onClick={collapseAll}>Collapse all</button>
-            </>
-          )}
-          <button type="button" onClick={toggleTheme} title="切换深色 / 浅色">
-            {theme === "dark" ? "☀️ 浅色" : "🌙 深色"}
-          </button>
-        </div>
         {hasFiles && (
           <div className="share-tabs" style={{ display: "flex", gap: 6, marginTop: 12 }}>
             {(["chat", "files"] as const).map((id) => {
@@ -341,6 +330,17 @@ export function ShareViewer({ hash, shareType }: Props) {
             })}
           </div>
         )}
+        <div className="toolbar">
+          {(!hasFiles || activeTab === "chat") && (
+            <>
+              <button type="button" onClick={expandAll}>Expand all</button>
+              <button type="button" onClick={collapseAll}>Collapse all</button>
+            </>
+          )}
+          <button type="button" onClick={toggleTheme} title="切换深色 / 浅色">
+            {theme === "dark" ? "☀️ 浅色" : "🌙 深色"}
+          </button>
+        </div>
       </header>
 
       <div style={{ display: hasFiles && activeTab === "files" ? "block" : "none" }}>
