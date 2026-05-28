@@ -518,7 +518,7 @@ function buildCompactMaps(messages: RawMessage[]): { compactSummaries: Map<strin
 const LIGHT_BASE = `
 :root { color-scheme: light dark; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-       max-width: 920px; margin: 0 auto; padding: 24px 20px 60px; line-height: 1.6;
+       max-width: 1080px; margin: 0 auto; padding: 24px 20px 60px; line-height: 1.6;
        background: #fafafa; color: #222; }
 header { border-bottom: 1px solid #e5e5e5; margin-bottom: 20px; padding-bottom: 12px; }
 h1 { font-size: 18px; margin: 0 0 4px; }
@@ -682,6 +682,14 @@ h1 { font-size: 18px; margin: 0 0 4px; }
             border-radius: 3px; cursor: pointer; color: #444; }
 .copy-btn:hover { background: #f0f0f0; }
 .copy-btn.copied { background: #d4edda; border-color: #5cb85c; color: #155724; }
+
+/* Narrow viewports (phones / tablets up to the 1080 content cap): the body is
+   already full-width since max-width >= screen, so just trim the side padding
+   to reclaim edge space. Bubble percentages are intentionally left alone to
+   keep the chat left/right offset. */
+@media (max-width: 1080px) {
+  body { padding-left: 10px; padding-right: 10px; }
+}
 `;
 
 /* Dark-theme color overrides. Shared by the static export's system-preference
