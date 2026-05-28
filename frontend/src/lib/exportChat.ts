@@ -484,7 +484,7 @@ function buildCompactMaps(messages: RawMessage[]): { compactSummaries: Map<strin
   return { compactSummaries, compactSummaryUuids };
 }
 
-const STYLE = `
+const LIGHT_BASE = `
 :root { color-scheme: light dark; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
        max-width: 920px; margin: 0 auto; padding: 24px 20px 60px; line-height: 1.6;
@@ -643,8 +643,11 @@ h1 { font-size: 18px; margin: 0 0 4px; }
             border-radius: 3px; cursor: pointer; color: #444; }
 .copy-btn:hover { background: #f0f0f0; }
 .copy-btn.copied { background: #d4edda; border-color: #5cb85c; color: #155724; }
+`;
 
-@media (prefers-color-scheme: dark) {
+/* Dark-theme color overrides. Shared by the static export's system-preference
+ * media query (STYLE) and the share viewer's manual light/dark toggle (DARK_STYLE). */
+const DARK_RULES = `
   body { background: #1a1a1a; color: #eaeaea; }
   header { border-bottom-color: #333; }
   .row.assistant .bubble { background: #2a2a2a; color: #eaeaea; }
@@ -699,7 +702,21 @@ h1 { font-size: 18px; margin: 0 0 4px; }
   .compact-meta { color: #888; }
   .compact-ts { color: #666; }
   .compact-body { background: #1a1a1a; border-top-color: #333; color: #eaeaea; }
+`;
+
+/* Static HTML export: light base that auto-flips to dark per system preference. */
+export const STYLE = `${LIGHT_BASE}
+@media (prefers-color-scheme: dark) {
+${DARK_RULES}
 }
+`;
+
+/* Share viewer — forced light theme (ignores system preference). */
+export const LIGHT_STYLE = LIGHT_BASE;
+
+/* Share viewer — forced dark theme (dark rules applied unconditionally). */
+export const DARK_STYLE = `${LIGHT_BASE}
+${DARK_RULES}
 `;
 
 const SCRIPT = `
@@ -814,11 +831,21 @@ const SCRIPT = `
 })();
 `;
 
-async function buildHtml(title: string, messages: RawMessage[]): Promise<string> {
+async function renderEntries(messages: RawMessage[]): Promise<string[]> {
   const toolResults = buildToolResultMap(messages);
   const { compactSummaries, compactSummaryUuids } = buildCompactMaps(messages);
-  const rendered = (await Promise.all(messages.map((m) => renderEntry(m, toolResults, compactSummaries, compactSummaryUuids))))
+  return (await Promise.all(messages.map((m) => renderEntry(m, toolResults, compactSummaries, compactSummaryUuids))))
     .filter((s) => s.length > 0);
+}
+
+/** Render conversation entries to an HTML body string (no <html> wrapper).
+ *  Shared by the static export and the live share viewer. */
+export async function renderConversationBody(messages: RawMessage[]): Promise<string> {
+  return (await renderEntries(messages)).join("\n");
+}
+
+async function buildHtml(title: string, messages: RawMessage[]): Promise<string> {
+  const rendered = await renderEntries(messages);
   return `<!doctype html>
 <html lang="en">
 <head>

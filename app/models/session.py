@@ -76,6 +76,28 @@ class ScheduledTask(BaseModel):
     loop_seconds: int | None = None
 
 
+# Permanent shares never expire; spec pins the sentinel to 2**31-1.
+PERMANENT_SHARE_EXPIRES = 2147483647
+
+
+class ShareRecord(BaseModel):
+    hash: str
+    session_id: str
+    owner_id: str
+    share_type: Literal["full", "limited"]
+    # limited-only: the effective timestamp (epoch seconds) of the first
+    # turn_duration after the chosen user message — everything at or before
+    # this is visible. None for full shares.
+    cutoff_ts: float | None = None
+    cutoff_msg_uuid: str | None = None
+    cutoff_msg_text: str | None = None  # full text; UI shows first 32 chars
+    created_at: float  # epoch seconds
+    expires_at: float  # epoch seconds; PERMANENT_SHARE_EXPIRES = never
+    # Theme the viewer opens with; readers can still toggle. Existing shares
+    # were backfilled to 'light'.
+    default_theme: Literal["light", "dark"] = "light"
+
+
 class TaskCreateRequest(BaseModel):
     command: str = Field(min_length=1, max_length=2000)
     delay_seconds: int = Field(ge=1, le=604800)  # max 7 days

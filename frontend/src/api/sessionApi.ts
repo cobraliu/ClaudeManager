@@ -1572,6 +1572,68 @@ export function getAllRawMessages(sessionId: string): Promise<{ messages: RawMes
   return request<{ messages: RawMessage[]; total: number }>(`/api/sessions/${sessionId}/raw-messages/all`);
 }
 
+// ── Conversation shares ─────────────────────────────────────────────────────
+
+export type ShareType = "full" | "limited";
+export type ShareTheme = "light" | "dark";
+
+export interface ShareRecord {
+  hash: string;
+  share_type: ShareType;
+  url: string;
+  created_at: number;       // epoch seconds
+  expires_at: number;       // epoch seconds; 2147483647 = permanent
+  cutoff_ts?: number | null;
+  cutoff_msg_text?: string | null;
+  default_theme?: ShareTheme;
+}
+
+export interface ShareCreateBody {
+  share_type: ShareType;
+  expires_at?: number;       // epoch seconds; ignored when permanent
+  permanent?: boolean;
+  cutoff_after_uuid?: string;  // required for limited
+  default_theme?: ShareTheme;  // viewer's initial theme (default light)
+}
+
+export function createShare(sessionId: string, body: ShareCreateBody): Promise<ShareRecord> {
+  return request<ShareRecord>(`/api/sessions/${sessionId}/shares`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function listShares(sessionId: string): Promise<ShareRecord[]> {
+  return request<ShareRecord[]>(`/api/sessions/${sessionId}/shares`);
+}
+
+export function deleteShare(sessionId: string, hash: string): Promise<void> {
+  return request<void>(`/api/sessions/${sessionId}/shares/${hash}`, { method: "DELETE" });
+}
+
+export interface ShareMeta {
+  hash: string;
+  share_type: ShareType;
+  title: string;
+  created_at: number;
+  expires_at: number;
+  cutoff_ts?: number | null;
+  default_theme?: ShareTheme;
+}
+
+// Public (no auth) — used by the share viewer.
+export function getPublicShareMeta(hash: string): Promise<ShareMeta> {
+  return request<ShareMeta>(`/api/public/share/${hash}`, undefined, true);
+}
+
+export function getPublicShareMessages(
+  hash: string,
+  offset = 0,
+  limit = 100,
+): Promise<{ messages: RawMessage[]; total: number; title: string; share_type: ShareType; expires_at: number }> {
+  return request(`/api/public/share/${hash}/messages?offset=${offset}&limit=${limit}`, undefined, true);
+}
+
 export interface SubAgentMeta {
   agentId: string;
   description: string;

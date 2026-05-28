@@ -838,3 +838,144 @@ def get_conversation(claude_session_id: str, cwd: str, from_ts: float = 0.0) -> 
         result.extend(current_group)
 
     return result
+
+
+# ── Conversation share helpers ──────────────────────────────────────────────
+
+
+def _effective_timestamps(entries: list[dict]) -> list[float]:
+    """Effective ts per entry: its own timestamp, or the previous entry's
+    effective ts when untimed (so untimed entries stay glued to neighbors
+    instead of bubbling). Mirrors the resort logic in sessions.get_raw_messages.
+    """
+    eff: list[float] = []
+    prev = 0.0
+    for d in entries:
+        ts = _parse_ts(d) if isinstance(d, dict) else 0.0
+        if ts == 0.0:
+            eff.append(prev)
+        else:
+            eff.append(ts)
+            prev = ts
+    return eff
+
+
+def read_raw_messages_page(
+    jsonl_path: Path,
+    tail: int,
+    cutoff_ts: float | None = None,
+    offset: int | None = None,
+) -> dict:
+    """Return JSONL entries (chronologically sorted, oldest→newest) + total.
+
+    Forward-scans the whole file, re-sorts by effective timestamp, applies the
+    optional `cutoff_ts` filter (keep entries with effective ts <= cutoff_ts —
+    used to freeze limited shares), then windows the result:
+      - offset is not None → ascending slice `[offset : offset+tail]` (forward
+                             pagination for the share viewer; `tail<=0` means
+                             "to the end").
+      - offset is None     → the last `tail` entries (legacy tail behavior;
+                             `tail<=0` means "everything").
+
+    `total` is the count of eligible entries (after the optional cutoff filter),
+    so the viewer can tell how much is left to load.
+    """
+    try:
+        entries: list[dict] = []
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except OSError:
+        return {"messages": [], "total": 0}
+
+    if not entries:
+        return {"messages": [], "total": 0}
+
+    eff = _effective_timestamps(entries)
+    indexed = sorted(enumerate(entries), key=lambda pair: (eff[pair[0]], pair[0]))
+
+    if cutoff_ts is not None:
+        indexed = [(i, d) for (i, d) in indexed if eff[i] <= cutoff_ts]
+
+    ordered = [d for _, d in indexed]
+    total = len(ordered)
+    if offset is not None:
+        ordered = ordered[offset: offset + tail] if tail > 0 else ordered[offset:]
+    elif tail > 0 and total > tail:
+        ordered = ordered[-tail:]
+    return {"messages": ordered, "total": total}
+
+
+def _entry_user_text(entry: dict) -> str:
+    """Plain text of a user-message entry (joined text blocks, or raw string)."""
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def compute_share_cutoff(jsonl_path: Path, after_uuid: str) -> dict | None:
+    """Compute the limited-share cutoff for a chosen user message.
+
+    Finds the entry with uuid == `after_uuid`, then the FIRST `turn_duration`
+    system entry after it (in effective-timestamp order); the cutoff is that
+    marker's effective timestamp — i.e. the chosen turn's full output is
+    included. If no turn_duration follows yet (turn still in progress), falls
+    back to the latest entry's timestamp so everything currently present is
+    included.
+
+    Returns {"cutoff_ts": float, "cutoff_msg_text": str} or None if the uuid
+    wasn't found.
+    """
+    try:
+        entries: list[dict] = []
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except OSError:
+        return None
+
+    if not entries:
+        return None
+
+    eff = _effective_timestamps(entries)
+    order = sorted(range(len(entries)), key=lambda i: (eff[i], i))
+
+    sel_pos = None  # position within `order`
+    for pos, idx in enumerate(order):
+        if entries[idx].get("uuid") == after_uuid:
+            sel_pos = pos
+            break
+    if sel_pos is None:
+        return None
+
+    sel_idx = order[sel_pos]
+    cutoff_ts = eff[order[-1]]  # fallback: latest entry
+    for idx in order[sel_pos + 1:]:
+        if _is_turn_complete(entries[idx]):
+            cutoff_ts = eff[idx]
+            break
+
+    return {
+        "cutoff_ts": cutoff_ts,
+        "cutoff_msg_text": _entry_user_text(entries[sel_idx]),
+    }
