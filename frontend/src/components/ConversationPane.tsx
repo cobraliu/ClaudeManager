@@ -20,6 +20,11 @@ import {
 import { PromptHistoryPopover } from "./PromptHistoryPopover";
 
 const POLL_MS = 1500;
+// Idle cadence: when the session is not streaming/compacting/waiting and no
+// send is outstanding, nothing new can land between the status poll's
+// hint-driven refresh and the next is_streaming flip, so a slow poll is safe
+// and the change-token short-circuit makes each tick nearly free.
+const IDLE_POLL_MS = 10000;
 const DEFAULT_TAIL = 100;
 // crypto.randomUUID() requires a secure context (HTTPS/localhost).
 // Fall back to Math.random on plain HTTP local-network access.
@@ -4285,14 +4290,23 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     return () => { cancelled = true; clearInterval(id); };
   }, [sessionId, isStreaming]);
 
+  // "Active" = any state where new content can land continuously and must be
+  // shown promptly: streaming, compacting, a pending AUQ/approval, or an
+  // optimistic send still in flight. Anything here keeps the poll at 1.5s; only
+  // a fully-idle session drops to IDLE_POLL_MS. This is a boolean so the poll
+  // effect re-runs only on the active↔idle transition, not on every mutation.
+  const pollActive =
+    isStreaming || isCompacting || isWaitingForAuq ||
+    !!pendingAuqData || !!pendingApproveData || optimisticMsgs.length > 0;
+
   useEffect(() => {
-    // Session or tail changed: drop the change token so the first fetch returns
-    // a full payload (a grown tail must never be short-circuited as unchanged).
+    // Session, tail, or active-state changed: drop the change token so the first
+    // fetch returns a full payload (a grown tail must never be short-circuited).
     lastTokenRef.current = undefined;
     fetchMessages(tail);
-    pollRef.current = setInterval(() => fetchMessages(tail), POLL_MS);
+    pollRef.current = setInterval(() => fetchMessages(tail), pollActive ? POLL_MS : IDLE_POLL_MS);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [fetchMessages, tail]);
+  }, [fetchMessages, tail, pollActive]);
 
   const loadMore = useCallback(() => {
     const el = scrollRef.current;
