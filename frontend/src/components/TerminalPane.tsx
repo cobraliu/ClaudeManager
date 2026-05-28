@@ -146,7 +146,7 @@ export function TerminalPane({ wsUrl, sessionId, scrollMode = "pty", onDisconnec
       customGlyphs: true,
       theme: theme === "light" ? TERMINAL_THEME_LIGHT : TERMINAL_THEME,
       convertEol: false,
-      scrollback: 100000,
+      scrollback: 10000,
       wordSeparator: " ()[]{}',\"`|;:@#$%^&*+=<>/\\~",
       macOptionClickForcesSelection: true,
       allowProposedApi: true,
