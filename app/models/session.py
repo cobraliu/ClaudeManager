@@ -80,6 +80,16 @@ class ScheduledTask(BaseModel):
 PERMANENT_SHARE_EXPIRES = 2147483647
 
 
+class FileAccessSpec(BaseModel):
+    # Paths are relative to the session's cwd. `full` dirs grant their entire
+    # (non-hidden, non-skipped) subtree recursively, including files added
+    # later; `files` are individually granted. A dir is "partial" (a nav-only
+    # container) when it is an ancestor of a `files`/`full` entry but not itself
+    # in `full` — that state is derived, not stored.
+    full: list[str] = Field(default_factory=list)
+    files: list[str] = Field(default_factory=list)
+
+
 class ShareRecord(BaseModel):
     hash: str
     session_id: str
@@ -96,6 +106,9 @@ class ShareRecord(BaseModel):
     # Theme the viewer opens with; readers can still toggle. Existing shares
     # were backfilled to 'light'.
     default_theme: Literal["light", "dark"] = "light"
+    # Public file-viewing spec for the share's Files tab. None = no files
+    # exposed (viewer shows Chat only, no tab bar).
+    file_access: FileAccessSpec | None = None
 
 
 class TaskCreateRequest(BaseModel):

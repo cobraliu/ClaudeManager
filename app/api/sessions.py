@@ -17,6 +17,7 @@ from app.config import get_default_workspace
 from app.models.session import (
     AttachRequest,
     AttachResponse,
+    FileAccessSpec,
     ScheduledTask,
     SessionCreateRequest,
     SessionListResponse,
@@ -2600,6 +2601,9 @@ class ShareCreateRequest(BaseModel):
     cutoff_after_uuid: str | None = None
     # Theme the viewer opens with (readers can still toggle).
     default_theme: Literal["light", "dark"] = "light"
+    # Optional public file-viewing spec. Paths are relative to session.cwd;
+    # reads still go through the path-traversal guard, so this is not trusted.
+    file_access: FileAccessSpec | None = None
 
 
 def _share_to_view(rec: ShareRecord) -> dict:
@@ -2612,6 +2616,7 @@ def _share_to_view(rec: ShareRecord) -> dict:
         "cutoff_ts": rec.cutoff_ts,
         "cutoff_msg_text": rec.cutoff_msg_text,
         "default_theme": rec.default_theme,
+        "has_files": bool(rec.file_access and (rec.file_access.full or rec.file_access.files)),
     }
 
 
@@ -2665,6 +2670,7 @@ def create_share(session_id: str, body: ShareCreateRequest, user_id: CurrentUser
         created_at=time.time(),
         expires_at=expires_at,
         default_theme=body.default_theme,
+        file_access=(body.file_access if (body.file_access and (body.file_access.full or body.file_access.files)) else None),
     )
     store.create_share(rec)
     share_cache.put(rec)

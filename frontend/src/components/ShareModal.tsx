@@ -4,12 +4,14 @@ import {
   deleteShare,
   getAllRawMessages,
   listShares,
+  type FileAccessSpec,
   type RawMessage,
   type SessionMeta,
   type ShareRecord,
   type ShareTheme,
   type ShareType,
 } from "../api/sessionApi";
+import { ShareFileSelector } from "./ShareFileSelector";
 
 const PERMANENT_EXPIRES = 2147483647;
 const DAY = 86400;
@@ -54,6 +56,7 @@ export function ShareModal({ session, onClose }: Props) {
   // ── create form state ──
   const [shareType, setShareType] = useState<ShareType>("full");
   const [defaultTheme, setDefaultTheme] = useState<ShareTheme>("light");
+  const [fileAccess, setFileAccess] = useState<FileAccessSpec>({ full: [], files: [] });
   const [preset, setPreset] = useState<ExpiryPreset>("7d");
   const [customDt, setCustomDt] = useState("");
   const [userMsgs, setUserMsgs] = useState<RawMessage[]>([]);
@@ -123,12 +126,14 @@ export function ShareModal({ session, onClose }: Props) {
     }
     setCreating(true);
     try {
+      const hasFiles = fileAccess.full.length > 0 || fileAccess.files.length > 0;
       const rec = await createShare(session.id, {
         share_type: shareType,
         permanent,
         expires_at,
         cutoff_after_uuid: shareType === "limited" ? cutoffUuid : undefined,
         default_theme: defaultTheme,
+        file_access: hasFiles ? fileAccess : undefined,
       });
       setCreated(rec);
       if (tab === "history") loadHistory();
@@ -228,6 +233,11 @@ export function ShareModal({ session, onClose }: Props) {
                     <button key={id} onClick={() => setDefaultTheme(id)} style={{ ...fieldStyle, cursor: "pointer", borderColor: defaultTheme === id ? "var(--accent-blue)" : "var(--border)", color: defaultTheme === id ? "var(--accent-blue)" : "var(--text-body)" }}>{lbl}</button>
                   ))}
                 </div>
+              </div>
+
+              <div>
+                <label style={labelStyle}>可公开查看的文件（可选 · 勾选后分享页出现 Files 标签）</label>
+                <ShareFileSelector sessionId={session.id} value={fileAccess} onChange={setFileAccess} />
               </div>
 
               {shareType === "limited" && (

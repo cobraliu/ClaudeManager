@@ -1577,6 +1577,13 @@ export function getAllRawMessages(sessionId: string): Promise<{ messages: RawMes
 export type ShareType = "full" | "limited";
 export type ShareTheme = "light" | "dark";
 
+// Public file-viewing spec. Paths are relative to the session cwd. `full` dirs
+// grant their entire subtree recursively; `files` are individual grants.
+export interface FileAccessSpec {
+  full: string[];
+  files: string[];
+}
+
 export interface ShareRecord {
   hash: string;
   share_type: ShareType;
@@ -1586,6 +1593,7 @@ export interface ShareRecord {
   cutoff_ts?: number | null;
   cutoff_msg_text?: string | null;
   default_theme?: ShareTheme;
+  has_files?: boolean;
 }
 
 export interface ShareCreateBody {
@@ -1594,6 +1602,7 @@ export interface ShareCreateBody {
   permanent?: boolean;
   cutoff_after_uuid?: string;  // required for limited
   default_theme?: ShareTheme;  // viewer's initial theme (default light)
+  file_access?: FileAccessSpec;  // optional public files for the Files tab
 }
 
 export function createShare(sessionId: string, body: ShareCreateBody): Promise<ShareRecord> {
@@ -1619,6 +1628,7 @@ export interface ShareMeta {
   expires_at: number;
   cutoff_ts?: number | null;
   default_theme?: ShareTheme;
+  has_files?: boolean;
 }
 
 // Public (no auth) — used by the share viewer.
@@ -1632,6 +1642,49 @@ export function getPublicShareMessages(
   limit = 100,
 ): Promise<{ messages: RawMessage[]; total: number; title: string; share_type: ShareType; expires_at: number }> {
   return request(`/api/public/share/${hash}/messages?offset=${offset}&limit=${limit}`, undefined, true);
+}
+
+// ── Public share files (no auth) — back the viewer's Files tab. ──────────────
+export interface ShareFileEntry {
+  name: string;
+  path: string;             // relative to session cwd
+  type: "file" | "dir";
+  size?: number | null;
+  is_text?: boolean;
+  is_skipped?: boolean;
+  is_sqlite?: boolean;
+  is_archive?: boolean;
+}
+
+export interface ShareFilesResponse {
+  entries: ShareFileEntry[];
+  path: string;             // current dir relative to cwd
+}
+
+export interface ShareFileContent {
+  path: string;
+  content: string;
+  is_text: boolean;
+  too_large: boolean;
+}
+
+export function getPublicShareFiles(hash: string, path = ""): Promise<ShareFilesResponse> {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  return request<ShareFilesResponse>(`/api/public/share/${hash}/files${qs}`, undefined, true);
+}
+
+export function getPublicShareFileContent(hash: string, path: string): Promise<ShareFileContent> {
+  return request<ShareFileContent>(
+    `/api/public/share/${hash}/file?path=${encodeURIComponent(path)}`,
+    undefined,
+    true,
+  );
+}
+
+// Direct URL for inline <img> rendering of a granted image file. Goes through
+// apiPath so it respects any ROOT_PATH prefix.
+export function publicShareRawUrl(hash: string, path: string): string {
+  return apiPath(`/api/public/share/${hash}/raw?path=${encodeURIComponent(path)}`);
 }
 
 export interface SubAgentMeta {

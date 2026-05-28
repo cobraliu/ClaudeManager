@@ -8,7 +8,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Iterable
 
-from app.models.session import SessionMetadata, SessionStatus, ScheduledTask, ShareRecord
+from app.models.session import SessionMetadata, SessionStatus, ScheduledTask, ShareRecord, FileAccessSpec
 
 
 _ALLOWED_TRANSITIONS: dict[SessionStatus, set[SessionStatus]] = {
@@ -149,6 +149,12 @@ class SessionStore:
             self._conn.execute(
                 "ALTER TABLE shares ADD COLUMN default_theme TEXT NOT NULL DEFAULT 'light'"
             )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        # Auto-migrate shares (file_access added later; JSON of FileAccessSpec, NULL = no files)
+        try:
+            self._conn.execute("ALTER TABLE shares ADD COLUMN file_access TEXT")
             self._conn.commit()
         except sqlite3.OperationalError:
             pass
@@ -826,6 +832,12 @@ class SessionStore:
 
     @staticmethod
     def _row_to_share(row: sqlite3.Row) -> ShareRecord:
+        file_access = None
+        if "file_access" in row.keys() and row["file_access"]:
+            try:
+                file_access = FileAccessSpec(**json.loads(row["file_access"]))
+            except (ValueError, TypeError):
+                file_access = None
         return ShareRecord(
             hash=row["hash"],
             session_id=row["session_id"],
@@ -837,20 +849,25 @@ class SessionStore:
             created_at=row["created_at"],
             expires_at=row["expires_at"],
             default_theme=(row["default_theme"] if "default_theme" in row.keys() else "light"),
+            file_access=file_access,
         )
 
     def create_share(self, share: ShareRecord) -> ShareRecord:
         """Insert (or replace, if the same hash already exists) a share."""
+        file_access_json = (
+            json.dumps(share.file_access.model_dump()) if share.file_access else None
+        )
         with self._lock:
             self._conn.execute(
                 """INSERT OR REPLACE INTO shares
                    (hash, session_id, owner_id, share_type, cutoff_ts,
                     cutoff_msg_uuid, cutoff_msg_text, created_at, expires_at,
-                    default_theme)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    default_theme, file_access)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (share.hash, share.session_id, share.owner_id, share.share_type,
                  share.cutoff_ts, share.cutoff_msg_uuid, share.cutoff_msg_text,
-                 share.created_at, share.expires_at, share.default_theme),
+                 share.created_at, share.expires_at, share.default_theme,
+                 file_access_json),
             )
             self._conn.commit()
         return share
