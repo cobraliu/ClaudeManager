@@ -260,6 +260,7 @@ export interface ConfigView {
   file_viewer_max_lines: number;
   file_viewer_max_bytes: number;
   enabled_tools: string[];
+  skip_dirs: string[];
 }
 
 export interface FontInfo {
@@ -342,6 +343,13 @@ export function setEnabledTools(tools: string[]): Promise<ConfigView> {
   return request("/api/config/enabled-tools", {
     method: "PUT",
     body: JSON.stringify({ tools }),
+  });
+}
+
+export function setSkipDirs(skip_dirs: string[]): Promise<ConfigView> {
+  return request("/api/config/skip-dirs", {
+    method: "PUT",
+    body: JSON.stringify({ skip_dirs }),
   });
 }
 
