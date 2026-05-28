@@ -698,11 +698,23 @@ def get_external_preview(agent_session_id: str, cwd: str, user_id: CurrentUser, 
 
 
 @router.get("/status")
-def list_sessions_status(user_id: CurrentUser) -> SessionStatusListResponse:
-    """Lightweight endpoint: returns only status/activity fields, no Claude enrichment."""
+def list_sessions_status(
+    user_id: CurrentUser,
+    scope: str = Query(default="all"),
+) -> SessionStatusListResponse:
+    """Lightweight endpoint: returns only status/activity fields, no Claude enrichment.
+
+    `scope="active"` restricts the result to RUNNING/DETACHED sessions. The
+    high-frequency frontend poll uses it: attention (plan/auq/approve) and the
+    live TUI hint only exist for eligible sessions, so terminated/stopped ones
+    contribute nothing yet still cost a per-session loop iteration and payload.
+    Non-active sessions are refreshed by the slower full session-list poll.
+    """
     store = _get_store()
     tmux = _get_tmux()
     items = store.list_for_owner(user_id)
+    if scope == "active":
+        items = [s for s in items if s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)]
     session_ids = [s.id for s in items]
     new_output_map = store.get_has_new_output_bulk(session_ids, user_id)
     task_map = store.list_pending_tasks_for_sessions(session_ids)

@@ -424,8 +424,9 @@ export interface SessionStatusListResponse {
   total: number;
 }
 
-export function listSessionsStatus(): Promise<SessionStatusListResponse> {
-  return request("/api/sessions/status");
+export function listSessionsStatus(scope: "all" | "active" = "all"): Promise<SessionStatusListResponse> {
+  const q = scope === "active" ? "?scope=active" : "";
+  return request(`/api/sessions/status${q}`);
 }
 
 

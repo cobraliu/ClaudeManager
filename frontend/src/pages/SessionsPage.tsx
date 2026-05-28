@@ -1703,7 +1703,10 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     let cancelled = false;
     const poll = async () => {
       try {
-        const res = await listSessionsStatus();
+        // Active tier only: attention + live TUI hints exist solely for
+        // RUNNING/DETACHED sessions, so this 3s poll skips terminated/stopped
+        // ones entirely. Non-active sessions are covered by the 5s list poll.
+        const res = await listSessionsStatus("active");
         if (cancelled) return;
         // Build attention map across ALL sessions (not just active) so the
         // session list can flag pending work even when nothing is attached.
