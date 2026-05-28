@@ -20,7 +20,7 @@ const STATUS_COLORS: Record<string, string> = {
   terminated: "#d9534f",
 };
 
-type AttentionKind = "plan" | "auq" | "approve";
+export type AttentionKind = "plan" | "auq" | "approve";
 
 interface Props {
   session: SessionMeta;
@@ -39,7 +39,7 @@ interface Props {
   loading?: boolean;
 }
 
-const ATTENTION_LABEL: Record<AttentionKind, string> = {
+export const ATTENTION_LABEL: Record<AttentionKind, string> = {
   plan: "APPROVE PLAN",
   auq: "ANSWER QUESTION",
   approve: "APPROVE TOOL",

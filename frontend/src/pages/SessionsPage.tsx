@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { DownloadExclusionModal } from "../components/DownloadExclusionModal";
 import { useWindowSize } from "../lib/useWindowSize";
 import {
@@ -41,7 +41,8 @@ import {
 import { TuiPane } from "../components/TuiPane";
 import { ConversationPane } from "../components/ConversationPane";
 import { CodePane, FileViewerPane, FileSidePanel, ScratchEditorPane } from "../components/CodePane";
-import { SessionCard, PromptText } from "../components/SessionCard";
+import { SessionCard, PromptText, type AttentionKind } from "../components/SessionCard";
+import { AttentionNotifier, type AttentionItem } from "../components/AttentionNotifier";
 import { UsageBar, UsageCenter } from "../components/UsageBar";
 import { FileEditorModal } from "../components/FileEditorModal";
 import { GitPanel } from "../components/GitPanel";
@@ -1448,7 +1449,6 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   // Per-session attention markers for the session list. Populated by the same
   // /api/sessions/status poll that drives the active session's tui_*. Keyed by
   // session.id → highest-priority pending kind. Plan > AUQ > approve.
-  type AttentionKind = "plan" | "auq" | "approve";
   const [attentionMap, setAttentionMap] = useState<Map<string, AttentionKind>>(() => new Map());
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [modelList, setModelList] = useState<ModelInfo[]>([]);
@@ -1979,6 +1979,19 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       alert(String(e));
     }
   };
+
+  // Sessions (other than the one currently open) that need user interaction —
+  // feeds the top-right notifier so pending work is visible with the sidebar
+  // collapsed. Reuses the existing attentionMap; adds no polling.
+  const attentionItems = useMemo<AttentionItem[]>(() => {
+    const out: AttentionItem[] = [];
+    for (const [id, kind] of attentionMap) {
+      if (id === activeSessionId) continue;
+      const s = sessions.find((x) => x.id === id);
+      out.push({ id, kind, name: s ? (s.name || s.project) : id });
+    }
+    return out;
+  }, [attentionMap, activeSessionId, sessions]);
 
   const handleViewChat = (id: string) => {
     setActive({ session_id: id, ws_url: "", ws_token: "" } as AttachResponse);
@@ -2935,6 +2948,8 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       {showAsciiflow && <AsciiflowModal onClose={() => setShowAsciiflow(false)} />}
 
       {shareModalSession && <ShareModal session={shareModalSession} onClose={() => setShareModalSession(null)} />}
+
+      <AttentionNotifier items={attentionItems} onJump={handleAttach} />
 
       <TextSelectionMenu />
 
