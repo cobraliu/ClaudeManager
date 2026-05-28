@@ -163,6 +163,9 @@ export function ShareViewer({ hash, shareType }: Props) {
   const loadedRef = useRef<RawMessage[]>([]);
   const totalRef = useRef(0);
   const busyRef = useRef(false);
+  // Live-follow only kicks in after the reader scrolls once, so the page opens
+  // at the top (oldest first) instead of being yanked to the latest message.
+  const userScrolledRef = useRef(false);
 
   // Free the global fixed-viewport layout (index.css pins html/body/#root to
   // height:100%;overflow:hidden) so the transcript scrolls as a normal page,
@@ -220,7 +223,7 @@ export function ShareViewer({ hash, shareType }: Props) {
         setLoadedCount(loadedRef.current.length);
         const html = await renderConversationBody(loadedRef.current);
         setBodyHtml(html);
-        if (shareType === "full" && wasAtBottom) {
+        if (shareType === "full" && wasAtBottom && userScrolledRef.current) {
           requestAnimationFrame(() => window.scrollTo(0, document.documentElement.scrollHeight));
         }
       }
@@ -246,7 +249,7 @@ export function ShareViewer({ hash, shareType }: Props) {
   // Infinite scroll: load the next page as the reader nears the bottom.
   useEffect(() => {
     if (error) return;
-    const onScroll = () => { if (nearBottom()) void fetchForward(false); };
+    const onScroll = () => { userScrolledRef.current = true; if (nearBottom()) void fetchForward(false); };
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
   }, [error, fetchForward]);
