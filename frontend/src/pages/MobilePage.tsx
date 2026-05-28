@@ -100,6 +100,14 @@ import {
   type TuiAuqData,
   type TuiApproveData,
   getUsageInfo,
+  createShare,
+  listShares,
+  deleteShare,
+  getAllRawMessages,
+  type RawMessage,
+  type ShareRecord,
+  type ShareTheme,
+  type ShareType,
 } from "../api/sessionApi";
 import gitIcon from "../assets/git.svg";
 import terminalIcon from "../assets/terminal.svg";
@@ -4996,6 +5004,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
   const [showSettings, setShowSettings] = useState(false);
   const [showCaps, setShowCaps] = useState(false);
   const [showJsonl, setShowJsonl] = useState(false);
+  const [showShare, setShowShare] = useState(false);
   const [fontSize, setFontSize] = useState<number>(() => Number(localStorage.getItem("cm_mobile_font") || 13));
   const changeFontSize = (delta: number) => setFontSize(prev => {
     const next = Math.min(20, Math.max(10, prev + delta));
@@ -5270,6 +5279,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
               ? { icon: "▶", title: "Resume", onClick: async () => { try { await resumeSession(session.id); setSession((s) => ({ ...s, status: "running" })); } catch (e) { alert(String(e)); } }, color: "var(--accent-green)", bg: "transparent" }
               : { icon: "⏹", title: "Terminate", onClick: async () => { try { await terminateSession(session.id); onBack(); } catch {} }, color: "var(--accent-red)", bg: "transparent" },
             { icon: "⚙", title: "Claude Capabilities", onClick: () => setShowCaps(true), color: iconMuted, bg: "transparent" },
+            { icon: "🔗", title: "分享对话", onClick: () => setShowShare(true), color: iconMuted, bg: "transparent" },
             {
               icon: <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: -0.3 }}>HTML</span>,
               title: "Export chat as HTML",
@@ -5318,6 +5328,7 @@ function DetailView({ session: initialSession, onBack, username, onLogout, onSwi
         theme={theme} onToggleTheme={onToggleTheme}
         terminalFont={terminalFont} onTerminalFontChange={onTerminalFontChange}
       />
+      <MobileSharePanel open={showShare} onClose={() => setShowShare(false)} session={session} />
 
       {shellOpen && <MobileShellPanel sessionId={session.id} cwd={session.cwd} onClose={() => history.back()} onMinimize={() => setShellMinimized(true)} minimized={shellMinimized} fontFamily={terminalFont} />}
       {shellOpen && shellMinimized && (
@@ -5639,6 +5650,192 @@ function MobileSettingsPanel({ open, onClose, theme, onToggleTheme, terminalFont
             </div>
             {msg && <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-muted)" }}>{msg}</div>}
           </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const SHARE_PERMANENT = 2147483647;
+
+function shareUserText(m: RawMessage): string {
+  const c = m.message?.content;
+  if (typeof c === "string") return c.trim();
+  if (Array.isArray(c)) return c.filter((b) => b.type === "text" && b.text).map((b) => b.text).join("\n").trim();
+  return "";
+}
+
+function fmtShareTime(s: number): string { return new Date(s * 1000).toLocaleString(); }
+function fmtShareExpiry(s: number): string { return s >= SHARE_PERMANENT ? "永久" : fmtShareTime(s); }
+function shareAbsUrl(url: string): string { return /^https?:/i.test(url) ? url : window.location.origin + url; }
+
+// Mobile share sheet — bottom sheet, stacked form + card-list history (no wide
+// table), icon-light. Deliberately not a port of the desktop ShareModal.
+function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: () => void; session: SessionMeta }) {
+  const [tab, setTab] = useState<"create" | "history">("create");
+  const [shareType, setShareType] = useState<ShareType>("full");
+  const [defaultTheme, setDefaultTheme] = useState<ShareTheme>("light");
+  const [preset, setPreset] = useState<"1d" | "7d" | "30d" | "permanent">("7d");
+  const [userMsgs, setUserMsgs] = useState<RawMessage[]>([]);
+  const [cutoffUuid, setCutoffUuid] = useState("");
+  const [loadingMsgs, setLoadingMsgs] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [created, setCreated] = useState<ShareRecord | null>(null);
+  const [history, setHistory] = useState<ShareRecord[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || shareType !== "limited" || userMsgs.length > 0 || loadingMsgs) return;
+    setLoadingMsgs(true);
+    getAllRawMessages(session.id)
+      .then((d) => setUserMsgs(d.messages.filter((m) => m.type === "user" && shareUserText(m).length > 0)))
+      .catch((e) => setErr(String(e)))
+      .finally(() => setLoadingMsgs(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, shareType]);
+
+  useEffect(() => {
+    if (!open || tab !== "history") return;
+    setLoadingHistory(true);
+    listShares(session.id).then(setHistory).catch((e) => setErr(String(e))).finally(() => setLoadingHistory(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, tab]);
+
+  if (!open) return null;
+
+  const copy = (text: string, key: string) => {
+    const done = () => { setCopied(key); setTimeout(() => setCopied((k) => (k === key ? null : k)), 1200); };
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done).catch(done);
+    else { const ta = document.createElement("textarea"); ta.value = text; ta.style.position = "fixed"; ta.style.top = "-1000px"; document.body.appendChild(ta); ta.select(); try { document.execCommand("copy"); } catch { /* ignore */ } document.body.removeChild(ta); done(); }
+  };
+
+  const create = async () => {
+    setErr(null);
+    if (shareType === "limited" && !cutoffUuid) { setErr("请选择截止消息"); return; }
+    const permanent = preset === "permanent";
+    const days = preset === "1d" ? 1 : preset === "7d" ? 7 : 30;
+    setCreating(true);
+    try {
+      const rec = await createShare(session.id, {
+        share_type: shareType,
+        permanent,
+        expires_at: permanent ? undefined : Math.floor(Date.now() / 1000) + days * 86400,
+        cutoff_after_uuid: shareType === "limited" ? cutoffUuid : undefined,
+        default_theme: defaultTheme,
+      });
+      setCreated(rec);
+    } catch (e) { setErr(String(e instanceof Error ? e.message : e)); }
+    finally { setCreating(false); }
+  };
+
+  const del = async (hash: string) => {
+    if (!window.confirm("删除该分享链接？")) return;
+    try { await deleteShare(session.id, hash); setHistory((h) => h.filter((r) => r.hash !== hash)); } catch (e) { setErr(String(e)); }
+  };
+
+  const chip = (active: boolean): React.CSSProperties => ({
+    fontSize: 13, padding: "8px 12px", borderRadius: 8, cursor: "pointer", flex: "1 0 auto",
+    border: `1px solid ${active ? "var(--accent-blue)" : "var(--border)"}`,
+    background: active ? "rgba(88,166,255,0.12)" : "var(--bg-base)",
+    color: active ? "var(--accent-blue)" : "var(--text-body)",
+  });
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 3500, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxHeight: "88vh", background: "var(--bg-surface)", borderRadius: "12px 12px 0 0", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-bright)" }}>🔗 分享对话</span>
+          <button onClick={onClose} style={{ background: "var(--bg-hover)", border: "none", color: "var(--text-secondary)", fontSize: 13, padding: "4px 12px", borderRadius: 6 }}>✕</button>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, padding: "10px 16px 0" }}>
+          {(["create", "history"] as const).map((id) => (
+            <button key={id} onClick={() => setTab(id)} style={{ flex: 1, ...chip(tab === id) }}>{id === "create" ? "新建" : "历史"}</button>
+          ))}
+        </div>
+
+        <div style={{ overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 16 }}>
+          {err && <div style={{ color: "var(--accent-red, #e05260)", fontSize: 12 }}>{err}</div>}
+
+          {tab === "create" && (
+            <>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setShareType("full")} style={chip(shareType === "full")}>全程同步</button>
+                <button onClick={() => setShareType("limited")} style={chip(shareType === "limited")}>限制截止</button>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setDefaultTheme("light")} style={chip(defaultTheme === "light")}>☀️ 浅色</button>
+                <button onClick={() => setDefaultTheme("dark")} style={chip(defaultTheme === "dark")}>🌙 深色</button>
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {([["1d", "1天"], ["7d", "7天"], ["30d", "30天"], ["permanent", "永久"]] as const).map(([id, lbl]) => (
+                  <button key={id} onClick={() => setPreset(id)} style={chip(preset === id)}>{lbl}</button>
+                ))}
+              </div>
+
+              {shareType === "limited" && (
+                <div>
+                  <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 6 }}>选择截止消息</div>
+                  {loadingMsgs ? <div style={{ fontSize: 12, color: "var(--text-muted)" }}>加载中…</div> : (
+                    <div style={{ maxHeight: "32vh", overflowY: "auto", border: "1px solid var(--border)", borderRadius: 8 }}>
+                      {userMsgs.length === 0 && <div style={{ fontSize: 12, color: "var(--text-muted)", padding: 10 }}>无可选消息</div>}
+                      {userMsgs.map((m) => {
+                        const uuid = m.uuid || ""; const sel = uuid === cutoffUuid; const txt = shareUserText(m);
+                        return (
+                          <div key={uuid} onClick={() => setCutoffUuid(uuid)} title={txt}
+                            style={{ padding: "8px 10px", fontSize: 12, cursor: "pointer", borderBottom: "1px solid var(--bg-hover)", background: sel ? "rgba(88,166,255,0.1)" : "transparent", color: sel ? "var(--accent-blue)" : "var(--text-body)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {sel ? "● " : "○ "}{txt.slice(0, 60)}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <button onClick={create} disabled={creating} style={{ padding: "11px", borderRadius: 8, border: "none", background: "var(--accent-blue)", color: "#fff", fontSize: 14, fontWeight: 600 }}>
+                {creating ? "生成中…" : "生成分享链接"}
+              </button>
+
+              {created && (
+                <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{created.share_type === "full" ? "全程同步" : "限制截止"} · 失效 {fmtShareExpiry(created.expires_at)}</div>
+                  <input readOnly value={shareAbsUrl(created.url)} onFocus={(e) => e.currentTarget.select()} style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-body)", fontSize: 12, fontFamily: "monospace" }} />
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => copy(shareAbsUrl(created.url), "new")} style={{ flex: 1, padding: "9px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--text-body)", fontSize: 13 }}>{copied === "new" ? "已复制" : "复制"}</button>
+                    <button onClick={() => window.open(created.url, "_blank")} style={{ flex: 1, padding: "9px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--text-body)", fontSize: 13 }}>打开</button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {tab === "history" && (
+            <>
+              {loadingHistory ? <div style={{ fontSize: 12, color: "var(--text-muted)" }}>加载中…</div>
+                : history.length === 0 ? <div style={{ fontSize: 12, color: "var(--text-muted)" }}>暂无分享记录</div>
+                : history.map((rec) => (
+                  <div key={rec.hash} style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                      {rec.share_type === "full" ? "全程同步" : "限制截止"} · 失效 {fmtShareExpiry(rec.expires_at)}
+                    </div>
+                    {rec.share_type === "limited" && rec.cutoff_msg_text && (
+                      <div style={{ fontSize: 12, color: "var(--text-body)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={rec.cutoff_msg_text}>
+                        截止：{rec.cutoff_msg_text.slice(0, 32)}{rec.cutoff_msg_text.length > 32 ? "…" : ""}
+                      </div>
+                    )}
+                    <div style={{ fontSize: 10, color: "var(--text-faint)" }}>创建 {fmtShareTime(rec.created_at)}</div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button onClick={() => copy(shareAbsUrl(rec.url), rec.hash)} style={{ flex: 1, padding: "8px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--text-body)", fontSize: 12 }}>{copied === rec.hash ? "已复制" : "复制"}</button>
+                      <button onClick={() => window.open(rec.url, "_blank")} style={{ flex: 1, padding: "8px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--text-body)", fontSize: 12 }}>打开</button>
+                      <button onClick={() => del(rec.hash)} style={{ padding: "8px 12px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--accent-red, #e05260)", fontSize: 12 }}>删除</button>
+                    </div>
+                  </div>
+                ))}
+            </>
+          )}
         </div>
       </div>
     </div>

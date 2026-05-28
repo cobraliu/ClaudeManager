@@ -25,6 +25,7 @@ from app.api import files as files_api
 from app.api import fs as fs_api
 from app.api import memory as memory_api
 from app.api import sessions as sessions_api
+from app.api import shares as shares_api
 from app.api import usage_api
 from app.config import (
     get_claude_bin,
@@ -45,6 +46,7 @@ from app.services.bash_term_service import TerminalManager
 from app.services.prompt_history_backfill import run_loop as prompt_history_backfill_loop
 from app.services.proxy_tap_cleanup import run_once as proxy_tap_cleanup_once
 from app.services.session_store import SessionStore
+from app.services.share_cache import share_cache
 from app.services.tmux_service import TmuxService
 from app.services.user_store import UserStore
 from app.ws import terminal_ws, shell_ws, term_ws
@@ -672,16 +674,37 @@ async def lifespan(app: FastAPI):
                 logger.exception("proxy_tap cleanup error")
             await asyncio.sleep(30)
 
+    def _purge_expired_shares() -> None:
+        now = time.time()
+        for h in session_store.delete_expired_shares(now):
+            share_cache.remove(h)
+        share_cache.purge_expired(now)
+
+    async def _share_cleanup_loop():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, _purge_expired_shares)
+            except Exception:
+                logger.exception("share cleanup error")
+
+    # Warm the in-memory share cache from the durable store.
+    try:
+        share_cache.load(session_store.list_active_shares(time.time()))
+    except Exception:
+        logger.exception("share cache warm-up failed")
+
     prompt_backfill_stop = asyncio.Event()
     watchdog = asyncio.create_task(_session_watchdog())
     scheduler = asyncio.create_task(_task_scheduler())
     proxy_tap_cleaner = asyncio.create_task(_proxy_tap_cleanup_loop())
+    share_cleaner = asyncio.create_task(_share_cleanup_loop())
     prompt_backfill = asyncio.create_task(
         prompt_history_backfill_loop(session_store, prompt_backfill_stop)
     )
     yield
     prompt_backfill_stop.set()
-    for t in (watchdog, scheduler, proxy_tap_cleaner, prompt_backfill):
+    for t in (watchdog, scheduler, proxy_tap_cleaner, share_cleaner, prompt_backfill):
         t.cancel()
         try:
             await t
@@ -726,6 +749,7 @@ app.include_router(config_api.router)
 app.include_router(fs_api.router)
 app.include_router(sessions_api.router)
 app.include_router(sessions_api.models_router)
+app.include_router(shares_api.public_router)
 app.include_router(files_api.router)
 app.include_router(code_api.router)
 app.include_router(memory_api.router)

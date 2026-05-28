@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import secrets
@@ -7,6 +8,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -23,13 +25,15 @@ from app.models.session import (
     SessionStatusListResponse,
     SessionStatusView,
     SessionView,
+    ShareRecord,
+    PERMANENT_SHARE_EXPIRES,
     TaskCreateRequest,
     TaskView,
 )
 from app.observability import audit_event
 from app.security import AdminUser, CurrentUser, CurrentUserInfo
 from app.services.claude_pid import format_tui_hint, get_pid_waiting_state, parse_auq_from_screen
-from app.services.claude_session_reader import enrich_session, find_newest_claude_session_id, get_latest_turn_info, get_conversation, search_conversation, list_project_session_ids, list_subagents, get_subagent_lines, list_all_claude_sessions_global, get_todo_plans
+from app.services.claude_session_reader import enrich_session, find_newest_claude_session_id, get_latest_turn_info, get_conversation, search_conversation, list_project_session_ids, list_subagents, get_subagent_lines, list_all_claude_sessions_global, get_todo_plans, compute_share_cutoff, read_raw_messages_page
 from app.services.claude_goals import read_goals
 from app.services.claude_auqs import list_auqs
 from app.agents import get_adapter
@@ -45,6 +49,7 @@ from app.services.git_service import (
     make_commit_message, make_commit_summary,
 )
 from app.services.session_store import SessionStore
+from app.services.share_cache import share_cache
 from app.services.tmux_service import TmuxError, TmuxService
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -2580,6 +2585,109 @@ def get_raw_messages_all(
         total = len(transformed)
 
     return {"messages": collected, "total": total}
+
+
+# ── Conversation shares ──────────────────────────────────────────────────────
+
+
+class ShareCreateRequest(BaseModel):
+    share_type: Literal["full", "limited"]
+    # Absolute expiry, epoch seconds. Ignored when `permanent` is set.
+    expires_at: float | None = None
+    permanent: bool = False
+    # Required for limited shares: the uuid of the chosen user-input message;
+    # the cutoff is the first turn_duration after it.
+    cutoff_after_uuid: str | None = None
+    # Theme the viewer opens with (readers can still toggle).
+    default_theme: Literal["light", "dark"] = "light"
+
+
+def _share_to_view(rec: ShareRecord) -> dict:
+    return {
+        "hash": rec.hash,
+        "share_type": rec.share_type,
+        "url": public_path(f"/share/{rec.share_type}/{rec.hash}.html"),
+        "created_at": rec.created_at,
+        "expires_at": rec.expires_at,
+        "cutoff_ts": rec.cutoff_ts,
+        "cutoff_msg_text": rec.cutoff_msg_text,
+        "default_theme": rec.default_theme,
+    }
+
+
+@router.post("/{session_id}/shares")
+def create_share(session_id: str, body: ShareCreateRequest, user_id: CurrentUser) -> dict:
+    """Create a public share link for this session's conversation."""
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    if body.permanent:
+        expires_at = float(PERMANENT_SHARE_EXPIRES)
+    elif body.expires_at is not None:
+        expires_at = float(body.expires_at)
+    else:
+        raise HTTPException(status_code=422, detail="expires_at or permanent required")
+    if expires_at <= time.time():
+        raise HTTPException(status_code=422, detail="expiry must be in the future")
+    due = int(expires_at)
+
+    cutoff_ts: float | None = None
+    cutoff_uuid: str | None = None
+    cutoff_text: str | None = None
+    if body.share_type == "limited":
+        if not body.cutoff_after_uuid:
+            raise HTTPException(status_code=422, detail="cutoff_after_uuid required for limited share")
+        adapter = get_adapter(session.tool)
+        chat_sid = session.agent_session_id or adapter.find_newest_session_id(session.cwd)
+        jsonl_path = adapter.get_jsonl_path(chat_sid, session.cwd) if chat_sid else None
+        if jsonl_path is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        res = compute_share_cutoff(Path(jsonl_path), body.cutoff_after_uuid)
+        if res is None:
+            raise HTTPException(status_code=404, detail="cutoff message not found")
+        cutoff_ts = res["cutoff_ts"]
+        cutoff_uuid = body.cutoff_after_uuid
+        cutoff_text = res["cutoff_msg_text"]
+        h = hashlib.md5(f"{session_id}_{int(cutoff_ts)}_{due}".encode()).hexdigest()
+    else:
+        h = hashlib.md5(f"{session_id}_{due}".encode()).hexdigest()
+
+    rec = ShareRecord(
+        hash=h,
+        session_id=session_id,
+        owner_id=user_id,
+        share_type=body.share_type,
+        cutoff_ts=cutoff_ts,
+        cutoff_msg_uuid=cutoff_uuid,
+        cutoff_msg_text=cutoff_text,
+        created_at=time.time(),
+        expires_at=expires_at,
+        default_theme=body.default_theme,
+    )
+    store.create_share(rec)
+    share_cache.put(rec)
+    return _share_to_view(rec)
+
+
+@router.get("/{session_id}/shares")
+def list_session_shares(session_id: str, user_id: CurrentUser) -> list[dict]:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    return [_share_to_view(r) for r in store.list_shares(session_id, user_id)]
+
+
+@router.delete("/{session_id}/shares/{hash}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_session_share(session_id: str, hash: str, user_id: CurrentUser) -> None:
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    store.delete_share(hash, user_id)
+    share_cache.remove(hash)
 
 
 class AuqAnswerItem(BaseModel):

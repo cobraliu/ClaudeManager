@@ -187,6 +187,37 @@ function renderWriteContent(filePath: string, content: string): string {
   </div>`;
 }
 
+// cat -n style numbered output (Read results, `cat -n`): "   42\tcontent".
+// Mirrors ConversationPane's NumberedLines so the viewer shows a distinct
+// line-number gutter instead of cramming the number against the code.
+const CAT_N_RE = /^ *\d+\t/;
+function isNumberedOutput(text: string): boolean {
+  const lines = text.split("\n").filter((l) => l.length > 0).slice(0, 5);
+  return lines.length >= 2 && lines.every((l) => CAT_N_RE.test(l));
+}
+
+function renderToolResultPre(text: string): string {
+  if (!isNumberedOutput(text)) {
+    return `<pre class="tool-pre">${escapeHtml(text)}</pre>`;
+  }
+  const lines = text.split("\n");
+  let gutter = 4;
+  for (const line of lines) {
+    const tab = line.indexOf("\t");
+    if (tab !== -1) gutter = Math.max(gutter, line.slice(0, tab).trim().length);
+  }
+  const rows = lines.map((line) => {
+    const tab = line.indexOf("\t");
+    if (tab === -1) {
+      return `<div class="num-row"><span class="num-ln"></span><span class="num-code">${escapeHtml(line) || "&nbsp;"}</span></div>`;
+    }
+    const num = line.slice(0, tab).trim();
+    const code = line.slice(tab + 1);
+    return `<div class="num-row"><span class="num-ln">${escapeHtml(num)}</span><span class="num-code">${escapeHtml(code) || "&nbsp;"}</span></div>`;
+  });
+  return `<pre class="tool-pre numbered" style="--num-gutter:${gutter}ch">${rows.join("")}</pre>`;
+}
+
 async function renderAssistantText(text: string): Promise<string> {
   return `<div class="md">${await renderMermaidToHtml(renderMarkdown(text))}</div>`;
 }
@@ -239,7 +270,7 @@ function renderToolUseBlock(b: RawContentBlock, resultBlock: RawContentBlock | u
         <span class="tool-result-label">${isErr ? "Error" : "Result"}</span>
         <button class="copy-btn" data-copy-source="next-pre">Copy</button>
       </div>
-      <pre class="tool-pre">${escapeHtml(text)}</pre>
+      ${renderToolResultPre(text)}
     </div>`;
   } else {
     resultHtml = `<div class="tool-result tool-result-pending"><span class="tool-result-label">No result</span></div>`;
@@ -444,7 +475,7 @@ async function renderEntry(
       // Orphan tool result (no matching tool_use seen) — show inline
       const text = blockText(b.content);
       if (text.trim()) {
-        parts.push(`<details class="tool-result orphan"><summary>Tool result</summary><pre class="tool-pre">${escapeHtml(text)}</pre></details>`);
+        parts.push(`<details class="tool-result orphan"><summary>Tool result</summary>${renderToolResultPre(text)}</details>`);
       }
     }
   }
@@ -484,7 +515,7 @@ function buildCompactMaps(messages: RawMessage[]): { compactSummaries: Map<strin
   return { compactSummaries, compactSummaryUuids };
 }
 
-const STYLE = `
+const LIGHT_BASE = `
 :root { color-scheme: light dark; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
        max-width: 920px; margin: 0 auto; padding: 24px 20px 60px; line-height: 1.6;
@@ -548,6 +579,14 @@ h1 { font-size: 18px; margin: 0 0 4px; }
             white-space: pre-wrap; word-break: break-word; margin: 2px 0 0; }
 .tool-error .tool-pre { background: #3a1212; color: #f8d7da; border: 1px solid #6a2020; }
 .tool-result-pending { color: #888; font-size: 11px; padding: 2px 0; }
+/* Numbered output (Read / cat -n): right-aligned line-number gutter, separated
+   from the code column. .tool-pre stays dark in both themes, so no dark override. */
+.tool-pre.numbered { padding: 6px 0; white-space: normal; }
+.num-row { display: flex; }
+.num-ln { flex-shrink: 0; min-width: var(--num-gutter, 4ch); padding: 0 10px 0 8px;
+          text-align: right; color: #8a8a8a; user-select: none; white-space: nowrap;
+          border-right: 1px solid rgba(255,255,255,0.08); }
+.num-code { flex: 1 1 auto; min-width: 0; white-space: pre; padding: 0 8px; }
 
 /* Thinking */
 .thinking { margin: 4px 0; border: 1px dashed #d0c5e0; border-radius: 6px; background: #f9f6fc; }
@@ -643,8 +682,11 @@ h1 { font-size: 18px; margin: 0 0 4px; }
             border-radius: 3px; cursor: pointer; color: #444; }
 .copy-btn:hover { background: #f0f0f0; }
 .copy-btn.copied { background: #d4edda; border-color: #5cb85c; color: #155724; }
+`;
 
-@media (prefers-color-scheme: dark) {
+/* Dark-theme color overrides. Shared by the static export's system-preference
+ * media query (STYLE) and the share viewer's manual light/dark toggle (DARK_STYLE). */
+const DARK_RULES = `
   body { background: #1a1a1a; color: #eaeaea; }
   header { border-bottom-color: #333; }
   .row.assistant .bubble { background: #2a2a2a; color: #eaeaea; }
@@ -699,7 +741,21 @@ h1 { font-size: 18px; margin: 0 0 4px; }
   .compact-meta { color: #888; }
   .compact-ts { color: #666; }
   .compact-body { background: #1a1a1a; border-top-color: #333; color: #eaeaea; }
+`;
+
+/* Static HTML export: light base that auto-flips to dark per system preference. */
+export const STYLE = `${LIGHT_BASE}
+@media (prefers-color-scheme: dark) {
+${DARK_RULES}
 }
+`;
+
+/* Share viewer — forced light theme (ignores system preference). */
+export const LIGHT_STYLE = LIGHT_BASE;
+
+/* Share viewer — forced dark theme (dark rules applied unconditionally). */
+export const DARK_STYLE = `${LIGHT_BASE}
+${DARK_RULES}
 `;
 
 const SCRIPT = `
@@ -730,12 +786,22 @@ const SCRIPT = `
       btn.classList.remove('copied');
     }, 1100);
   }
+  function preText(pre) {
+    if (!pre) return '';
+    // Numbered output: copy the code column only, dropping the line-number gutter.
+    if (pre.classList.contains('numbered')) {
+      var codes = pre.querySelectorAll('.num-code');
+      var out = [];
+      codes.forEach(function(c) { out.push(c.innerText); });
+      return out.join('\\n');
+    }
+    return pre.innerText;
+  }
   function handleCopy(btn) {
     var src = btn.getAttribute('data-copy-source');
     var text = '';
     if (src === 'next-pre') {
-      var pre = btn.parentElement.parentElement.querySelector('pre');
-      if (pre) text = pre.innerText;
+      text = preText(btn.parentElement.parentElement.querySelector('pre'));
     } else if (src === 'next-md') {
       var md = btn.parentElement.parentElement.querySelector('.md, .plan-body');
       if (md) text = md.innerText;
@@ -761,8 +827,7 @@ const SCRIPT = `
         text = lines.join('\n');
       }
     } else {
-      var pre = btn.closest('details, div').querySelector('pre');
-      if (pre) text = pre.innerText;
+      text = preText(btn.closest('details, div').querySelector('pre'));
     }
     if (text) {
       copyText(text);
@@ -814,11 +879,21 @@ const SCRIPT = `
 })();
 `;
 
-async function buildHtml(title: string, messages: RawMessage[]): Promise<string> {
+async function renderEntries(messages: RawMessage[]): Promise<string[]> {
   const toolResults = buildToolResultMap(messages);
   const { compactSummaries, compactSummaryUuids } = buildCompactMaps(messages);
-  const rendered = (await Promise.all(messages.map((m) => renderEntry(m, toolResults, compactSummaries, compactSummaryUuids))))
+  return (await Promise.all(messages.map((m) => renderEntry(m, toolResults, compactSummaries, compactSummaryUuids))))
     .filter((s) => s.length > 0);
+}
+
+/** Render conversation entries to an HTML body string (no <html> wrapper).
+ *  Shared by the static export and the live share viewer. */
+export async function renderConversationBody(messages: RawMessage[]): Promise<string> {
+  return (await renderEntries(messages)).join("\n");
+}
+
+async function buildHtml(title: string, messages: RawMessage[]): Promise<string> {
+  const rendered = await renderEntries(messages);
   return `<!doctype html>
 <html lang="en">
 <head>

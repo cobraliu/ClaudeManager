@@ -51,6 +51,7 @@ import { downloadConversationHtml } from "../lib/exportChat";
 import { apiPath } from "../lib/baseUrl";
 import { SessionSideDock } from "../components/SessionSideDock";
 import { UserConfigModal } from "../components/UserConfigModal";
+import { ShareModal } from "../components/ShareModal";
 import { EmbeddedTerminalPanel, useSessionTerminalApi } from "../components/EmbeddedTerminalPanel";
 import CodexChatInput from "../components/CodexChatInput";
 import { TextSelectionMenu } from "../components/TextSelectionMenu";
@@ -1499,6 +1500,8 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     } catch (e) { alert(String(e)); }
   };
 
+  const [shareModalSession, setShareModalSession] = useState<SessionMeta | null>(null);
+
   // Side-dock section visibility (per-session can be added later; for now global)
   const [dockOpen, setDockOpen] = useState<{ auqs: boolean; tasks: boolean; goals: boolean }>(() => {
     try {
@@ -2761,6 +2764,15 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
               <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               {activeSessionMeta && (
                 <button
+                  onClick={() => setShareModalSession(activeSessionMeta)}
+                  title="分享对话"
+                  style={{ fontSize: 11, padding: "2px 10px", background: "transparent", color: "var(--text-faint)", border: "1px solid transparent", borderRadius: 4 }}
+                >
+                  🔗 Share
+                </button>
+              )}
+              {activeSessionMeta && (
+                <button
                   onClick={() => handleDownloadChat(activeSessionMeta)}
                   title="Export chat as HTML"
                   style={{ fontSize: 11, padding: "2px 10px", background: "transparent", color: "var(--text-faint)", border: "1px solid transparent", borderRadius: 4 }}
@@ -2921,6 +2933,8 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       />
 
       {showAsciiflow && <AsciiflowModal onClose={() => setShowAsciiflow(false)} />}
+
+      {shareModalSession && <ShareModal session={shareModalSession} onClose={() => setShareModalSession(null)} />}
 
       <TextSelectionMenu />
 

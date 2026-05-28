@@ -8,7 +8,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Iterable
 
-from app.models.session import SessionMetadata, SessionStatus, ScheduledTask
+from app.models.session import SessionMetadata, SessionStatus, ScheduledTask, ShareRecord
 
 
 _ALLOWED_TRANSITIONS: dict[SessionStatus, set[SessionStatus]] = {
@@ -84,6 +84,20 @@ CREATE TABLE IF NOT EXISTS prompt_history_backfill (
     session_id   TEXT PRIMARY KEY,
     completed_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS shares (
+    hash             TEXT PRIMARY KEY,
+    session_id       TEXT NOT NULL,
+    owner_id         TEXT NOT NULL,
+    share_type       TEXT NOT NULL,
+    cutoff_ts        REAL,
+    cutoff_msg_uuid  TEXT,
+    cutoff_msg_text  TEXT,
+    created_at       REAL NOT NULL,
+    expires_at       REAL NOT NULL,
+    default_theme    TEXT NOT NULL DEFAULT 'light'
+);
+CREATE INDEX IF NOT EXISTS idx_shares_session ON shares(session_id, owner_id);
+CREATE INDEX IF NOT EXISTS idx_shares_expires ON shares(expires_at);
 """
 
 
@@ -127,6 +141,14 @@ class SessionStore:
         # Auto-migrate scheduled_tasks (loop_seconds added later for repeating tasks)
         try:
             self._conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN loop_seconds INTEGER")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        # Auto-migrate shares (default_theme added later; backfill existing rows to light)
+        try:
+            self._conn.execute(
+                "ALTER TABLE shares ADD COLUMN default_theme TEXT NOT NULL DEFAULT 'light'"
+            )
             self._conn.commit()
         except sqlite3.OperationalError:
             pass
@@ -541,6 +563,9 @@ class SessionStore:
             self._conn.execute(
                 "DELETE FROM prompt_history_backfill WHERE session_id = ?", (session_id,)
             )
+            self._conn.execute(
+                "DELETE FROM shares WHERE session_id = ?", (session_id,)
+            )
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -796,4 +821,83 @@ class SessionStore:
                 (session_id, completed_at),
             )
             self._conn.commit()
+
+    # ── Conversation shares ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _row_to_share(row: sqlite3.Row) -> ShareRecord:
+        return ShareRecord(
+            hash=row["hash"],
+            session_id=row["session_id"],
+            owner_id=row["owner_id"],
+            share_type=row["share_type"],
+            cutoff_ts=row["cutoff_ts"],
+            cutoff_msg_uuid=row["cutoff_msg_uuid"],
+            cutoff_msg_text=row["cutoff_msg_text"],
+            created_at=row["created_at"],
+            expires_at=row["expires_at"],
+            default_theme=(row["default_theme"] if "default_theme" in row.keys() else "light"),
+        )
+
+    def create_share(self, share: ShareRecord) -> ShareRecord:
+        """Insert (or replace, if the same hash already exists) a share."""
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO shares
+                   (hash, session_id, owner_id, share_type, cutoff_ts,
+                    cutoff_msg_uuid, cutoff_msg_text, created_at, expires_at,
+                    default_theme)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (share.hash, share.session_id, share.owner_id, share.share_type,
+                 share.cutoff_ts, share.cutoff_msg_uuid, share.cutoff_msg_text,
+                 share.created_at, share.expires_at, share.default_theme),
+            )
+            self._conn.commit()
+        return share
+
+    def get_share(self, hash: str) -> ShareRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM shares WHERE hash = ?", (hash,)
+            ).fetchone()
+            return self._row_to_share(row) if row else None
+
+    def list_shares(self, session_id: str, owner_id: str) -> list[ShareRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM shares WHERE session_id = ? AND owner_id = ? ORDER BY created_at DESC",
+                (session_id, owner_id),
+            ).fetchall()
+            return [self._row_to_share(r) for r in rows]
+
+    def delete_share(self, hash: str, owner_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM shares WHERE hash = ? AND owner_id = ?",
+                (hash, owner_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def list_active_shares(self, now: float) -> list[ShareRecord]:
+        """All non-expired shares — used to warm the in-memory cache at startup."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM shares WHERE expires_at > ?", (now,)
+            ).fetchall()
+            return [self._row_to_share(r) for r in rows]
+
+    def delete_expired_shares(self, now: float) -> list[str]:
+        """Delete shares whose expiry has passed; return their hashes."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT hash FROM shares WHERE expires_at <= ?", (now,)
+            ).fetchall()
+            hashes = [r["hash"] for r in rows]
+            if hashes:
+                self._conn.execute(
+                    "DELETE FROM shares WHERE expires_at <= ?", (now,)
+                )
+                self._conn.commit()
+            return hashes
 

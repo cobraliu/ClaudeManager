@@ -4,6 +4,8 @@ import { LoginPage } from "./pages/LoginPage";
 import { SessionsPage } from "./pages/SessionsPage";
 import { AdminPage } from "./pages/AdminPage";
 import { MobilePage } from "./pages/MobilePage";
+import { ShareViewer } from "./components/ShareViewer";
+import type { ShareType } from "./api/sessionApi";
 import { startMermaidObserver } from "./lib/mermaid";
 import { apiPath } from "./lib/baseUrl";
 import "./index.css";
@@ -144,8 +146,13 @@ function App() {
   );
 }
 
+// Public, no-auth share viewer. Suffix-anchored so it works under any ROOT_PATH.
+const _shareMatch = window.location.pathname.match(/\/share\/(full|limited)\/([0-9a-f]{32})\.html$/);
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    {_shareMatch
+      ? <ShareViewer shareType={_shareMatch[1] as ShareType} hash={_shareMatch[2]} />
+      : <App />}
   </React.StrictMode>
 );

@@ -4439,8 +4439,24 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     setPendingAttachments((prev) => prev.filter((p) => p.path !== path));
   }, []);
 
+  // Transient top toast with its own auto-dismiss (independent of the
+  // lost-transition effect's timer).
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showTransientToast = useCallback((msg: string) => {
+    setLostToast(msg);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => { setLostToast(null); toastTimerRef.current = null; }, 3000);
+  }, []);
+
   const resendLostMsg = useCallback((id: string, text: string) => {
-    if (!wsRef.current || !wsRef.current.isOpen() || hasUnansweredAuq) return;
+    if (hasUnansweredAuq) { showTransientToast("请先回答上方的问题，再重发消息"); return; }
+    // Weak-network reconnect window: the WS isn't OPEN, so sendPrompt would be
+    // silently dropped. Tell the user instead of leaving the failed bubble
+    // unchanged (which reads as "resend did nothing").
+    if (!wsRef.current || !wsRef.current.isOpen()) {
+      showTransientToast("连接已断开，正在重连，请稍后再试");
+      return;
+    }
     setOptimisticMsgs((prev) => [
       ...prev.filter((o) => o.id !== id),
       { id: _randomId(), text, sentAt: Date.now(), status: "pending" },
@@ -4448,7 +4464,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     wsRef.current.sendPrompt(text);
     stickToBottom.current = true;
     requestAnimationFrame(() => scrollToBottom(false));
-  }, [hasUnansweredAuq, scrollToBottom]);
+  }, [hasUnansweredAuq, scrollToBottom, showTransientToast]);
 
   const dismissLostMsg = useCallback((id: string) => {
     setOptimisticMsgs((prev) => prev.filter((o) => o.id !== id));
