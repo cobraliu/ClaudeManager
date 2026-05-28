@@ -25,6 +25,7 @@ import {
   setSessionModel,
   listGoals,
   listSessionTodos,
+  getStatusBar,
   type SessionMeta,
   type AttachResponse,
   type ExternalSession,
@@ -1530,6 +1531,18 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
   const [dockTodoHistory, setDockTodoHistory] = useState<TodoPlan[]>([]);
   const [dockActiveGoal, setDockActiveGoal] = useState<Goal | null>(null);
   const [dockGoalHistory, setDockGoalHistory] = useState<Goal[]>([]);
+  // Active-only combined fetch for the always-visible toolbar buttons — one
+  // request, no history payload. This is the high-frequency (5s) poll.
+  const refreshStatusBar = useCallback(async () => {
+    if (!activeSessionId) return;
+    try {
+      const data = await getStatusBar(activeSessionId);
+      setDockTodos(data.todos_active);
+      setDockActiveGoal(data.goal_active);
+    } catch { /* ignore */ }
+  }, [activeSessionId]);
+  // Full todos (active + history). Used after an in-dock edit and while the
+  // Tasks section is open; also refreshes the active state.
   const refreshDockTodos = useCallback(async () => {
     if (!activeSessionId) return;
     try {
@@ -1538,6 +1551,7 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       setDockTodoHistory(data.history);
     } catch { /* ignore */ }
   }, [activeSessionId]);
+  // Full goals (active + history). Used while the Goals section is open.
   const refreshDockGoals = useCallback(async () => {
     if (!activeSessionId) return;
     try {
@@ -1546,16 +1560,30 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
       setDockGoalHistory(data.history);
     } catch { /* ignore */ }
   }, [activeSessionId]);
+  // Always-on poll: active todos/goal for the toolbar. History is deferred to
+  // the dock-open effect below so this hot path never ships big history arrays.
   useEffect(() => {
     if (!activeSessionId || !isClaudeSession) {
       setDockTodos([]); setDockTodoHistory([]); setDockActiveGoal(null); setDockGoalHistory([]);
       return;
     }
-    refreshDockTodos();
-    refreshDockGoals();
-    const id = setInterval(() => { refreshDockTodos(); refreshDockGoals(); }, 5000);
+    refreshStatusBar();
+    const id = setInterval(refreshStatusBar, 5000);
     return () => clearInterval(id);
-  }, [activeSessionId, isClaudeSession, refreshDockTodos, refreshDockGoals]);
+  }, [activeSessionId, isClaudeSession, refreshStatusBar]);
+  // History is only rendered inside the dock, so fetch + refresh it only while
+  // the Tasks/Goals section is open. The toolbar never needs history.
+  useEffect(() => {
+    if (!activeSessionId || !isClaudeSession) return;
+    if (!dockOpen.tasks && !dockOpen.goals) return;
+    const tick = () => {
+      if (dockOpen.tasks) refreshDockTodos();
+      if (dockOpen.goals) refreshDockGoals();
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => clearInterval(id);
+  }, [activeSessionId, isClaudeSession, dockOpen.tasks, dockOpen.goals, refreshDockTodos, refreshDockGoals]);
 
   const { width: winW, height: winH } = useWindowSize();
 
@@ -1675,7 +1703,10 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
     let cancelled = false;
     const poll = async () => {
       try {
-        const res = await listSessionsStatus();
+        // Active tier only: attention + live TUI hints exist solely for
+        // RUNNING/DETACHED sessions, so this 3s poll skips terminated/stopped
+        // ones entirely. Non-active sessions are covered by the 5s list poll.
+        const res = await listSessionsStatus("active");
         if (cancelled) return;
         // Build attention map across ALL sessions (not just active) so the
         // session list can flag pending work even when nothing is attached.

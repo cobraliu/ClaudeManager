@@ -20,6 +20,11 @@ import {
 import { PromptHistoryPopover } from "./PromptHistoryPopover";
 
 const POLL_MS = 1500;
+// Idle cadence: when the session is not streaming/compacting/waiting and no
+// send is outstanding, nothing new can land between the status poll's
+// hint-driven refresh and the next is_streaming flip, so a slow poll is safe
+// and the change-token short-circuit makes each tick nearly free.
+const IDLE_POLL_MS = 10000;
 const DEFAULT_TAIL = 100;
 // crypto.randomUUID() requires a secure context (HTTPS/localhost).
 // Fall back to Math.random on plain HTTP local-network access.
@@ -3710,6 +3715,15 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
   // Signature of the last fetched window — lets the 1.5s poll skip setMessages
   // (and the full re-render it triggers) when the server returned identical data.
   const prevMsgSigRef = useRef("");
+  // Last raw-messages change token (JSONL+snapshot state). When unchanged, the
+  // server returns {unchanged:true} with no payload and we skip the whole pass.
+  // Reset to undefined on session/tail change so a wider window is never
+  // short-circuited.
+  const lastTokenRef = useRef<string | undefined>(undefined);
+  // Mirror of "any optimistic bubble is in flight". While true we force a full
+  // fetch (no token) so the reconcile/"lost"-timeout pass always has real data
+  // to pair against — never short-circuited away while a send is outstanding.
+  const pendingOptimisticRef = useRef(false);
   // Input height resizable via top-edge grip (drag up to enlarge).
   const [inputHeight, setInputHeight] = useState<number>(() => loadInputHeight(sessionId));
 
@@ -4101,24 +4115,37 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
 
   const fetchMessages = useCallback(async (currentTail: number) => {
     try {
-      const data = await getRawMessages(sessionId, currentTail);
+      // While a send is outstanding, force a full fetch (no token) so the
+      // reconcile/"lost"-timeout pass below always has real data. Otherwise use
+      // the change token so an idle poll can short-circuit on the server.
+      const tok = pendingOptimisticRef.current ? undefined : lastTokenRef.current;
+      const data = await getRawMessages(sessionId, currentTail, tok);
       setLoadingMore(false);
+      // Server short-circuit: the change token (JSONL size+mtime folded with
+      // in-flight proxy-snapshot state) matches last poll, so the merged window
+      // is provably unchanged. Keep current messages, skip the re-render and the
+      // reconcile pass. Safe to skip reconcile here because we never send a
+      // token while optimistic bubbles are pending (see tok above).
+      if (data.unchanged) return;
+      if (data.token !== undefined) lastTokenRef.current = data.token;
+      const msgList = data.messages ?? [];
+      const msgTotal = data.total ?? 0;
       // Skip the state update (and the full message-list re-render it forces)
       // when the server returned the same window as last poll. The signature is
       // total + count + an exact stringify of the last two entries — append,
       // truncate (rewind), streaming growth, and stop_reason all change one of
       // these; nothing earlier than the tail mutates in this append-only model
       // except rewind, which changes the count.
-      const n = data.messages.length;
-      const sig = `${data.total}|${n}|${JSON.stringify(data.messages.slice(Math.max(0, n - 2)))}`;
+      const n = msgList.length;
+      const sig = `${msgTotal}|${n}|${JSON.stringify(msgList.slice(Math.max(0, n - 2)))}`;
       const changed = sig !== prevMsgSigRef.current;
       if (changed) {
         prevMsgSigRef.current = sig;
-        setMessages(data.messages);
-        setTotal(data.total);
+        setMessages(msgList);
+        setTotal(msgTotal);
         // Track newly-appeared compact_boundary entries so we can flash them.
         const freshUuids: string[] = [];
-        for (const m of data.messages) {
+        for (const m of msgList) {
           if (m.type === "system" && (m as unknown as Record<string, unknown>).subtype === "compact_boundary" && m.uuid) {
             if (!seenCompactUuidsRef.current.has(m.uuid)) {
               seenCompactUuidsRef.current.add(m.uuid);
@@ -4151,7 +4178,7 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
       const now = Date.now();
       const realUserEntries: { text: string; ts: number }[] = [];
       const compactBoundaryTs: number[] = [];
-      for (const m of data.messages) {
+      for (const m of msgList) {
         let text: string | null = null;
         if (m.type === "user" && m.message) {
           text = getTextFromContent(m.message.content as RawContentBlock[] | string).trim();
@@ -4244,7 +4271,12 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     setSubagents([]);
   }, [sessionId]);
 
-  // Fetch sub-agents list periodically (stops growing once session ends)
+  // Fetch sub-agents list periodically. New sub-agents only appear while the
+  // session is actively running a Task tool, so poll fast (10s) only while
+  // streaming and back off to 60s when idle. The effect re-runs on the
+  // streaming transition, so a fresh fetch lands right when activity starts or
+  // stops — the log-linking map stays current without polling a dormant
+  // session every 10s.
   useEffect(() => {
     let cancelled = false;
     const fetch = async () => {
@@ -4254,15 +4286,27 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
       } catch { /* ignore */ }
     };
     fetch();
-    const id = setInterval(fetch, 10_000);
+    const id = setInterval(fetch, isStreaming ? 10_000 : 60_000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [sessionId]);
+  }, [sessionId, isStreaming]);
+
+  // "Active" = any state where new content can land continuously and must be
+  // shown promptly: streaming, compacting, a pending AUQ/approval, or an
+  // optimistic send still in flight. Anything here keeps the poll at 1.5s; only
+  // a fully-idle session drops to IDLE_POLL_MS. This is a boolean so the poll
+  // effect re-runs only on the active↔idle transition, not on every mutation.
+  const pollActive =
+    isStreaming || isCompacting || isWaitingForAuq ||
+    !!pendingAuqData || !!pendingApproveData || optimisticMsgs.length > 0;
 
   useEffect(() => {
+    // Session, tail, or active-state changed: drop the change token so the first
+    // fetch returns a full payload (a grown tail must never be short-circuited).
+    lastTokenRef.current = undefined;
     fetchMessages(tail);
-    pollRef.current = setInterval(() => fetchMessages(tail), POLL_MS);
+    pollRef.current = setInterval(() => fetchMessages(tail), pollActive ? POLL_MS : IDLE_POLL_MS);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [fetchMessages, tail]);
+  }, [fetchMessages, tail, pollActive]);
 
   const loadMore = useCallback(() => {
     const el = scrollRef.current;
@@ -4374,6 +4418,12 @@ export function ConversationPane({ sessionId, tool, codexTransport, isStreaming,
     const id = setInterval(cleanupExpiredDrafts, DRAFT_CLEANUP_MS);
     return () => clearInterval(id);
   }, []);
+
+  // Keep the pending-optimistic mirror current so fetchMessages can decide
+  // whether it's safe to use the change-token short-circuit (see lastTokenRef).
+  useEffect(() => {
+    pendingOptimisticRef.current = optimisticMsgs.length > 0;
+  }, [optimisticMsgs]);
 
   // Fire a toast the first time an optimistic message transitions to "lost"
   // (compact-eaten or 30s send timeout). Mark toastShown so we don't re-toast

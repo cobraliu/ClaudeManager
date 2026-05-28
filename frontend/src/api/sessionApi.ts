@@ -424,8 +424,9 @@ export interface SessionStatusListResponse {
   total: number;
 }
 
-export function listSessionsStatus(): Promise<SessionStatusListResponse> {
-  return request("/api/sessions/status");
+export function listSessionsStatus(scope: "all" | "active" = "all"): Promise<SessionStatusListResponse> {
+  const q = scope === "active" ? "?scope=active" : "";
+  return request(`/api/sessions/status${q}`);
 }
 
 
@@ -971,6 +972,17 @@ export interface TodoPlansResponse {
 
 export function listSessionTodos(sessionId: string): Promise<TodoPlansResponse> {
   return request(`/api/sessions/${sessionId}/todos`);
+}
+
+// Active-only todos + goal, combined into one request for the high-frequency
+// bottom-toolbar poll. History is fetched separately (listSessionTodos/listGoals)
+// only when a dock section is open.
+export interface StatusBarResponse {
+  todos_active: TodoItem[];
+  goal_active: Goal | null;
+}
+export function getStatusBar(sessionId: string): Promise<StatusBarResponse> {
+  return request(`/api/sessions/${sessionId}/status-bar`);
 }
 
 export function openShell(sessionId: string): Promise<AttachResponse> {
@@ -1564,8 +1576,20 @@ export interface RawContentBlock {
   [key: string]: unknown;
 }
 
-export function getRawMessages(sessionId: string, tail = 500): Promise<{ messages: RawMessage[]; total: number }> {
-  return request<{ messages: RawMessage[]; total: number }>(`/api/sessions/${sessionId}/raw-messages?tail=${tail}`);
+export interface RawMessagesResp {
+  messages?: RawMessage[];
+  total?: number;
+  token?: string;
+  unchanged?: boolean;
+}
+
+export function getRawMessages(
+  sessionId: string,
+  tail = 500,
+  sinceToken?: string,
+): Promise<RawMessagesResp> {
+  const q = sinceToken ? `&since_token=${encodeURIComponent(sinceToken)}` : "";
+  return request<RawMessagesResp>(`/api/sessions/${sessionId}/raw-messages?tail=${tail}${q}`);
 }
 
 export function getAllRawMessages(sessionId: string): Promise<{ messages: RawMessage[]; total: number }> {

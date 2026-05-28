@@ -9,7 +9,10 @@ import {
 
 const COLLAPSE_KEY = "sideDockCollapsed";
 const SORT_KEY = "auqsPanelSort";
-const AUQ_POLL_MS = 5000;
+// AUQ history is a dock-only view (the user-blocking AUQ prompt itself is
+// driven in real time by the status poll's tui_auq_data, not by this list), so
+// a slow refresh is fine and keeps request volume down.
+const AUQ_POLL_MS = 30000;
 
 type SectionKey = "auqs" | "tasks" | "goals";
 type SortOrder = "asc" | "desc";
