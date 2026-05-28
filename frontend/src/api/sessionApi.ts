@@ -973,6 +973,17 @@ export function listSessionTodos(sessionId: string): Promise<TodoPlansResponse> 
   return request(`/api/sessions/${sessionId}/todos`);
 }
 
+// Active-only todos + goal, combined into one request for the high-frequency
+// bottom-toolbar poll. History is fetched separately (listSessionTodos/listGoals)
+// only when a dock section is open.
+export interface StatusBarResponse {
+  todos_active: TodoItem[];
+  goal_active: Goal | null;
+}
+export function getStatusBar(sessionId: string): Promise<StatusBarResponse> {
+  return request(`/api/sessions/${sessionId}/status-bar`);
+}
+
 export function openShell(sessionId: string): Promise<AttachResponse> {
   return request(`/api/sessions/${sessionId}/shell`, { method: "POST", body: JSON.stringify({}) });
 }

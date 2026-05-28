@@ -1557,6 +1557,31 @@ def list_session_todos(session_id: str, user_id: CurrentUser) -> dict:
     return get_todo_plans(session.agent_session_id, session.cwd)
 
 
+# ── Status bar (active-only todos + goal, combined) ───────────────────────────
+
+@router.get("/{session_id}/status-bar")
+def get_status_bar(session_id: str, user_id: CurrentUser) -> dict:
+    """Active-only todos + goal for the always-on bottom toolbar.
+
+    Combines /todos and /goals into one request and drops the history arrays —
+    the toolbar buttons only need the active state, and the dock fetches full
+    history on demand when a section is opened. This is the high-frequency
+    (5s) poll, so trimming its payload to the active slice is the main win.
+    """
+    store = _get_store()
+    session = store.get(session_id)
+    if session is None or session.owner_id != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not session.agent_session_id:
+        return {"todos_active": [], "goal_active": None}
+    todos = get_todo_plans(session.agent_session_id, session.cwd)
+    goals = read_goals(session.agent_session_id, session.cwd)
+    return {
+        "todos_active": todos.get("active", []),
+        "goal_active": goals.get("active"),
+    }
+
+
 # ── AUQ history ───────────────────────────────────────────────────────────────
 
 @router.get("/{session_id}/auqs")
