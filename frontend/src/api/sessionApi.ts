@@ -1574,7 +1574,7 @@ export function getAllRawMessages(sessionId: string): Promise<{ messages: RawMes
 
 // ── Conversation shares ─────────────────────────────────────────────────────
 
-export type ShareType = "full" | "limited";
+export type ShareType = "full" | "limited" | "chat";
 export type ShareTheme = "light" | "dark";
 
 // Public file-viewing spec. Paths are relative to the session cwd. `full` dirs
@@ -1629,6 +1629,7 @@ export interface ShareMeta {
   cutoff_ts?: number | null;
   default_theme?: ShareTheme;
   has_files?: boolean;
+  session_alive?: boolean;  // chat shares: whether the session can receive input
 }
 
 // Public (no auth) — used by the share viewer.
@@ -1640,8 +1641,18 @@ export function getPublicShareMessages(
   hash: string,
   offset = 0,
   limit = 100,
-): Promise<{ messages: RawMessage[]; total: number; title: string; share_type: ShareType; expires_at: number }> {
+): Promise<{ messages: RawMessage[]; total: number; title: string; share_type: ShareType; expires_at: number; session_alive?: boolean }> {
   return request(`/api/public/share/${hash}/messages?offset=${offset}&limit=${limit}`, undefined, true);
+}
+
+// Public (no auth) — send a chat-mode prompt to the live session behind a chat
+// share. Throws Error(detail) on 4xx/5xx (e.g. "auq_pending", "offline").
+export function postPublicSharePrompt(hash: string, text: string): Promise<{ ok: boolean }> {
+  return request(
+    `/api/public/share/${hash}/prompt`,
+    { method: "POST", body: JSON.stringify({ text }) },
+    true,
+  );
 }
 
 // ── Public share files (no auth) — back the viewer's Files tab. ──────────────

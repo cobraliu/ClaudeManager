@@ -94,7 +94,10 @@ class ShareRecord(BaseModel):
     hash: str
     session_id: str
     owner_id: str
-    share_type: Literal["full", "limited"]
+    # "chat" is an interactive share: readers can send chat-mode prompts to the
+    # live session and browse the whole project read-only. full/limited are
+    # read-only conversation views.
+    share_type: Literal["full", "limited", "chat"]
     # limited-only: the effective timestamp (epoch seconds) of the first
     # turn_duration after the chosen user message — everything at or before
     # this is visible. None for full shares.

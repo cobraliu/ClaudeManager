@@ -147,7 +147,7 @@ function App() {
 }
 
 // Public, no-auth share viewer. Suffix-anchored so it works under any ROOT_PATH.
-const _shareMatch = window.location.pathname.match(/\/share\/(full|limited)\/([0-9a-f]{32})\.html$/);
+const _shareMatch = window.location.pathname.match(/\/share\/(full|limited|chat)\/([0-9a-f]{32})\.html$/);
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

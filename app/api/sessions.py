@@ -2598,7 +2598,7 @@ def get_raw_messages_all(
 
 
 class ShareCreateRequest(BaseModel):
-    share_type: Literal["full", "limited"]
+    share_type: Literal["full", "limited", "chat"]
     # Absolute expiry, epoch seconds. Ignored when `permanent` is set.
     expires_at: float | None = None
     permanent: bool = False
@@ -2662,6 +2662,10 @@ def create_share(session_id: str, body: ShareCreateRequest, user_id: CurrentUser
         cutoff_uuid = body.cutoff_after_uuid
         cutoff_text = res["cutoff_msg_text"]
         h = hashlib.md5(f"{session_id}_{int(cutoff_ts)}_{due}".encode()).hexdigest()
+    elif body.share_type == "chat":
+        # Distinct namespace so a chat share never collides with a full share
+        # of the same session/expiry (both are cutoff-less).
+        h = hashlib.md5(f"{session_id}_chat_{due}".encode()).hexdigest()
     else:
         h = hashlib.md5(f"{session_id}_{due}".encode()).hexdigest()
 
@@ -2676,7 +2680,12 @@ def create_share(session_id: str, body: ShareCreateRequest, user_id: CurrentUser
         created_at=time.time(),
         expires_at=expires_at,
         default_theme=body.default_theme,
-        file_access=(body.file_access if (body.file_access and (body.file_access.full or body.file_access.files)) else None),
+        # chat shares always expose the whole project read-only (full=[""]);
+        # the client-supplied spec is ignored for them.
+        file_access=(
+            FileAccessSpec(full=[""]) if body.share_type == "chat"
+            else (body.file_access if (body.file_access and (body.file_access.full or body.file_access.files)) else None)
+        ),
     )
     store.create_share(rec)
     share_cache.put(rec)

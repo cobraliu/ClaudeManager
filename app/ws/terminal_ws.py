@@ -8,6 +8,7 @@ import time
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from app.models.session import SessionStatus, WsClientMessage
+from app.services.chat_delivery import deliver_to_pane
 from app.services.claude_pid import format_tui_hint, get_pid_waiting_state
 from app.services.claude_session_reader import get_latest_turn_info
 from app.services.session_store import SessionStore
@@ -298,43 +299,10 @@ async def terminal_ws(
                                 )
                             except Exception:
                                 logger.exception("append_prompt_history failed")
-                        buf_name = f"cm-{session_id[:8]}-{int(time.time() * 1000)}"
                         try:
-                            if text_part:
-                                await loop.run_in_executor(
-                                    None, tmux._run,
-                                    "set-buffer", "-b", buf_name, "--", text_part,
-                                )
-                                await loop.run_in_executor(
-                                    None, tmux._run,
-                                    "paste-buffer", "-d", "-p", "-r", "-b", buf_name, "-t", pane_target,
-                                )
-                            if needs_enter:
-                                # Image-upload prompts arrive as multi-line text
-                                # containing "@<path>" file references. A single
-                                # send-keys Enter after the bracketed paste does
-                                # not actually submit — the text lands in Ink's
-                                # input box, cursor sits after the @<path>, but
-                                # the prompt never sends until the user hits
-                                # Enter manually a second time. Empirically the
-                                # cure is to fire a follow-up Enter ourselves.
-                                # We only do this when "@" is in the payload so
-                                # the plain-text path keeps its single Enter and
-                                # never injects a stray newline into the
-                                # conversation.
-                                needs_double_enter = "@" in text_part
-                                if text_part:
-                                    await asyncio.sleep(0.1)
-                                await loop.run_in_executor(
-                                    None, tmux._run,
-                                    "send-keys", "-t", pane_target, "Enter",
-                                )
-                                if needs_double_enter:
-                                    await asyncio.sleep(0.1)
-                                    await loop.run_in_executor(
-                                        None, tmux._run,
-                                        "send-keys", "-t", pane_target, "Enter",
-                                    )
+                            await loop.run_in_executor(
+                                None, deliver_to_pane, tmux, pane_target, text_part, needs_enter,
+                            )
                         except Exception as exc:
                             # Don't leave the client hanging on a silently dropped
                             # message. Bounce it back so the optimistic bubble
