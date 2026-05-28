@@ -69,6 +69,16 @@ function attachInteractions(root: HTMLElement): () => void {
     btn.classList.add("copied");
     setTimeout(() => { btn.textContent = orig; btn.classList.remove("copied"); }, 1100);
   };
+  const preText = (pre: Element | null | undefined): string => {
+    if (!pre) return "";
+    // Numbered output: copy the code column only, dropping the line-number gutter.
+    if (pre.classList.contains("numbered")) {
+      return Array.from(pre.querySelectorAll(".num-code"))
+        .map((c) => (c as HTMLElement).innerText)
+        .join("\n");
+    }
+    return (pre as HTMLElement).innerText;
+  };
 
   const onClick = (e: Event) => {
     const t = e.target as HTMLElement | null;
@@ -78,8 +88,7 @@ function attachInteractions(root: HTMLElement): () => void {
     const src = t.getAttribute("data-copy-source");
     let text = "";
     if (src === "next-pre") {
-      const pre = t.parentElement?.parentElement?.querySelector("pre");
-      if (pre) text = (pre as HTMLElement).innerText;
+      text = preText(t.parentElement?.parentElement?.querySelector("pre"));
     } else if (src === "next-md") {
       const md = t.parentElement?.parentElement?.querySelector(".md, .plan-body");
       if (md) text = (md as HTMLElement).innerText;
@@ -102,8 +111,7 @@ function attachInteractions(root: HTMLElement): () => void {
         text = lines.join("\n");
       }
     } else {
-      const pre = t.closest("details, div")?.querySelector("pre");
-      if (pre) text = (pre as HTMLElement).innerText;
+      text = preText(t.closest("details, div")?.querySelector("pre"));
     }
     if (text) { copyText(text); flash(t); }
   };

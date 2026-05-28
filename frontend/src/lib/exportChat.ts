@@ -187,6 +187,37 @@ function renderWriteContent(filePath: string, content: string): string {
   </div>`;
 }
 
+// cat -n style numbered output (Read results, `cat -n`): "   42\tcontent".
+// Mirrors ConversationPane's NumberedLines so the viewer shows a distinct
+// line-number gutter instead of cramming the number against the code.
+const CAT_N_RE = /^ *\d+\t/;
+function isNumberedOutput(text: string): boolean {
+  const lines = text.split("\n").filter((l) => l.length > 0).slice(0, 5);
+  return lines.length >= 2 && lines.every((l) => CAT_N_RE.test(l));
+}
+
+function renderToolResultPre(text: string): string {
+  if (!isNumberedOutput(text)) {
+    return `<pre class="tool-pre">${escapeHtml(text)}</pre>`;
+  }
+  const lines = text.split("\n");
+  let gutter = 4;
+  for (const line of lines) {
+    const tab = line.indexOf("\t");
+    if (tab !== -1) gutter = Math.max(gutter, line.slice(0, tab).trim().length);
+  }
+  const rows = lines.map((line) => {
+    const tab = line.indexOf("\t");
+    if (tab === -1) {
+      return `<div class="num-row"><span class="num-ln"></span><span class="num-code">${escapeHtml(line) || "&nbsp;"}</span></div>`;
+    }
+    const num = line.slice(0, tab).trim();
+    const code = line.slice(tab + 1);
+    return `<div class="num-row"><span class="num-ln">${escapeHtml(num)}</span><span class="num-code">${escapeHtml(code) || "&nbsp;"}</span></div>`;
+  });
+  return `<pre class="tool-pre numbered" style="--num-gutter:${gutter}ch">${rows.join("")}</pre>`;
+}
+
 async function renderAssistantText(text: string): Promise<string> {
   return `<div class="md">${await renderMermaidToHtml(renderMarkdown(text))}</div>`;
 }
@@ -239,7 +270,7 @@ function renderToolUseBlock(b: RawContentBlock, resultBlock: RawContentBlock | u
         <span class="tool-result-label">${isErr ? "Error" : "Result"}</span>
         <button class="copy-btn" data-copy-source="next-pre">Copy</button>
       </div>
-      <pre class="tool-pre">${escapeHtml(text)}</pre>
+      ${renderToolResultPre(text)}
     </div>`;
   } else {
     resultHtml = `<div class="tool-result tool-result-pending"><span class="tool-result-label">No result</span></div>`;
@@ -444,7 +475,7 @@ async function renderEntry(
       // Orphan tool result (no matching tool_use seen) — show inline
       const text = blockText(b.content);
       if (text.trim()) {
-        parts.push(`<details class="tool-result orphan"><summary>Tool result</summary><pre class="tool-pre">${escapeHtml(text)}</pre></details>`);
+        parts.push(`<details class="tool-result orphan"><summary>Tool result</summary>${renderToolResultPre(text)}</details>`);
       }
     }
   }
@@ -548,6 +579,14 @@ h1 { font-size: 18px; margin: 0 0 4px; }
             white-space: pre-wrap; word-break: break-word; margin: 2px 0 0; }
 .tool-error .tool-pre { background: #3a1212; color: #f8d7da; border: 1px solid #6a2020; }
 .tool-result-pending { color: #888; font-size: 11px; padding: 2px 0; }
+/* Numbered output (Read / cat -n): right-aligned line-number gutter, separated
+   from the code column. .tool-pre stays dark in both themes, so no dark override. */
+.tool-pre.numbered { padding: 6px 0; white-space: normal; }
+.num-row { display: flex; }
+.num-ln { flex-shrink: 0; min-width: var(--num-gutter, 4ch); padding: 0 10px 0 8px;
+          text-align: right; color: #8a8a8a; user-select: none; white-space: nowrap;
+          border-right: 1px solid rgba(255,255,255,0.08); }
+.num-code { flex: 1 1 auto; min-width: 0; white-space: pre; padding: 0 8px; }
 
 /* Thinking */
 .thinking { margin: 4px 0; border: 1px dashed #d0c5e0; border-radius: 6px; background: #f9f6fc; }
@@ -747,12 +786,22 @@ const SCRIPT = `
       btn.classList.remove('copied');
     }, 1100);
   }
+  function preText(pre) {
+    if (!pre) return '';
+    // Numbered output: copy the code column only, dropping the line-number gutter.
+    if (pre.classList.contains('numbered')) {
+      var codes = pre.querySelectorAll('.num-code');
+      var out = [];
+      codes.forEach(function(c) { out.push(c.innerText); });
+      return out.join('\\n');
+    }
+    return pre.innerText;
+  }
   function handleCopy(btn) {
     var src = btn.getAttribute('data-copy-source');
     var text = '';
     if (src === 'next-pre') {
-      var pre = btn.parentElement.parentElement.querySelector('pre');
-      if (pre) text = pre.innerText;
+      text = preText(btn.parentElement.parentElement.querySelector('pre'));
     } else if (src === 'next-md') {
       var md = btn.parentElement.parentElement.querySelector('.md, .plan-body');
       if (md) text = md.innerText;
@@ -778,8 +827,7 @@ const SCRIPT = `
         text = lines.join('\n');
       }
     } else {
-      var pre = btn.closest('details, div').querySelector('pre');
-      if (pre) text = pre.innerText;
+      text = preText(btn.closest('details, div').querySelector('pre'));
     }
     if (text) {
       copyText(text);
