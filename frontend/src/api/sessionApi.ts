@@ -1564,8 +1564,20 @@ export interface RawContentBlock {
   [key: string]: unknown;
 }
 
-export function getRawMessages(sessionId: string, tail = 500): Promise<{ messages: RawMessage[]; total: number }> {
-  return request<{ messages: RawMessage[]; total: number }>(`/api/sessions/${sessionId}/raw-messages?tail=${tail}`);
+export interface RawMessagesResp {
+  messages?: RawMessage[];
+  total?: number;
+  token?: string;
+  unchanged?: boolean;
+}
+
+export function getRawMessages(
+  sessionId: string,
+  tail = 500,
+  sinceToken?: string,
+): Promise<RawMessagesResp> {
+  const q = sinceToken ? `&since_token=${encodeURIComponent(sinceToken)}` : "";
+  return request<RawMessagesResp>(`/api/sessions/${sessionId}/raw-messages?tail=${tail}${q}`);
 }
 
 export function getAllRawMessages(sessionId: string): Promise<{ messages: RawMessage[]; total: number }> {

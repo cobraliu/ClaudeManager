@@ -2265,14 +2265,23 @@ def get_raw_messages(
     session_id: str,
     user_id: CurrentUser,
     tail: int = Query(default=100, ge=10, le=2000),
+    since_token: str | None = Query(default=None),
 ) -> dict:
     """Return the last `tail` JSONL entries.
 
     Uses mmap + reverse scan so only the last `tail` lines are JSON-parsed.
     Total line count is derived from a fast binary newline scan (no full parse).
+
+    When `since_token` matches the current change token, returns
+    `{"unchanged": True, "token": ...}` without re-reading/parsing — the poll
+    loop uses this to skip the full payload while nothing has changed. The
+    token must be paired with a fixed `tail`; callers reset it when `tail`
+    grows (load-more) so a larger window is never short-circuited.
     """
     import json as _json
     import mmap as _mmap
+    import os as _os
+    from pathlib import Path as _Path
     from app.services.claude_session_reader import _find_session_jsonl
 
     store = _get_store()
@@ -2296,8 +2305,35 @@ def get_raw_messages(
         with jsonl_path.open("rb") as f:
             f.seek(0, 2)
             size = f.tell()
+            # ── Change token ────────────────────────────────────────────────
+            # Fold the JSONL state (size + mtime) AND the in-flight proxy
+            # snapshot dir state (count + max-mtime + total-size) into one
+            # opaque token. Streaming assistant content arrives via snapshots
+            # under ~/.claude/cached_messages/{csid}/ even when the JSONL is
+            # static, so the snapshot state MUST be part of the token —
+            # otherwise the live view would freeze mid-stream. Any append,
+            # in-place rewrite, or snapshot add/update flips the token, so an
+            # unchanged token guarantees the merged result is unchanged: it is
+            # always safe to skip the expensive parse+merge below.
+            _jstat = _os.fstat(f.fileno())
+            _snap_n = _snap_mtime = _snap_sz = 0
+            _cache_dir = _Path.home() / ".claude" / "cached_messages" / chat_sid
+            try:
+                with _os.scandir(_cache_dir) as _it:
+                    for _e in _it:
+                        if _e.name.endswith(".json") and not _e.name.startswith("."):
+                            _est = _e.stat()
+                            _snap_n += 1
+                            _snap_sz += _est.st_size
+                            if _est.st_mtime_ns > _snap_mtime:
+                                _snap_mtime = _est.st_mtime_ns
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            token = f"{size}:{_jstat.st_mtime_ns}:{_snap_n}:{_snap_mtime}:{_snap_sz}"
+            if since_token and since_token == token:
+                return {"unchanged": True, "token": token}
             if size == 0:
-                return {"messages": [], "total": 0}
+                return {"messages": [], "total": 0, "token": token}
 
             with _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ) as mm:
                 # ── Total line count: fast chunk-based newline scan, no JSON parse ──
@@ -2482,7 +2518,7 @@ def get_raw_messages(
                             synth.sort(key=lambda d: d["timestamp"])
                             collected.extend(synth)
 
-                return {"messages": collected, "total": total}
+                return {"messages": collected, "total": total, "token": token}
 
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
