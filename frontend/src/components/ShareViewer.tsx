@@ -6,6 +6,7 @@ import {
   type ShareType,
 } from "../api/sessionApi";
 import { renderConversationBody, LIGHT_STYLE, DARK_STYLE } from "../lib/exportChat";
+import { ShareFilesTab } from "./ShareFilesTab";
 
 const PERMANENT_EXPIRES = 2147483647;
 const POLL_MS = 1500;
@@ -150,6 +151,8 @@ export function ShareViewer({ hash, shareType }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(() => savedTheme(hash) ?? "light");
   const themeOverriddenRef = useRef(savedTheme(hash) !== null);
+  const [hasFiles, setHasFiles] = useState(false);
+  const [activeTab, setActiveTab] = useState<"chat" | "files">("chat");
 
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const loadedRef = useRef<RawMessage[]>([]);
@@ -183,6 +186,7 @@ export function ShareViewer({ hash, shareType }: Props) {
         setTitle(m.title || "Shared conversation");
         setExpiresAt(m.expires_at);
         setCutoffTs(m.cutoff_ts ?? null);
+        setHasFiles(Boolean(m.has_files));
         if (!themeOverriddenRef.current && (m.default_theme === "light" || m.default_theme === "dark")) {
           setTheme(m.default_theme);
         }
@@ -299,25 +303,58 @@ export function ShareViewer({ hash, shareType }: Props) {
           {total > 0 && <span> · 共 {total} 条</span>}
         </div>
         <div className="toolbar">
-          <button type="button" onClick={expandAll}>Expand all</button>
-          <button type="button" onClick={collapseAll}>Collapse all</button>
+          {(!hasFiles || activeTab === "chat") && (
+            <>
+              <button type="button" onClick={expandAll}>Expand all</button>
+              <button type="button" onClick={collapseAll}>Collapse all</button>
+            </>
+          )}
           <button type="button" onClick={toggleTheme} title="切换深色 / 浅色">
             {theme === "dark" ? "☀️ 浅色" : "🌙 深色"}
           </button>
         </div>
+        {hasFiles && (
+          <div className="share-tabs" style={{ display: "flex", gap: 6, marginTop: 12 }}>
+            {(["chat", "files"] as const).map((id) => {
+              const on = activeTab === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setActiveTab(id)}
+                  style={{
+                    fontSize: 13, padding: "6px 16px", borderRadius: 6, cursor: "pointer",
+                    border: `1px solid ${on ? (theme === "dark" ? "#58a6ff" : "#2563eb") : (theme === "dark" ? "#444" : "#ddd")}`,
+                    background: on ? (theme === "dark" ? "rgba(88,166,255,0.15)" : "rgba(37,99,235,0.08)") : "transparent",
+                    color: on ? (theme === "dark" ? "#58a6ff" : "#2563eb") : (theme === "dark" ? "#aaa" : "#666"),
+                  }}
+                >
+                  {id === "chat" ? "💬 Chat" : "📁 Files"}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </header>
-      {loading && !bodyHtml ? (
-        <div style={{ color: "#888", fontSize: 13, fontFamily: "sans-serif" }}>加载中…</div>
-      ) : (
-        <>
-          <div ref={bodyRef} dangerouslySetInnerHTML={{ __html: bodyHtml }} />
-          {remaining > 0 && (
-            <div style={{ textAlign: "center", color: "#888", fontSize: 12, padding: "16px 0", fontFamily: "sans-serif" }}>
-              下滑加载更多（剩余 {remaining} 条）…
-            </div>
-          )}
-        </>
-      )}
+
+      <div style={{ display: hasFiles && activeTab === "files" ? "block" : "none" }}>
+        {hasFiles && activeTab === "files" && <ShareFilesTab hash={hash} theme={theme} />}
+      </div>
+
+      <div style={{ display: hasFiles && activeTab === "files" ? "none" : "block" }}>
+        {loading && !bodyHtml ? (
+          <div style={{ color: "#888", fontSize: 13, fontFamily: "sans-serif" }}>加载中…</div>
+        ) : (
+          <>
+            <div ref={bodyRef} dangerouslySetInnerHTML={{ __html: bodyHtml }} />
+            {remaining > 0 && (
+              <div style={{ textAlign: "center", color: "#888", fontSize: 12, padding: "16px 0", fontFamily: "sans-serif" }}>
+                下滑加载更多（剩余 {remaining} 条）…
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }

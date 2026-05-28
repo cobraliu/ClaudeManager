@@ -108,7 +108,9 @@ import {
   type ShareRecord,
   type ShareTheme,
   type ShareType,
+  type FileAccessSpec,
 } from "../api/sessionApi";
+import { ShareFileSelector } from "../components/ShareFileSelector";
 import gitIcon from "../assets/git.svg";
 import terminalIcon from "../assets/terminal.svg";
 import scheduleIcon from "../assets/schedule.svg";
@@ -5676,6 +5678,8 @@ function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: 
   const [shareType, setShareType] = useState<ShareType>("full");
   const [defaultTheme, setDefaultTheme] = useState<ShareTheme>("light");
   const [preset, setPreset] = useState<"1d" | "7d" | "30d" | "permanent">("7d");
+  const [fileAccess, setFileAccess] = useState<FileAccessSpec>({ full: [], files: [] });
+  const [showFiles, setShowFiles] = useState(false);
   const [userMsgs, setUserMsgs] = useState<RawMessage[]>([]);
   const [cutoffUuid, setCutoffUuid] = useState("");
   const [loadingMsgs, setLoadingMsgs] = useState(false);
@@ -5718,12 +5722,14 @@ function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: 
     const days = preset === "1d" ? 1 : preset === "7d" ? 7 : 30;
     setCreating(true);
     try {
+      const hasFiles = fileAccess.full.length > 0 || fileAccess.files.length > 0;
       const rec = await createShare(session.id, {
         share_type: shareType,
         permanent,
         expires_at: permanent ? undefined : Math.floor(Date.now() / 1000) + days * 86400,
         cutoff_after_uuid: shareType === "limited" ? cutoffUuid : undefined,
         default_theme: defaultTheme,
+        file_access: hasFiles ? fileAccess : undefined,
       });
       setCreated(rec);
     } catch (e) { setErr(String(e instanceof Error ? e.message : e)); }
@@ -5773,6 +5779,21 @@ function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: 
                 {([["1d", "1天"], ["7d", "7天"], ["30d", "30天"], ["permanent", "永久"]] as const).map(([id, lbl]) => (
                   <button key={id} onClick={() => setPreset(id)} style={chip(preset === id)}>{lbl}</button>
                 ))}
+              </div>
+
+              <div>
+                <button
+                  onClick={() => setShowFiles((v) => !v)}
+                  style={{ width: "100%", textAlign: "left", padding: "9px 12px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--text-body)", fontSize: 13, display: "flex", justifyContent: "space-between", alignItems: "center" }}
+                >
+                  <span>📁 可查看的文件{fileAccess.full.length + fileAccess.files.length > 0 ? `（${fileAccess.full.length + fileAccess.files.length}）` : "（可选）"}</span>
+                  <span style={{ color: "var(--text-muted)", fontSize: 11 }}>{showFiles ? "▼" : "▶"}</span>
+                </button>
+                {showFiles && (
+                  <div style={{ marginTop: 8 }}>
+                    <ShareFileSelector sessionId={session.id} value={fileAccess} onChange={setFileAccess} compact />
+                  </div>
+                )}
               </div>
 
               {shareType === "limited" && (
