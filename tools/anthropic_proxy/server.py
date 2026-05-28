@@ -64,6 +64,11 @@ _STATS: dict[str, Any] = {
     "snapshots_total": 0,
     "client_disconnects_total": 0,
     "upstream_errors_total": 0,
+    # Subset where the upstream cut the SSE stream mid-flight (payload not
+    # completed / sock-read timeout) AFTER we'd already sent headers downstream
+    # — distinct from a client hangup. Counted separately so monitoring can tell
+    # which side dropped the connection.
+    "upstream_truncated_total": 0,
 }
 _START_MONOTONIC: float = 0.0  # set in main() at server start
 
@@ -264,10 +269,12 @@ async def handle(
     timeout = aiohttp.ClientTimeout(total=None, sock_read=600, connect=30)
     client_gone = False
     resp_prepared = False
+    resp: web.StreamResponse | None = None
     status = 0
     bytes_sent = 0
     is_sse = False
     sse_buffer_overflow = False
+    upstream_truncated = False
     try:
         # connector_owner=False keeps the app-wide TCPConnector alive across requests
         # so TLS handshakes to api.anthropic.com get reused (big win for SSE).
@@ -367,15 +374,47 @@ async def handle(
         #       illegal and aiohttp will discard or raise — log it as a
         #       client-driven event and return whatever we had.
         if resp_prepared:
-            client_gone = True
-            log.info("client disconnected mid-stream url=%s session=%s after=%dB events=%d snapshots=%d cause=%s",
-                     url, session_id or "-", bytes_sent,
-                     aggregator.events_seen if aggregator else 0,
-                     aggregator.snapshots_taken if aggregator else 0,
-                     exc)
-            # `resp` was created inside the inner `async with` whose exit
-            # raised; it's out of scope here. Return a placeholder — aiohttp
-            # ignores the body once the response is in-flight.
+            # Headers already went downstream — we can't downgrade to a 502.
+            # Distinguish the two sides so logs/stats name the right culprit:
+            #   (a) upstream truncated the SSE stream mid-flight: aiohttp raises
+            #       ClientPayloadError ("payload is not completed") while reading
+            #       the upstream body, or a sock-read timeout means upstream went
+            #       silent. The client is usually still connected and waiting, so
+            #       cap the chunked response with write_eof() — the CLI then gets
+            #       a well-formed (if incomplete) stream it can retry on, instead
+            #       of a malformed HTTP frame surfacing as InvalidHTTPResponse.
+            #   (b) the client (Claude CLI) hung up: writing downstream failed on
+            #       context-exit. Nothing to flush.
+            if isinstance(exc, (aiohttp.ClientPayloadError, asyncio.TimeoutError)):
+                upstream_truncated = True
+                _STATS["upstream_truncated_total"] += 1
+                eof_ok = False
+                if resp is not None:
+                    try:
+                        await resp.write_eof()
+                        eof_ok = True
+                    except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                        # Client also gone, or response already closed.
+                        client_gone = True
+                log.info(
+                    "upstream truncated mid-stream url=%s session=%s after=%dB "
+                    "events=%d snapshots=%d client_eof=%s cause=%s",
+                    url, session_id or "-", bytes_sent,
+                    aggregator.events_seen if aggregator else 0,
+                    aggregator.snapshots_taken if aggregator else 0,
+                    "Y" if eof_ok else "N", exc)
+                if eof_ok:
+                    return resp
+            else:
+                client_gone = True
+                log.info(
+                    "client disconnected mid-stream url=%s session=%s after=%dB "
+                    "events=%d snapshots=%d cause=%s",
+                    url, session_id or "-", bytes_sent,
+                    aggregator.events_seen if aggregator else 0,
+                    aggregator.snapshots_taken if aggregator else 0,
+                    exc)
+            # Response is already in-flight; aiohttp ignores any returned body.
             return web.Response(status=status or 200)
         _STATS["upstream_errors_total"] += 1
         log.warning("upstream error url=%s session=%s: %s", url, session_id or "-", exc)
@@ -399,13 +438,14 @@ async def handle(
             _STATS["client_disconnects_total"] += 1
         dur_ms = int((time.monotonic() - t0) * 1000)
         log.info(
-            "req method=%s path=%s session=%s status=%d sse=%s dur_ms=%d bytes=%d events=%d snapshots=%d%s%s",
+            "req method=%s path=%s session=%s status=%d sse=%s dur_ms=%d bytes=%d events=%d snapshots=%d%s%s%s",
             request.method, request.path, session_id or "-",
             status, "Y" if is_sse else "N",
             dur_ms, bytes_sent,
             aggregator.events_seen if aggregator else 0,
             aggregator.snapshots_taken if aggregator else 0,
             " client_gone=Y" if client_gone else "",
+            " upstream_truncated=Y" if upstream_truncated else "",
             " sse_overflow=Y" if sse_buffer_overflow else "",
         )
 
