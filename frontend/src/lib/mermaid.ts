@@ -129,7 +129,28 @@ export function startMermaidObserver(): void {
     });
   };
 
-  new MutationObserver(schedule).observe(document.body, {
+  // Only react when a mermaid block actually entered the DOM. Without this
+  // guard the observer ran scanAndRender() — a full-document
+  // querySelectorAll(".mermaid-block") — on EVERY mutation anywhere in the app
+  // (streaming output, the 1.5s poll re-render, terminal output, typing,
+  // scrolling). That scan grows with the page's DOM and fires up to ~60×/s
+  // during activity, saturating the main thread over a long session (the
+  // "everything is laggy until you refresh" symptom). The overwhelming common
+  // case has no diagrams at all, so checking addedNodes lets us skip the scan
+  // entirely; when a block does appear, querySelector is bounded by the small
+  // newly-added subtree, not the whole document.
+  const isOrHasMermaid = (node: Node): boolean => {
+    if (node.nodeType !== 1) return false; // ELEMENT_NODE
+    const el = node as Element;
+    return el.classList.contains("mermaid-block") || el.querySelector(".mermaid-block") !== null;
+  };
+  new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (isOrHasMermaid(node)) { schedule(); return; }
+      }
+    }
+  }).observe(document.body, {
     childList: true,
     subtree: true,
   });
