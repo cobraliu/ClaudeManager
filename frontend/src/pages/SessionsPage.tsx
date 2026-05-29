@@ -1677,12 +1677,16 @@ export function SessionsPage({ username, onLogout, onSwitchToAdmin, theme, onTog
 
   // Poll every 5s, pause when tab hidden
   useEffect(() => {
-    let id: ReturnType<typeof setInterval>;
+    let id: ReturnType<typeof setInterval> | null = null;
     const start = () => {
+      // Idempotent: a second "visible" event (some browsers pair visibilitychange
+      // with focus/pageshow) would otherwise overwrite `id` and orphan the old
+      // interval, stacking 5s list-polls that never get cleared until reload.
+      if (id !== null) clearInterval(id);
       refresh(searchRef2.current);
       id = setInterval(() => refresh(searchRef2.current), 5000);
     };
-    const stop = () => clearInterval(id);
+    const stop = () => { if (id !== null) { clearInterval(id); id = null; } };
     const onVis = () => (document.hidden ? stop() : start());
     start();
     document.addEventListener("visibilitychange", onVis);
