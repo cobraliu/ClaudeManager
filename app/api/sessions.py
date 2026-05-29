@@ -35,8 +35,8 @@ from app.models.session import (
 from app.observability import audit_event
 from app.security import AdminUser, CurrentUser, CurrentUserInfo
 from app.services.claude_pid import format_tui_hint, get_pid_waiting_state, parse_auq_from_screen
-from app.services.claude_session_reader import enrich_session, find_newest_claude_session_id, get_latest_turn_info, get_conversation, search_conversation, list_project_session_ids, list_subagents, get_subagent_lines, list_all_claude_sessions_global, get_todo_plans, compute_share_cutoff, read_raw_messages_page
-from app.services.claude_goals import read_goals
+from app.services.claude_session_reader import enrich_session, find_newest_claude_session_id, get_latest_turn_info, get_conversation, search_conversation, list_project_session_ids, list_subagents, get_subagent_lines, list_all_claude_sessions_global, get_todo_plans, get_active_todos, compute_share_cutoff, read_raw_messages_page
+from app.services.claude_goals import read_goals, get_active_goal
 from app.services.claude_auqs import list_auqs
 from app.agents import get_adapter
 from app.services.cursor_session_reader import list_all_cursor_sessions_global
@@ -1695,7 +1695,9 @@ def get_status_bar(session_id: str, user_id: CurrentUser) -> dict:
     Combines /todos and /goals into one request and drops the history arrays —
     the toolbar buttons only need the active state, and the dock fetches full
     history on demand when a section is opened. This is the high-frequency
-    (5s) poll, so trimming its payload to the active slice is the main win.
+    (5s) poll, so it uses the bounded tail readers (get_active_todos /
+    get_active_goal) that NEVER read the whole JSONL — O(tail) regardless of
+    file size, so it can't get slower as the session grows.
     """
     store = _get_store()
     session = store.get(session_id)
@@ -1703,11 +1705,9 @@ def get_status_bar(session_id: str, user_id: CurrentUser) -> dict:
         raise HTTPException(status_code=404, detail="session not found")
     if not session.agent_session_id:
         return {"todos_active": [], "goal_active": None}
-    todos = get_todo_plans(session.agent_session_id, session.cwd)
-    goals = read_goals(session.agent_session_id, session.cwd)
     return {
-        "todos_active": todos.get("active", []),
-        "goal_active": goals.get("active"),
+        "todos_active": get_active_todos(session.agent_session_id, session.cwd),
+        "goal_active": get_active_goal(session.agent_session_id, session.cwd),
     }
 
 

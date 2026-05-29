@@ -392,8 +392,25 @@ def _todos_kset(todos: list[dict]) -> set:
     return keys
 
 
-def get_todo_plans(claude_session_id: str, cwd: str) -> dict:
+# Incremental scan cache for get_todo_plans: jsonl path -> (consumed_offset, snapshots).
+# The session JSONL is append-only, so the snapshot list only ever grows; a poll
+# seeks to the cached offset and parses just the newly-appended lines instead of
+# the whole 100MB+ file. Keyed by path (owner-independent). Copy-on-read for
+# concurrency safety (idempotent if two callers race on the same delta).
+_todo_scan_cache: dict[str, tuple[int, list]] = {}
+
+
+def get_todo_plans(claude_session_id: str, cwd: str, window_bytes: int | None = None) -> dict:
     """Scan the session JSONL for plan snapshots and group them into plans.
+
+    `window_bytes` (bounded tail mode, used by the status-bar hot path): read
+    only the last `window_bytes` and forward-parse, never the whole file —
+    O(window) regardless of file size, restart-safe, no cache. History is
+    partial in this mode (only plans whose snapshots fall in the window); the
+    "active" slice is correct as long as the window covers the last plan's
+    starting anchor, which the caller (get_active_todos) guarantees by widening
+    the window until an anchor is captured. Default (None) = full incremental
+    scan with cache, used by the on-demand dock history endpoints.
 
     Two data sources, unified into one view:
       A. `TodoWrite` tool_use blocks (assistant entries) — emitted by the agent calling
@@ -427,10 +444,54 @@ def get_todo_plans(claude_session_id: str, cwd: str) -> dict:
     # update). Plan boundaries are decided by comparing each new anchor to the PRIOR anchor — not
     # to the cumulative plan kset — so a delta that carries forward old ids can't bridge two
     # disjoint anchors into one plan.
-    snapshots: list[tuple[float, list[dict], set, bool]] = []
     try:
-        with open(jsonl) as f:
-            for line in f:
+        size = jsonl.stat().st_size
+    except OSError:
+        return {"active": [], "history": []}
+    _pk = str(jsonl)
+    if window_bytes is not None:
+        # Bounded tail mode: read only the last window_bytes, forward-parse, no
+        # cache. Active state lives at the tail (the CLI re-emits a full
+        # task_reminder anchor ~every turn), so a suffix that contains the last
+        # plan's anchor yields the same "active" as a full scan.
+        _start = max(0, size - window_bytes)
+        snapshots: list[tuple[float, list[dict], set, bool]] = []
+    else:
+        _cached = _todo_scan_cache.get(_pk)
+        if _cached is not None and size >= _cached[0]:
+            _start = _cached[0]
+            snapshots = list(_cached[1])
+        else:
+            _start = 0
+            snapshots = []
+    _consumed = _start
+    try:
+        # Read only the appended region [consumed_offset, size). A line worth
+        # parsing always contains one of these literals, so the byte pre-filter
+        # skips json.loads on the overwhelming majority (plain chat turns) — this
+        # alone slashes even the one-time cold pass from ~48k parses to ~1k.
+        with open(jsonl, "rb") as f:
+            f.seek(_start)
+            _data = f.read(max(0, size - _start))
+            if window_bytes is not None and _start > 0:
+                # Started mid-file: drop the partial first line so parsing begins
+                # on a clean record boundary.
+                _fnl = _data.find(b"\n")
+                _data = _data[_fnl + 1:] if _fnl != -1 else b""
+            _last_nl = _data.rfind(b"\n")
+            if _last_nl != -1:
+                _consumed = _start + _last_nl + 1
+            _lines = _data[:_last_nl + 1].split(b"\n") if _last_nl != -1 else []
+            for line in _lines:
+                if not line:
+                    continue
+                if (
+                    b"TodoWrite" not in line
+                    and b"TaskCreate" not in line
+                    and b"TaskUpdate" not in line
+                    and b"task_reminder" not in line
+                ):
+                    continue
                 try:
                     d = json.loads(line)
                 except json.JSONDecodeError:
@@ -556,6 +617,8 @@ def get_todo_plans(claude_session_id: str, cwd: str) -> dict:
                     # signals "the task list was reset" — it must break the snapshot chain
                     # so the next TaskCreate doesn't accumulate onto the previous batch.
                     snapshots.append((ts, norm, _todos_kset(norm), True))
+            if window_bytes is None:
+                _todo_scan_cache[_pk] = (_consumed, snapshots)
     except OSError:
         return {"active": [], "history": []}
 
@@ -607,6 +670,39 @@ def get_todo_plans(claude_session_id: str, cwd: str) -> dict:
             })
     history.reverse()
     return {"active": active, "history": history}
+
+
+# Window sizes for the bounded tail scan, smallest first. An active plan's anchor
+# (task_reminder / TodoWrite) is re-emitted ~every turn, so the smallest window
+# almost always captures it; we widen only when a window saw no plan at all.
+_TODO_TAIL_WINDOWS = (256 * 1024, 2 * 1024 * 1024, 16 * 1024 * 1024)
+
+
+def get_active_todos(claude_session_id: str, cwd: str) -> list[dict]:
+    """Active todo list for the status-bar hot path WITHOUT reading the full file.
+
+    Reads a bounded tail window and runs the exact get_todo_plans grouping on it,
+    widening the window only if it captured no plan (so the file may be larger
+    than the window yet hold an anchor further back). The active plan's snapshots
+    live at the tail, so a suffix that contains them yields the same "active" as a
+    full scan — verified by the golden test in tests/. Returns get_todo_plans()'s
+    "active" slice (latest plan's todos if not all-completed, else []).
+    """
+    jsonl = _find_session_jsonl(claude_session_id, cwd)
+    if jsonl is None:
+        return []
+    try:
+        size = jsonl.stat().st_size
+    except OSError:
+        return []
+    res = {"active": [], "history": []}
+    for wb in _TODO_TAIL_WINDOWS:
+        res = get_todo_plans(claude_session_id, cwd, window_bytes=wb)
+        # Definitive when the window covers the whole file, or it saw at least one
+        # plan (=> it holds the most recent anchor, which decides "active").
+        if size <= wb or res["active"] or res["history"]:
+            break
+    return res["active"]
 
 
 def get_subagent_lines(claude_session_id: str, cwd: str, agent_id: str, from_line: int = 0) -> dict:
