@@ -1103,9 +1103,15 @@ class DirInfoResponse(BaseModel):
 def get_dir_info(
     session_id: str,
     path: str = Query(default=""),
+    with_sizes: bool = Query(default=True),
     user_id: CurrentUser = None,  # type: ignore[assignment]
 ) -> DirInfoResponse:
-    """Return total size and top-level items with sizes for a directory."""
+    """Return top-level items for a directory.
+
+    with_sizes=False skips the recursive per-directory size walk (_dir_size),
+    which is the dominant cost on trees with large subdirs (node_modules, logs).
+    Callers that only list names (e.g. the share file picker) pass False.
+    """
     store = _get_store()
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
@@ -1122,7 +1128,7 @@ def get_dir_info(
         try:
             rel = str(child.relative_to(base))
             if child.is_dir():
-                sz = _dir_size(child)
+                sz = _dir_size(child) if with_sizes else 0
                 items.append(DirInfoItem(name=child.name, path=rel, type="dir", size=sz))
             elif child.is_file():
                 sz = child.stat().st_size

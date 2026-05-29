@@ -136,7 +136,7 @@ function InclNode({
     if (next && children === null) {
       setLoading(true);
       try {
-        const res = await getDirInfo(sessionId, item.path);
+        const res = await getDirInfo(sessionId, item.path, false);
         setChildren(res.items.filter(offerable));
       } catch {
         setChildren([]);
@@ -241,7 +241,7 @@ export function ShareFileSelector({
   const count = full.size + files.size;
 
   useEffect(() => {
-    getDirInfo(sessionId, "")
+    getDirInfo(sessionId, "", false)
       .then((r) => setRoots(r.items.filter(offerable)))
       .catch((e) => setErr(String(e instanceof Error ? e.message : e)));
   }, [sessionId]);
