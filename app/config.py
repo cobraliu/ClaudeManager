@@ -198,6 +198,43 @@ def set_enabled_tools(tools: list[str]) -> None:
     _set("enabled_tools", json.dumps(cleaned))
 
 
+# ── Directory scan blacklist ─────────────────────────────────────────────────
+# Bare directory NAMES whose entire subtree is bypassed during file scans
+# (listing, name search, share browsing). These dirs routinely hold 10k-100k+
+# files (dependency/venv caches) and dominate scan cost; bypassing them keeps
+# directory listings fast. Matched by name at any depth — not paths.
+_DEFAULT_SKIP_DIRS = ["node_modules", "venv", ".venv"]
+
+
+def get_skip_dirs() -> list[str]:
+    raw = _get("skip_dirs")
+    if not raw:
+        return list(_DEFAULT_SKIP_DIRS)
+    try:
+        vals = json.loads(raw)
+    except Exception:
+        return list(_DEFAULT_SKIP_DIRS)
+    if not isinstance(vals, list):
+        return list(_DEFAULT_SKIP_DIRS)
+    return [str(v).strip() for v in vals if str(v).strip()]
+
+
+def set_skip_dirs(dirs: list[str]) -> None:
+    # These are bare directory names matched anywhere in the tree, so reject any
+    # entry containing a path separator or a traversal component. An empty list
+    # is allowed — the admin may choose to disable the blacklist entirely.
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for d in dirs:
+        name = str(d).strip()
+        if not name or name in (".", "..") or "/" in name or "\\" in name:
+            continue
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    _set("skip_dirs", json.dumps(cleaned))
+
+
 _DEFAULT_TERMINAL_FONT = '"Ubuntu Sans Mono", "WenQuanYi Micro Hei Mono", "WenQuanYi Zen Hei Mono", monospace'
 
 

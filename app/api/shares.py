@@ -10,6 +10,7 @@ cleanup loop), so a hit never touches the DB.
 from __future__ import annotations
 
 import mimetypes
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
@@ -24,7 +25,9 @@ from app.api.files import (
     SQLITE_EXTENSIONS,
     FileEntry,
     FilesResponse,
+    _blacklisted_dirs,
     _is_archive_name,
+    _is_probably_text,
     _is_text,
     _resolve,
 )
@@ -177,7 +180,8 @@ def _norm(rel: str) -> str:
 
 
 def _segment_hidden_or_skipped(rel: str) -> bool:
-    return any(p.startswith(".") or p in SKIP_DIRS for p in _norm(rel).split("/") if p)
+    skip_names = SKIP_DIRS | _blacklisted_dirs()
+    return any(p.startswith(".") or p in skip_names for p in _norm(rel).split("/") if p)
 
 
 def _is_under_full(spec: FileAccessSpec, rel: str) -> bool:
@@ -231,12 +235,15 @@ def _visible_children(spec: FileAccessSpec, session_cwd: str, rel_dir: str) -> l
     target = _resolve(session_cwd, rel_dir)
     full_here = _is_under_full(spec, rel_dir)
 
+    # scandir caches is_dir()/stat() from one directory read, avoiding a stat()
+    # syscall per entry; _is_probably_text keeps the listing free of per-file I/O.
     try:
-        raw = [e for e in target.iterdir() if not e.name.startswith(".")]
+        with os.scandir(target) as it:
+            raw = [e for e in it if not e.name.startswith(".")]
     except (OSError, PermissionError):
         raw = []
 
-    def _sort_key(e: Path) -> tuple:
+    def _sort_key(e: os.DirEntry) -> tuple:
         try:
             return (e.is_file(), e.name.lower())
         except OSError:
@@ -244,13 +251,14 @@ def _visible_children(spec: FileAccessSpec, session_cwd: str, rel_dir: str) -> l
 
     raw.sort(key=_sort_key)
 
+    skip_names = SKIP_DIRS | _blacklisted_dirs()
     entries: list[FileEntry] = []
     for entry in raw[:MAX_DIR_ENTRIES]:
         try:
             is_dir = entry.is_dir()
-            if is_dir and entry.name in SKIP_DIRS:
+            if is_dir and entry.name in skip_names:
                 continue
-            rel = str(entry.relative_to(base))
+            rel = os.path.relpath(entry.path, base)
         except OSError:
             continue
 
@@ -263,7 +271,8 @@ def _visible_children(spec: FileAccessSpec, session_cwd: str, rel_dir: str) -> l
         if not visible:
             continue
 
-        is_sq = not is_dir and entry.suffix.lower() in SQLITE_EXTENSIONS
+        suffix = os.path.splitext(entry.name)[1].lower()
+        is_sq = not is_dir and suffix in SQLITE_EXTENSIONS
         is_arc = not is_dir and _is_archive_name(entry.name)
         try:
             size = entry.stat().st_size if not is_dir else None
@@ -274,7 +283,7 @@ def _visible_children(spec: FileAccessSpec, session_cwd: str, rel_dir: str) -> l
             path=rel,
             type="dir" if is_dir else "file",
             size=size,
-            is_text=_is_text(entry) if (not is_dir and not is_sq and not is_arc) else False,
+            is_text=_is_probably_text(Path(entry.name)) if (not is_dir and not is_sq and not is_arc) else False,
             is_sqlite=is_sq,
             is_archive=is_arc,
         ))

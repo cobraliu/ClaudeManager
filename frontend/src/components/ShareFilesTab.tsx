@@ -136,12 +136,21 @@ function FileContent({ hash, entry, pal, theme }: { hash: string; entry: ShareFi
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [raw, setRaw] = useState(false); // raw vs preview for csv/md/html
+  const [htmlMax, setHtmlMax] = useState(false); // html preview filling the viewport
+
+  useEffect(() => {
+    if (!htmlMax) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setHtmlMax(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [htmlMax]);
 
   const image = isImage(entry.name);
   const canPreview = isCsv(entry.name) || isMd(entry.name) || isHtml(entry.name);
 
   useEffect(() => {
     setRaw(false);
+    setHtmlMax(false);
     if (image) { setContent(null); return; }
     let cancelled = false;
     setLoading(true);
@@ -187,8 +196,21 @@ function FileContent({ hash, entry, pal, theme }: { hash: string; entry: ShareFi
       // allow-scripts WITHOUT allow-same-origin: the page runs its JS as an
       // opaque origin (interactive) but cannot reach our cookies/API. Same
       // sandbox the in-session HtmlViewer uses.
-      inner = <iframe title={entry.name} srcDoc={content} sandbox="allow-scripts"
-        style={{ width: "100%", height: "70vh", border: "none", background: "#fff" }} />;
+      inner = (
+        <>
+          <iframe title={entry.name} srcDoc={content} sandbox="allow-scripts"
+            style={htmlMax
+              ? { position: "fixed", inset: 0, width: "100vw", height: "100vh", border: "none", background: "#fff", zIndex: 9999 }
+              : { width: "100%", height: "70vh", border: "none", background: "#fff" }} />
+          {htmlMax && (
+            <button
+              onClick={() => setHtmlMax(false)}
+              title="还原 (Esc)"
+              style={{ position: "fixed", top: 12, right: 12, zIndex: 10000, fontSize: 12, padding: "5px 12px", borderRadius: 6, cursor: "pointer", background: pal.panel, color: pal.text, border: `1px solid ${pal.border}`, boxShadow: "0 2px 8px rgba(0,0,0,.3)" }}
+            >⤡ 还原</button>
+          )}
+        </>
+      );
     } else {
       inner = <CodeBlock code={content} lang={HLJS_LANGS[ext(entry.name)]} pal={pal} theme={theme} />;
     }
@@ -198,13 +220,26 @@ function FileContent({ hash, entry, pal, theme }: { hash: string; entry: ShareFi
     <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "8px 12px", borderBottom: `1px solid ${pal.border}`, flexShrink: 0 }}>
         <span style={{ fontFamily: "monospace", fontSize: 12, color: pal.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.path}</span>
-        {canPreview && content !== null && isText && !tooLarge && (
-          <button
-            onClick={() => setRaw((v) => !v)}
-            style={{ flexShrink: 0, fontSize: 12, padding: "3px 10px", borderRadius: 5, cursor: "pointer", background: pal.panel, color: pal.text, border: `1px solid ${pal.border}` }}
-          >
-            {raw ? "预览" : "原始"}
-          </button>
+        {content !== null && isText && !tooLarge && (
+          <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+            {!raw && isHtml(entry.name) && (
+              <button
+                onClick={() => setHtmlMax(true)}
+                title="最大化 (Esc 还原)"
+                style={{ fontSize: 12, padding: "3px 10px", borderRadius: 5, cursor: "pointer", background: pal.panel, color: pal.text, border: `1px solid ${pal.border}` }}
+              >
+                ⤢ 最大化
+              </button>
+            )}
+            {canPreview && (
+              <button
+                onClick={() => { setRaw((v) => !v); setHtmlMax(false); }}
+                style={{ fontSize: 12, padding: "3px 10px", borderRadius: 5, cursor: "pointer", background: pal.panel, color: pal.text, border: `1px solid ${pal.border}` }}
+              >
+                {raw ? "预览" : "原始"}
+              </button>
+            )}
+          </div>
         )}
       </div>
       <div style={{ overflow: "auto" }}>{inner}</div>

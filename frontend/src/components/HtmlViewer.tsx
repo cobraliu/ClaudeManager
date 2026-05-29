@@ -45,6 +45,14 @@ export function HtmlViewer({ sessionId, path, initialContent }: {
   const currentPath = navStack[navStack.length - 1];
   const [content, setContent] = useState<string | null>(initialContent);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [maxd, setMaxd] = useState(false); // fill the viewport in place
+
+  useEffect(() => {
+    if (!maxd) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setMaxd(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [maxd]);
 
   useEffect(() => {
     if (currentPath === path) {
@@ -86,7 +94,9 @@ export function HtmlViewer({ sessionId, path, initialContent }: {
   const goHome = () => setNavStack([path]);
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0, background: "var(--bg-base)" }}>
+    <div style={maxd
+      ? { position: "fixed", inset: 0, zIndex: 9999, display: "flex", flexDirection: "column", background: "var(--bg-base)" }
+      : { flex: 1, display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0, background: "var(--bg-base)" }}>
       <div style={{
         display: "flex", alignItems: "center", gap: 6,
         padding: "3px 10px", fontSize: 11, color: "var(--text-faint)",
@@ -119,6 +129,16 @@ export function HtmlViewer({ sessionId, path, initialContent }: {
         {canBack && (
           <span style={{ color: "var(--text-faintest)" }}>{navStack.length - 1} deep</span>
         )}
+        <button
+          onClick={() => setMaxd(v => !v)}
+          title={maxd ? "还原 (Esc)" : "最大化"}
+          style={{
+            fontSize: 10, padding: "1px 7px",
+            background: "var(--bg-hover)", color: "var(--text-muted)",
+            border: "1px solid var(--text-faintest)", borderRadius: 3,
+            cursor: "pointer", flexShrink: 0,
+          }}
+        >{maxd ? "⤡ 还原" : "⤢ 最大化"}</button>
       </div>
       {loadError ? (
         <div style={{ padding: 24, color: "var(--accent-red)", fontSize: 13 }}>{loadError}</div>

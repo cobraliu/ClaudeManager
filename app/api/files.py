@@ -75,6 +75,7 @@ SPECIAL_NAMES_TEXT = {
     "requirements.txt", "setup.py", "setup.cfg", "pyproject.toml",
     "package.json", "package-lock.json", "yarn.lock",
     "go.mod", "go.sum", "Cargo.toml", "Cargo.lock",
+    "LICENSE", "README", "CHANGELOG", "AUTHORS", "NOTICE", "COPYING",
 }
 
 SQLITE_EXTENSIONS = {".db", ".sqlite", ".sqlite3", ".db3"}
@@ -86,14 +87,33 @@ SKIP_DIRS = {
 }
 
 
+def _blacklisted_dirs() -> set[str]:
+    """Admin-configured directory names whose entire subtree is bypassed during
+    scans (default node_modules/venv/.venv). These caches hold the bulk of a
+    project's files, so dropping them keeps listing/search fast. Read live from
+    config so admin changes take effect without a restart."""
+    from app.config import get_skip_dirs
+    return set(get_skip_dirs())
+
+
+def _is_probably_text(path: Path) -> bool:
+    """Extension/name-only text guess — never opens the file. Used by directory
+    listings and name search so they cost zero per-file I/O regardless of how
+    many files a directory holds or how large they are. The authoritative
+    null-byte sniff (_is_text) is deferred to file open, where we read the
+    content anyway."""
+    return path.name in SPECIAL_NAMES_TEXT or path.suffix.lower() in TEXT_EXTENSIONS
+
+
 def _is_text(path: Path) -> bool:
-    if path.name in SPECIAL_NAMES_TEXT:
+    if _is_probably_text(path):
         return True
-    if path.suffix.lower() in TEXT_EXTENSIONS:
-        return True
-    # Sniff for null bytes (binary indicator)
+    # Sniff for null bytes (binary indicator). Read only the first 8KB —
+    # path.read_bytes() would pull the *entire* file into memory just to look
+    # at the head, which made listing/opening directories with large files crawl.
     try:
-        chunk = path.read_bytes()[:8192]
+        with path.open("rb") as fh:
+            chunk = fh.read(8192)
         return b"\x00" not in chunk
     except OSError:
         return False
@@ -248,16 +268,19 @@ def list_files(
     base = Path(session.cwd).resolve()
     rel_current = str(target.relative_to(base)) if target != base else ""
 
+    # scandir caches is_dir()/stat() from a single directory read (d_type on
+    # Linux), avoiding a separate stat() syscall per entry that iterdir() forces.
     try:
-        raw = list(target.iterdir())
-    except PermissionError:
+        with os.scandir(target) as it:
+            raw = list(it)
+    except (OSError, PermissionError):
         raw = []
 
     # Dirs first, then files; alphabetical within each group; optionally filter hidden
     if not hidden:
         raw = [e for e in raw if not e.name.startswith(".")]
 
-    def _sort_key(e: Path) -> tuple:
+    def _sort_key(e: os.DirEntry) -> tuple:
         try:
             return (e.is_file(), e.name.lower())
         except OSError:
@@ -265,24 +288,30 @@ def list_files(
 
     raw.sort(key=_sort_key)
 
+    blacklist = _blacklisted_dirs()
     entries: list[FileEntry] = []
     for entry in raw[:MAX_DIR_ENTRIES]:
         try:
-            rel = str(entry.relative_to(base))
             is_dir = entry.is_dir()
-            skip = is_dir and entry.name in SKIP_DIRS
-            is_sq = not is_dir and entry.suffix.lower() in SQLITE_EXTENSIONS
-            is_arc = not is_dir and _is_archive_name(entry.name)
+            name = entry.name
+            # Blacklisted dirs are bypassed entirely — not shown, not navigable.
+            if is_dir and name in blacklist:
+                continue
+            rel = os.path.relpath(entry.path, base)
+            skip = is_dir and name in SKIP_DIRS
+            suffix = os.path.splitext(name)[1].lower()
+            is_sq = not is_dir and suffix in SQLITE_EXTENSIONS
+            is_arc = not is_dir and _is_archive_name(name)
             try:
                 size = entry.stat().st_size if not is_dir else None
             except OSError:
                 size = None
             entries.append(FileEntry(
-                name=entry.name,
+                name=name,
                 path=rel,
                 type="dir" if is_dir else "file",
                 size=size,
-                is_text=_is_text(entry) if (not is_dir and not is_sq and not is_arc) else False,
+                is_text=_is_probably_text(Path(name)) if (not is_dir and not is_sq and not is_arc) else False,
                 is_skipped=skip,
                 is_sqlite=is_sq,
                 is_archive=is_arc,
@@ -314,11 +343,12 @@ def search_files(
     needle = q.lower()
     results: list[FileEntry] = []
 
+    skip_names = SKIP_DIRS | _blacklisted_dirs()
     for root, dirs, files in os.walk(base):
-        # Skip hidden dirs and SKIP_DIRS
+        # Skip hidden dirs, SKIP_DIRS, and the admin blacklist
         dirs[:] = [
             d for d in dirs
-            if (hidden or not d.startswith(".")) and d not in SKIP_DIRS
+            if (hidden or not d.startswith(".")) and d not in skip_names
         ]
         root_path = Path(root)
 
@@ -350,7 +380,7 @@ def search_files(
                         path=rel,
                         type="file",
                         size=size,
-                        is_text=_is_text(entry_path) if (not is_sq and not is_arc) else False,
+                        is_text=_is_probably_text(entry_path) if (not is_sq and not is_arc) else False,
                         is_sqlite=is_sq,
                         is_archive=is_arc,
                     ))
@@ -1073,9 +1103,15 @@ class DirInfoResponse(BaseModel):
 def get_dir_info(
     session_id: str,
     path: str = Query(default=""),
+    with_sizes: bool = Query(default=True),
     user_id: CurrentUser = None,  # type: ignore[assignment]
 ) -> DirInfoResponse:
-    """Return total size and top-level items with sizes for a directory."""
+    """Return top-level items for a directory.
+
+    with_sizes=False skips the recursive per-directory size walk (_dir_size),
+    which is the dominant cost on trees with large subdirs (node_modules, logs).
+    Callers that only list names (e.g. the share file picker) pass False.
+    """
     store = _get_store()
     session = store.get(session_id)
     if session is None or session.owner_id != user_id:
@@ -1092,7 +1128,7 @@ def get_dir_info(
         try:
             rel = str(child.relative_to(base))
             if child.is_dir():
-                sz = _dir_size(child)
+                sz = _dir_size(child) if with_sizes else 0
                 items.append(DirInfoItem(name=child.name, path=rel, type="dir", size=sz))
             elif child.is_file():
                 sz = child.stat().st_size

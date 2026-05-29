@@ -12,6 +12,7 @@ import {
   setProxy,
   setFileViewer,
   setEnabledTools,
+  setSkipDirs,
   restartServer,
   type UserInfo,
   type SessionMeta,
@@ -58,6 +59,8 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
   const [fvMaxBytesMbSaved, setFvMaxBytesMbSaved] = useState<number>(1);
   const [enabledTools, setEnabledToolsState] = useState<string[]>(["claude"]);
   const [enabledToolsSaved, setEnabledToolsSaved] = useState<string[]>(["claude"]);
+  const [skipDirsInput, setSkipDirsInput] = useState("");
+  const [skipDirsSaved, setSkipDirsSaved] = useState("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
   const [restarting, setRestarting] = useState(false);
@@ -98,8 +101,22 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
       setFvMaxBytesMbSaved(mb);
       setEnabledToolsState(c.enabled_tools);
       setEnabledToolsSaved(c.enabled_tools);
+      const sd = c.skip_dirs.join(", ");
+      setSkipDirsInput(sd);
+      setSkipDirsSaved(sd);
     } catch {}
   }, []);
+
+  const parseSkipDirs = (raw: string): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const tok of raw.split(/[\s,]+/)) {
+      const name = tok.trim();
+      if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\")) continue;
+      if (!seen.has(name)) { seen.add(name); out.push(name); }
+    }
+    return out;
+  };
 
   const searchRef2 = useRef(search);
   searchRef2.current = search;
@@ -537,6 +554,40 @@ export function AdminPage({ onLogout, onBack, theme, onToggleTheme }: Props) {
                   At least one tool must remain enabled.
                 </p>
               )}
+            </div>
+
+            {/* Directory scan blacklist */}
+            <div style={cardStyle}>
+              <h3 style={{ marginBottom: 12, fontSize: 15 }}>Directory Scan Blacklist</h3>
+              <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
+                Directory names skipped entirely when listing, searching, or sharing files — their
+                contents are never scanned. Useful for large dependency/cache folders like
+                <code style={{ color: "var(--text-secondary)" }}> node_modules</code>. Bare names
+                only (no paths), separated by commas or spaces. Leave empty to disable.
+              </p>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                <input
+                  value={skipDirsInput}
+                  onChange={(e) => setSkipDirsInput(e.target.value)}
+                  placeholder="node_modules, venv, .venv"
+                  style={{ ...inputStyle, flex: 1, minWidth: 240 }}
+                />
+                <button
+                  disabled={parseSkipDirs(skipDirsInput).join(", ") === skipDirsSaved}
+                  onClick={async () => {
+                    try {
+                      const c = await setSkipDirs(parseSkipDirs(skipDirsInput));
+                      const sd = c.skip_dirs.join(", ");
+                      setSkipDirsSaved(sd);
+                      setSkipDirsInput(sd);
+                      setMsg("Directory blacklist updated.");
+                    } catch (e) { setMsg(String(e)); }
+                  }}
+                  style={{ background: "#58a6ff", color: "#fff" }}
+                >
+                  Save
+                </button>
+              </div>
             </div>
 
           </div>

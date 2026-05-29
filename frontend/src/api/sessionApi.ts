@@ -260,6 +260,7 @@ export interface ConfigView {
   file_viewer_max_lines: number;
   file_viewer_max_bytes: number;
   enabled_tools: string[];
+  skip_dirs: string[];
 }
 
 export interface FontInfo {
@@ -342,6 +343,13 @@ export function setEnabledTools(tools: string[]): Promise<ConfigView> {
   return request("/api/config/enabled-tools", {
     method: "PUT",
     body: JSON.stringify({ tools }),
+  });
+}
+
+export function setSkipDirs(skip_dirs: string[]): Promise<ConfigView> {
+  return request("/api/config/skip-dirs", {
+    method: "PUT",
+    body: JSON.stringify({ skip_dirs }),
   });
 }
 
@@ -719,9 +727,14 @@ export interface DirInfoResponse {
   items: DirInfoItem[];
 }
 
-export function getDirInfo(sessionId: string, path: string): Promise<DirInfoResponse> {
+export function getDirInfo(
+  sessionId: string,
+  path: string,
+  withSizes = true,
+): Promise<DirInfoResponse> {
   const params = new URLSearchParams();
   if (path) params.set("path", path);
+  if (!withSizes) params.set("with_sizes", "false");
   const qs = params.toString() ? `?${params.toString()}` : "";
   return request(`/api/sessions/${sessionId}/fs/dir-info${qs}`);
 }

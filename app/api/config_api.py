@@ -22,6 +22,7 @@ from app.config import (
     get_file_viewer_mode,
     get_proxy,
     get_proxy_mode,
+    get_skip_dirs,
     get_term_idle_grace_seconds,
     get_term_standby_grace_seconds,
     get_terminal_font,
@@ -34,6 +35,7 @@ from app.config import (
     set_file_viewer_mode,
     set_proxy,
     set_proxy_mode,
+    set_skip_dirs,
     set_term_idle_grace_seconds,
     set_term_standby_grace_seconds,
     set_terminal_font,
@@ -59,6 +61,7 @@ class ConfigView(BaseModel):
     file_viewer_max_lines: int = 3000
     file_viewer_max_bytes: int = 1024 * 1024
     enabled_tools: list[str] = Field(default_factory=lambda: ["claude"])
+    skip_dirs: list[str] = Field(default_factory=lambda: ["node_modules", "venv", ".venv"])
 
 
 class FileViewerRequest(BaseModel):
@@ -92,6 +95,12 @@ class EnabledToolsRequest(BaseModel):
     tools: list[str] = Field(..., description="Subset of [claude, codex, cursor]")
 
 
+class SkipDirsRequest(BaseModel):
+    skip_dirs: list[str] = Field(
+        ..., description="Directory names bypassed entirely during file scans"
+    )
+
+
 class TermLifecycleRequest(BaseModel):
     """Idle = how long an ephemeral tmux terminal sits with no holder before
     standby; standby = grace period after standby starts before tmux kill."""
@@ -113,6 +122,7 @@ def _full_config() -> ConfigView:
         file_viewer_max_lines=get_file_viewer_max_lines(),
         file_viewer_max_bytes=get_file_viewer_max_bytes(),
         enabled_tools=get_enabled_tools(),
+        skip_dirs=get_skip_dirs(),
     )
 
 
@@ -227,6 +237,12 @@ def update_enabled_tools(body: EnabledToolsRequest, _admin: AdminUser) -> Config
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=f"invalid tools: {bad}")
     set_enabled_tools(list(body.tools))
+    return _full_config()
+
+
+@router.put("/skip-dirs")
+def update_skip_dirs(body: SkipDirsRequest, _admin: AdminUser) -> ConfigView:
+    set_skip_dirs(list(body.skip_dirs))
     return _full_config()
 
 
