@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   getPublicShareMeta,
   getPublicShareMessages,
@@ -13,7 +13,12 @@ const PERMANENT_EXPIRES = 2147483647;
 const POLL_MS = 1500;
 const PAGE = 100;
 const NEAR_BOTTOM_PX = 600;
+const NEAR_TOP_PX = 600;
 type Theme = "light" | "dark";
+/* asc = top-anchored, oldest first, scroll DOWN for newer (default full/limited).
+ * desc = bottom-anchored chat-style: still chronological, but opens at the latest
+ * message and scrolls UP for older (default for chat shares). */
+type Order = "asc" | "desc";
 
 /* Page-frame background for the area outside the centered content column
  * (index.css paints html/#root with the app's dark var; override per theme). */
@@ -26,6 +31,14 @@ const themeKey = (hash: string) => `cm_share_theme:${hash}`;
 function savedTheme(hash: string): Theme | null {
   const s = localStorage.getItem(themeKey(hash));
   return s === "light" || s === "dark" ? s : null;
+}
+
+/* Per-share reading order, same override semantics as theme. */
+const orderKey = (hash: string) => `cm_share_order:${hash}`;
+
+function savedOrder(hash: string): Order | null {
+  const s = localStorage.getItem(orderKey(hash));
+  return s === "asc" || s === "desc" ? s : null;
 }
 
 /* Widen the page cap past exportChat's 1080px reading column — mainly so the
@@ -252,6 +265,79 @@ function ShareChatComposer({ hash, theme, sessionAlive }: { hash: string; theme:
   );
 }
 
+/* Fixed top-left tool drawer (collapsed by default). Holds the controls that
+ * used to live in the header row — Chat/Files tabs, theme toggle, reading-order
+ * toggle — so the header is just title + meta. Runs outside <App>, so colors are
+ * static per theme rather than CSS vars. */
+function ShareToolDrawer({
+  theme, order, hasFiles, activeTab,
+  onToggleTheme, onToggleOrder, onSelectTab,
+}: {
+  theme: Theme;
+  order: Order;
+  hasFiles: boolean;
+  activeTab: "chat" | "files";
+  onToggleTheme: () => void;
+  onToggleOrder: () => void;
+  onSelectTab: (t: "chat" | "files") => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const dark = theme === "dark";
+  const c = {
+    bg: dark ? "rgba(26,26,26,0.97)" : "rgba(255,255,255,0.97)",
+    border: dark ? "#444" : "#ddd",
+    text: dark ? "#aaa" : "#666",
+    accent: dark ? "#58a6ff" : "#2563eb",
+    accentBg: dark ? "rgba(88,166,255,0.15)" : "rgba(37,99,235,0.08)",
+  };
+  const btn = (on: boolean): CSSProperties => ({
+    fontSize: 13, padding: "6px 14px", borderRadius: 6, cursor: "pointer",
+    border: `1px solid ${on ? c.accent : c.border}`,
+    background: on ? c.accentBg : "transparent",
+    color: on ? c.accent : c.text,
+    textAlign: "left", whiteSpace: "nowrap", fontFamily: "sans-serif",
+  });
+
+  return (
+    <div style={{ position: "fixed", top: 12, left: 12, zIndex: 60, fontFamily: "sans-serif" }}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        title="选项"
+        aria-expanded={open}
+        style={{
+          fontSize: 16, lineHeight: 1, width: 38, height: 38, borderRadius: 8, cursor: "pointer",
+          border: `1px solid ${c.border}`, background: c.bg, color: c.text,
+          backdropFilter: "blur(6px)", boxShadow: "0 1px 4px rgba(0,0,0,0.12)",
+        }}
+      >
+        {open ? "✕" : "☰"}
+      </button>
+      {open && (
+        <div
+          style={{
+            display: "flex", flexDirection: "column", gap: 6, marginTop: 6, padding: 8,
+            minWidth: 132, borderRadius: 8, border: `1px solid ${c.border}`, background: c.bg,
+            backdropFilter: "blur(6px)", boxShadow: "0 2px 10px rgba(0,0,0,0.18)",
+          }}
+        >
+          {hasFiles && (["chat", "files"] as const).map((id) => (
+            <button key={id} type="button" style={btn(activeTab === id)} onClick={() => onSelectTab(id)}>
+              {id === "chat" ? "💬 Chat" : "📁 Files"}
+            </button>
+          ))}
+          <button type="button" style={btn(false)} onClick={onToggleOrder} title="切换阅读顺序">
+            {order === "desc" ? "🔽 最新在下" : "🔼 最早在上"}
+          </button>
+          <button type="button" style={btn(false)} onClick={onToggleTheme} title="切换深色 / 浅色">
+            {theme === "dark" ? "☀️ 浅色" : "🌙 深色"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ShareViewer({ hash, shareType }: Props) {
   const [title, setTitle] = useState("Shared conversation");
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
@@ -266,6 +352,10 @@ export function ShareViewer({ hash, shareType }: Props) {
   const [hasFiles, setHasFiles] = useState(false);
   const [activeTab, setActiveTab] = useState<"chat" | "files">("chat");
   const [sessionAlive, setSessionAlive] = useState(true);
+  // Reading order: desc (chat-style, opens at latest) defaults for chat shares,
+  // asc (oldest-first, opens at top) for full/limited. Reader override persists.
+  const [order, setOrder] = useState<Order>(() => savedOrder(hash) ?? (shareType === "chat" ? "desc" : "asc"));
+  const [showJumpBtn, setShowJumpBtn] = useState(false);
 
   // chat shares are live (poll for new messages, follow bottom) like full,
   // and additionally expose a composer that injects prompts into the session.
@@ -273,11 +363,20 @@ export function ShareViewer({ hash, shareType }: Props) {
   const live = shareType === "full" || shareType === "chat";
 
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  // loadedRef is ALWAYS chronological (oldest→newest); `order` only changes which
+  // end we open at and which direction we paginate. headOffsetRef is the absolute
+  // index of loadedRef[0] in the full list, so we can window from either end:
+  // loadNewer appends from (headOffset+len), loadOlder prepends down to 0.
   const loadedRef = useRef<RawMessage[]>([]);
+  const headOffsetRef = useRef(0);
   const totalRef = useRef(0);
   const busyRef = useRef(false);
-  // Live-follow only kicks in after the reader scrolls once, so the page opens
-  // at the top (oldest first) instead of being yanked to the latest message.
+  // Scroll-position anchor: scrollHeight captured just before a prepend so we can
+  // keep the reader's viewport fixed over the same content after older messages
+  // are inserted above (window-scrolled, so we adjust window scroll by the delta).
+  const prependAnchorRef = useRef<number | null>(null);
+  // Live-follow only kicks in after the reader scrolls once, so an asc page opens
+  // at the top instead of being yanked to the latest message.
   const userScrolledRef = useRef(false);
 
   // Free the global fixed-viewport layout (index.css pins html/body/#root to
@@ -318,15 +417,16 @@ export function ShareViewer({ hash, shareType }: Props) {
     return () => { cancelled = true; };
   }, [hash]);
 
-  // Fetch the next forward page (oldest→newest) and append. `force` re-checks
-  // the server even when everything is already loaded (used by full-sync poll).
-  const fetchForward = useCallback(async (force: boolean): Promise<void> => {
+  // Append the next forward page (toward newer) and follow the bottom if the
+  // reader is already there. `force` re-checks the server even when the newest
+  // end is fully loaded (used by the live poll to pick up new arrivals).
+  const loadNewer = useCallback(async (force: boolean): Promise<void> => {
     if (busyRef.current) return;
-    const loadedLen = loadedRef.current.length;
-    if (!force && totalRef.current > 0 && loadedLen >= totalRef.current) return;
+    const nextOffset = headOffsetRef.current + loadedRef.current.length;
+    if (!force && totalRef.current > 0 && nextOffset >= totalRef.current) return;
     busyRef.current = true;
     try {
-      const data = await getPublicShareMessages(hash, loadedLen, PAGE);
+      const data = await getPublicShareMessages(hash, nextOffset, PAGE);
       totalRef.current = data.total;
       setTotal(data.total);
       setTitle((prev) => data.title || prev);
@@ -347,35 +447,100 @@ export function ShareViewer({ hash, shareType }: Props) {
     }
   }, [hash, live]);
 
-  // Initial load.
+  // Prepend the previous page (toward older) and pin the viewport over the same
+  // content via prependAnchorRef (restored in the layout effect below).
+  const loadOlder = useCallback(async (): Promise<void> => {
+    if (busyRef.current) return;
+    const head = headOffsetRef.current;
+    if (head <= 0) return;
+    busyRef.current = true;
+    try {
+      const start = Math.max(0, head - PAGE);
+      const data = await getPublicShareMessages(hash, start, head - start);
+      totalRef.current = data.total;
+      setTotal(data.total);
+      if (data.messages.length > 0) {
+        prependAnchorRef.current = document.documentElement.scrollHeight;
+        loadedRef.current = data.messages.concat(loadedRef.current);
+        headOffsetRef.current = start;
+        setLoadedCount(loadedRef.current.length);
+        const html = await renderConversationBody(loadedRef.current);
+        setBodyHtml(html);
+      }
+    } finally {
+      busyRef.current = false;
+    }
+  }, [hash]);
+
+  // Initial load — re-runs when hash or order changes. desc opens at the latest
+  // message (tail fetch, scrolled to bottom); asc opens at the top (offset 0).
   useEffect(() => {
     let cancelled = false;
     loadedRef.current = [];
+    headOffsetRef.current = 0;
     totalRef.current = 0;
+    userScrolledRef.current = false;
+    setLoadedCount(0);
+    setBodyHtml("");
     setLoading(true);
     setError(null);
-    fetchForward(true)
+    const run = async () => {
+      if (order === "desc") {
+        const data = await getPublicShareMessages(hash, 0, PAGE, true);
+        if (cancelled) return;
+        totalRef.current = data.total;
+        setTotal(data.total);
+        setTitle((prev) => data.title || prev);
+        setExpiresAt(data.expires_at);
+        if (typeof data.session_alive === "boolean") setSessionAlive(data.session_alive);
+        loadedRef.current = data.messages;
+        headOffsetRef.current = Math.max(0, data.total - data.messages.length);
+        setLoadedCount(data.messages.length);
+        const html = await renderConversationBody(loadedRef.current);
+        if (cancelled) return;
+        setBodyHtml(html);
+        requestAnimationFrame(() => window.scrollTo(0, document.documentElement.scrollHeight));
+      } else {
+        await loadNewer(true);
+      }
+    };
+    run()
       .catch((e) => { if (!cancelled) setError(String(e?.message || e || "加载失败")); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hash]);
+  }, [hash, order]);
 
-  // Infinite scroll: load the next page as the reader nears the bottom.
+  // Infinite scroll in both directions: near the bottom pulls newer, near the
+  // top pulls older. Also drives the jump-to-bottom button's visibility.
   useEffect(() => {
     if (error) return;
-    const onScroll = () => { userScrolledRef.current = true; if (nearBottom()) void fetchForward(false); };
+    const onScroll = () => {
+      userScrolledRef.current = true;
+      if (nearBottom()) void loadNewer(false);
+      if (window.scrollY < NEAR_TOP_PX) void loadOlder();
+      setShowJumpBtn(!nearBottom());
+    };
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
-  }, [error, fetchForward]);
+  }, [error, loadNewer, loadOlder]);
 
   // Live polling — pick up newly appended messages (full + chat; limited shares
   // are frozen).
   useEffect(() => {
     if (!live || error) return;
-    const id = window.setInterval(() => { void fetchForward(true); }, POLL_MS);
+    const id = window.setInterval(() => { void loadNewer(true); }, POLL_MS);
     return () => window.clearInterval(id);
-  }, [live, error, fetchForward]);
+  }, [live, error, loadNewer]);
+
+  // Restore scroll position after a prepend so the reader doesn't jump.
+  useLayoutEffect(() => {
+    if (prependAnchorRef.current != null) {
+      const delta = document.documentElement.scrollHeight - prependAnchorRef.current;
+      if (delta !== 0) window.scrollBy(0, delta);
+      prependAnchorRef.current = null;
+    }
+  }, [bodyHtml]);
 
   // Re-wire copy/expand interactions whenever the rendered body changes.
   useEffect(() => {
@@ -384,14 +549,20 @@ export function ShareViewer({ hash, shareType }: Props) {
   }, [bodyHtml]);
 
   // Auto-fill: if a freshly rendered page doesn't fill the viewport (so the
-  // reader can't scroll to trigger the next one), keep loading until it does.
+  // reader can't scroll to trigger the next one), keep loading toward the
+  // open end until it does — older for desc, newer for asc.
   useEffect(() => {
     if (error || loading) return;
     const id = requestAnimationFrame(() => {
-      if (loadedRef.current.length < totalRef.current && nearBottom()) void fetchForward(false);
+      const notScrollable = document.documentElement.scrollHeight <= window.innerHeight + 50;
+      if (order === "desc") {
+        if (headOffsetRef.current > 0 && notScrollable) void loadOlder();
+      } else if (headOffsetRef.current + loadedRef.current.length < totalRef.current && (notScrollable || nearBottom())) {
+        void loadNewer(false);
+      }
     });
     return () => cancelAnimationFrame(id);
-  }, [bodyHtml, error, loading, fetchForward]);
+  }, [bodyHtml, error, loading, order, loadNewer, loadOlder]);
 
   const toggleTheme = () => setTheme((t) => {
     const next = t === "dark" ? "light" : "dark";
@@ -399,6 +570,17 @@ export function ShareViewer({ hash, shareType }: Props) {
     try { localStorage.setItem(themeKey(hash), next); } catch { /* ignore */ }
     return next;
   });
+
+  const toggleOrder = () => setOrder((o) => {
+    const next = o === "asc" ? "desc" : "asc";
+    try { localStorage.setItem(orderKey(hash), next); } catch { /* ignore */ }
+    return next;
+  });
+
+  const jumpToBottom = () => {
+    void loadNewer(true);
+    requestAnimationFrame(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  };
 
   if (error) {
     return (
@@ -409,10 +591,23 @@ export function ShareViewer({ hash, shareType }: Props) {
     );
   }
 
-  const remaining = total - loadedCount;
+  // olderRemaining = messages above the loaded window (toward the start).
+  // newerRemaining = messages below it (toward the latest).
+  const olderRemaining = headOffsetRef.current;
+  const newerRemaining = Math.max(0, total - headOffsetRef.current - loadedCount);
 
   return (
     <div>
+      <ShareToolDrawer
+        theme={theme}
+        order={order}
+        hasFiles={hasFiles}
+        activeTab={activeTab}
+        onToggleTheme={toggleTheme}
+        onToggleOrder={toggleOrder}
+        onSelectTab={setActiveTab}
+      />
+
       <header>
         <h1>{title}</h1>
         <div className="meta">
@@ -426,39 +621,6 @@ export function ShareViewer({ hash, shareType }: Props) {
           {expiresAt != null && <span> · {fmtExpiry(expiresAt)}</span>}
           {total > 0 && <span> · 共 {total} 条</span>}
         </div>
-        <div className="share-tabs" style={{ display: "flex", gap: 6, marginTop: 12, alignItems: "center", flexWrap: "wrap" }}>
-          {hasFiles && (["chat", "files"] as const).map((id) => {
-            const on = activeTab === id;
-            return (
-              <button
-                key={id}
-                type="button"
-                onClick={() => setActiveTab(id)}
-                style={{
-                  fontSize: 13, padding: "6px 16px", borderRadius: 6, cursor: "pointer",
-                  border: `1px solid ${on ? (theme === "dark" ? "#58a6ff" : "#2563eb") : (theme === "dark" ? "#444" : "#ddd")}`,
-                  background: on ? (theme === "dark" ? "rgba(88,166,255,0.15)" : "rgba(37,99,235,0.08)") : "transparent",
-                  color: on ? (theme === "dark" ? "#58a6ff" : "#2563eb") : (theme === "dark" ? "#aaa" : "#666"),
-                }}
-              >
-                {id === "chat" ? "💬 Chat" : "📁 Files"}
-              </button>
-            );
-          })}
-          <button
-            type="button"
-            onClick={toggleTheme}
-            title="切换深色 / 浅色"
-            style={{
-              fontSize: 13, padding: "6px 16px", borderRadius: 6, cursor: "pointer",
-              border: `1px solid ${theme === "dark" ? "#444" : "#ddd"}`,
-              background: "transparent",
-              color: theme === "dark" ? "#aaa" : "#666",
-            }}
-          >
-            {theme === "dark" ? "☀️ 浅色" : "🌙 深色"}
-          </button>
-        </div>
       </header>
 
       <div style={{ display: hasFiles && activeTab === "files" ? "block" : "none" }}>
@@ -470,15 +632,38 @@ export function ShareViewer({ hash, shareType }: Props) {
           <div style={{ color: "#888", fontSize: 13, fontFamily: "sans-serif" }}>加载中…</div>
         ) : (
           <>
-            <div ref={bodyRef} dangerouslySetInnerHTML={{ __html: bodyHtml }} />
-            {remaining > 0 && (
+            {olderRemaining > 0 && (
               <div style={{ textAlign: "center", color: "#888", fontSize: 12, padding: "16px 0", fontFamily: "sans-serif" }}>
-                下滑加载更多（剩余 {remaining} 条）…
+                上滑加载更早（剩余 {olderRemaining} 条）…
+              </div>
+            )}
+            <div ref={bodyRef} dangerouslySetInnerHTML={{ __html: bodyHtml }} />
+            {newerRemaining > 0 && (
+              <div style={{ textAlign: "center", color: "#888", fontSize: 12, padding: "16px 0", fontFamily: "sans-serif" }}>
+                下滑加载更多（剩余 {newerRemaining} 条）…
               </div>
             )}
           </>
         )}
       </div>
+
+      {showJumpBtn && (!hasFiles || activeTab === "chat") && (
+        <button
+          type="button"
+          onClick={jumpToBottom}
+          title="回到最新"
+          style={{
+            position: "fixed", right: 16, bottom: isChat ? 96 : 20, zIndex: 55,
+            width: 40, height: 40, borderRadius: "50%", cursor: "pointer",
+            border: `1px solid ${theme === "dark" ? "#444" : "#ddd"}`,
+            background: theme === "dark" ? "#1f2428" : "#fff",
+            color: theme === "dark" ? "#aaa" : "#666",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.2)", fontSize: 16,
+          }}
+        >
+          ↓
+        </button>
+      )}
 
       {isChat && activeTab === "chat" && (
         <ShareChatComposer hash={hash} theme={theme} sessionAlive={sessionAlive} />
