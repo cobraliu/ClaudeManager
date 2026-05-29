@@ -5669,6 +5669,7 @@ function shareUserText(m: RawMessage): string {
 
 function fmtShareTime(s: number): string { return new Date(s * 1000).toLocaleString(); }
 function fmtShareExpiry(s: number): string { return s >= SHARE_PERMANENT ? "永久" : fmtShareTime(s); }
+function shareTypeLabel(t: ShareType): string { return t === "full" ? "全程同步" : t === "chat" ? "Chat" : "限制截止"; }
 function shareAbsUrl(url: string): string { return /^https?:/i.test(url) ? url : window.location.origin + url; }
 
 // Mobile share sheet — bottom sheet, stacked form + card-list history (no wide
@@ -5729,7 +5730,9 @@ function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: 
         expires_at: permanent ? undefined : Math.floor(Date.now() / 1000) + days * 86400,
         cutoff_after_uuid: shareType === "limited" ? cutoffUuid : undefined,
         default_theme: defaultTheme,
-        file_access: hasFiles ? fileAccess : undefined,
+        // chat shares always expose the whole project; the backend forces
+        // file_access, so don't send a client value.
+        file_access: shareType === "chat" ? undefined : (hasFiles ? fileAccess : undefined),
       });
       setCreated(rec);
     } catch (e) { setErr(String(e instanceof Error ? e.message : e)); }
@@ -5767,10 +5770,17 @@ function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: 
 
           {tab === "create" && (
             <>
-              <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button onClick={() => setShareType("full")} style={chip(shareType === "full")}>全程同步</button>
                 <button onClick={() => setShareType("limited")} style={chip(shareType === "limited")}>限制截止</button>
+                <button onClick={() => setShareType("chat")} style={chip(shareType === "chat")}>Chat</button>
               </div>
+              {shareType === "chat" && (
+                <div style={{ border: "1px solid #e05260", background: "rgba(224,82,96,0.10)", borderRadius: 8, padding: "10px 12px", fontSize: 12, lineHeight: 1.55, color: "#e05260" }}>
+                  <div style={{ fontWeight: 700, marginBottom: 3 }}>⚠️ 高危：可对话分享</div>
+                  拿到链接的人可<b>向该会话发指令</b>（Claude 可执行命令、改文件）并<b>只读全部文件</b>。仅分享给可信任的人。
+                </div>
+              )}
               <div style={{ display: "flex", gap: 8 }}>
                 <button onClick={() => setDefaultTheme("light")} style={chip(defaultTheme === "light")}>☀️ 浅色</button>
                 <button onClick={() => setDefaultTheme("dark")} style={chip(defaultTheme === "dark")}>🌙 深色</button>
@@ -5781,20 +5791,24 @@ function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: 
                 ))}
               </div>
 
-              <div>
-                <button
-                  onClick={() => setShowFiles((v) => !v)}
-                  style={{ width: "100%", textAlign: "left", padding: "9px 12px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--text-body)", fontSize: 13, display: "flex", justifyContent: "space-between", alignItems: "center" }}
-                >
-                  <span>📁 可查看的文件{fileAccess.full.length + fileAccess.files.length > 0 ? `（${fileAccess.full.length + fileAccess.files.length}）` : "（可选）"}</span>
-                  <span style={{ color: "var(--text-muted)", fontSize: 11 }}>{showFiles ? "▼" : "▶"}</span>
-                </button>
-                {showFiles && (
-                  <div style={{ marginTop: 8 }}>
-                    <ShareFileSelector sessionId={session.id} value={fileAccess} onChange={setFileAccess} compact />
-                  </div>
-                )}
-              </div>
+              {shareType === "chat" ? (
+                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>📁 Chat 自动开放整个项目（只读，排除 .git / node_modules 等），无需勾选文件。</div>
+              ) : (
+                <div>
+                  <button
+                    onClick={() => setShowFiles((v) => !v)}
+                    style={{ width: "100%", textAlign: "left", padding: "9px 12px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--text-body)", fontSize: 13, display: "flex", justifyContent: "space-between", alignItems: "center" }}
+                  >
+                    <span>📁 可查看的文件{fileAccess.full.length + fileAccess.files.length > 0 ? `（${fileAccess.full.length + fileAccess.files.length}）` : "（可选）"}</span>
+                    <span style={{ color: "var(--text-muted)", fontSize: 11 }}>{showFiles ? "▼" : "▶"}</span>
+                  </button>
+                  {showFiles && (
+                    <div style={{ marginTop: 8 }}>
+                      <ShareFileSelector sessionId={session.id} value={fileAccess} onChange={setFileAccess} compact />
+                    </div>
+                  )}
+                </div>
+              )}
 
               {shareType === "limited" && (
                 <div>
@@ -5822,7 +5836,7 @@ function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: 
 
               {created && (
                 <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{created.share_type === "full" ? "全程同步" : "限制截止"} · 失效 {fmtShareExpiry(created.expires_at)}</div>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{shareTypeLabel(created.share_type)} · 失效 {fmtShareExpiry(created.expires_at)}</div>
                   <input readOnly value={shareAbsUrl(created.url)} onFocus={(e) => e.currentTarget.select()} style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-body)", fontSize: 12, fontFamily: "monospace" }} />
                   <div style={{ display: "flex", gap: 8 }}>
                     <button onClick={() => copy(shareAbsUrl(created.url), "new")} style={{ flex: 1, padding: "9px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--bg-base)", color: "var(--text-body)", fontSize: 13 }}>{copied === "new" ? "已复制" : "复制"}</button>
@@ -5840,7 +5854,7 @@ function MobileSharePanel({ open, onClose, session }: { open: boolean; onClose: 
                 : history.map((rec) => (
                   <div key={rec.hash} style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 12, display: "flex", flexDirection: "column", gap: 6 }}>
                     <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                      {rec.share_type === "full" ? "全程同步" : "限制截止"} · 失效 {fmtShareExpiry(rec.expires_at)}
+                      {shareTypeLabel(rec.share_type)} · 失效 {fmtShareExpiry(rec.expires_at)}
                     </div>
                     {rec.share_type === "limited" && rec.cutoff_msg_text && (
                       <div style={{ fontSize: 12, color: "var(--text-body)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={rec.cutoff_msg_text}>
