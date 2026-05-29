@@ -1678,8 +1678,10 @@ export function getPublicShareMessages(
   hash: string,
   offset = 0,
   limit = 100,
+  tail = false,
 ): Promise<{ messages: RawMessage[]; total: number; title: string; share_type: ShareType; expires_at: number; session_alive?: boolean }> {
-  return request(`/api/public/share/${hash}/messages?offset=${offset}&limit=${limit}`, undefined, true);
+  const q = `offset=${offset}&limit=${limit}${tail ? "&tail=true" : ""}`;
+  return request(`/api/public/share/${hash}/messages?${q}`, undefined, true);
 }
 
 // Public (no auth) — send a chat-mode prompt to the live session behind a chat

@@ -90,13 +90,19 @@ def get_share_messages(
     hash: str,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=2000),
+    tail: bool = Query(default=False),
 ) -> dict:
     """Forward (oldest→newest) page of the shared conversation.
 
-    The viewer reads top-to-bottom and grows the window as it scrolls, so this
-    returns the ascending slice `[offset : offset+limit]`; `total` lets the
-    client know when it has reached the end (and, for full shares, when new
-    messages have appeared).
+    Messages are ALWAYS returned in ascending (oldest→newest) order. Two windowing
+    modes:
+      - tail=False (default): the ascending slice `[offset : offset+limit]` —
+        forward pagination for the top-anchored asc view.
+      - tail=True: the LAST `limit` messages (offset ignored) — the bottom-anchored
+        newest-first view opens here, then pages *older* by switching to
+        tail=False with a decreasing offset. `total` lets the client place this
+        window (head offset = total - len(messages)) and know when both ends are
+        reached.
     """
     rec = share_cache.get(hash)
     if rec is None:
@@ -125,7 +131,8 @@ def get_share_messages(
         msgs = data.get("messages", [])
         if cutoff is not None:
             msgs = [m for m in msgs if _parse_ts(m) <= cutoff]
-        return _resp(msgs[offset:offset + limit], len(msgs))
+        window = msgs[-limit:] if tail else msgs[offset:offset + limit]
+        return _resp(window, len(msgs))
 
     if jsonl_path is None:
         return _resp([], 0)
@@ -159,9 +166,13 @@ def get_share_messages(
                 "timestamp": "",
                 "message": {"role": role, "content": clean_blocks},
             })
-        return _resp(transformed[offset:offset + limit], len(transformed))
+        window = transformed[-limit:] if tail else transformed[offset:offset + limit]
+        return _resp(window, len(transformed))
 
-    page = read_raw_messages_page(Path(jsonl_path), limit, cutoff_ts=cutoff, offset=offset)
+    # offset=None makes read_raw_messages_page return the last `limit` entries.
+    page = read_raw_messages_page(
+        Path(jsonl_path), limit, cutoff_ts=cutoff, offset=None if tail else offset
+    )
     return _resp(page["messages"], page["total"])
 
 
