@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import re
@@ -145,7 +146,7 @@ def _cleanup_session_hooks(claude_session_id: str) -> None:
     except OSError:
         pass
     _hooks_cache.pop(claude_session_id, None)
-    _plan_pending_cache.pop(claude_session_id, None)
+    _plan_state_cache.pop(claude_session_id, None)
 
 
 def _is_compacting_via_hook(
@@ -166,7 +167,6 @@ def _is_compacting_via_hook(
     """
     import json as _json, time as _time
     from pathlib import Path as _Path
-    from collections import deque as _deque
     from datetime import datetime as _dt
     from app.services.claude_session_reader import _find_session_jsonl
 
@@ -196,8 +196,16 @@ def _is_compacting_via_hook(
     jsonl = _find_session_jsonl(claude_session_id, cwd)
     if jsonl is not None:
         try:
-            with open(jsonl) as f:
-                tail = _deque(f, maxlen=200)
+            # Bounded tail read: `deque(f, maxlen=200)` iterates the WHOLE file
+            # to keep the last 200 lines, which on a 100+MB JSONL is a full read.
+            # The resolution marker we look for is the most recent activity, so
+            # reading the last 256KB is enough.
+            with open(jsonl, "rb") as f:
+                f.seek(0, 2)
+                _sz = f.tell()
+                f.seek(max(0, _sz - 262144))
+                _tb = f.read()
+            tail = _tb.decode("utf-8", "replace").splitlines()[-200:]
             for line in reversed(tail):
                 if '"timestamp"' not in line:
                     continue
@@ -288,23 +296,53 @@ def _pending_auq_from_hooks(claude_session_id: str, cwd: str) -> dict | None:
     # Check whether this AUQ has already been answered (tool_result in JSONL).
     # A simple substring check on tool_use_id is sufficient — tool_use_ids are
     # 25-char random suffixes, no false positives expected.
+    #
+    # Bounded tail scan: the JSONL is append-only and can be 100+MB, so we must
+    # NOT read the whole file on every poll. Both the AskUserQuestion tool_use
+    # line and its tool_result reference `latest_auq_id`, and a still-pending
+    # AUQ blocks the session (nothing appends after it) — so the relevant lines
+    # are always near the tail. Read only the last few MB:
+    #   - tool_result for the id present → answered.
+    #   - id present without a tool_result → genuinely pending.
+    #   - id absent from the window (buried older than the window) → in an
+    #     append-only file a pending AUQ can't be buried, so it was answered;
+    #     return None to avoid a ghost card.
     from app.services.claude_session_reader import _find_session_jsonl as _find_jsonl
     jsonl = _find_jsonl(claude_session_id, cwd)
     if jsonl is not None:
+        WINDOW = 4 * 1024 * 1024
         try:
-            with open(jsonl) as f:
-                for line in f:
-                    if latest_auq_id in line and '"tool_result"' in line:
+            with open(jsonl, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - WINDOW))
+                tail_bytes = f.read()
+            needle = latest_auq_id.encode("utf-8", "replace")
+            id_seen = False
+            for raw in tail_bytes.split(b"\n"):
+                if needle in raw:
+                    id_seen = True
+                    if b'"tool_result"' in raw:
                         return None  # Already answered
+            if not id_seen and size > WINDOW:
+                return None  # buried older than the window → answered
         except OSError:
             pass
 
     return latest_auq_input
 
 
-# mtime-keyed cache for plan-pending status: {claude_session_id: (mtime, bool)}
-# Avoids re-scanning every session JSONL on every 3s status poll.
-_plan_pending_cache: dict[str, tuple[float, bool]] = {}
+# Incremental plan-pending state, keyed by claude_session_id:
+#   {sid: (consumed_offset, outstanding_plan_ids)}
+# The session JSONL is append-only and can be 100+MB, so re-scanning it whole
+# on every 3s status poll dominated request latency (a live session's mtime
+# changes every poll, which defeated the old mtime cache). Instead we remember
+# the byte offset of the last COMPLETE line parsed and, on each call, scan only
+# the bytes appended since. `outstanding_plan_ids` are ExitPlanMode tool_use ids
+# not yet matched by a tool_result (or bulk-resolved by a plan_mode_exit
+# attachment); pending == the set is non-empty. Tracking only the *outstanding*
+# ids (not every historical tool_result) keeps the set tiny — usually empty.
+_plan_state_cache: dict[str, tuple[int, set[str]]] = {}
 
 
 def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
@@ -330,6 +368,10 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
     Pending = at least one ExitPlanMode id has neither a matching
     tool_result nor a subsequent plan_mode_exit attachment.
 
+    Scanned incrementally (see `_plan_state_cache`): only bytes appended since
+    the last call are parsed. A file shrink (rewrite/compaction) triggers a
+    full rescan.
+
     Note: this used to also track a rolling `in_plan_state` based on
     `permission-mode` / `plan_mode` / `plan_mode_exit` signals. That was
     wrong because reject (option 4 "Tell Claude what to change") keeps
@@ -342,69 +384,82 @@ def _pending_plan_from_jsonl(claude_session_id: str, cwd: str) -> bool:
     if jsonl is None:
         return False
     try:
-        mtime = jsonl.stat().st_mtime
+        size = jsonl.stat().st_size
     except OSError:
         return False
-    cached = _plan_pending_cache.get(claude_session_id)
-    if cached and cached[0] == mtime:
-        return cached[1]
 
-    exit_plan_ids: set[str] = set()
-    resolved_ids: set[str] = set()
+    cached = _plan_state_cache.get(claude_session_id)
+    if cached and size >= cached[0]:
+        start, outstanding = cached[0], set(cached[1])
+    else:
+        # First call, or the file shrank (rewrite/compaction) → full rescan.
+        start, outstanding = 0, set()
+
+    if size <= start:
+        # Nothing new since last scan.
+        _plan_state_cache[claude_session_id] = (start, outstanding)
+        return bool(outstanding)
 
     try:
-        with open(jsonl) as f:
-            for raw in f:
-                # Skip lines that can't contribute. `plan_mode_exit` substring
-                # is subsumed by `plan_mode`.
-                if (
-                    "ExitPlanMode" not in raw
-                    and '"tool_result"' not in raw
-                    and "plan_mode" not in raw
-                ):
-                    continue
-                try:
-                    d = _json.loads(raw)
-                except Exception:
-                    continue
-
-                # plan_mode_exit attachment — approve path bulk-resolves any
-                # ExitPlanMode ids still outstanding at this point in the
-                # stream. Usually redundant with the matching tool_result,
-                # but kept as a fallback for any edge cases where the CLI
-                # writes plan_mode_exit without a paired tool_result.
-                if d.get("type") == "attachment":
-                    att = d.get("attachment")
-                    if isinstance(att, dict) and att.get("type") == "plan_mode_exit":
-                        resolved_ids |= exit_plan_ids
-                    continue
-
-                msg = d.get("message")
-                if not isinstance(msg, dict):
-                    continue
-                content = msg.get("content")
-                if not isinstance(content, list):
-                    continue
-                for b in content:
-                    if not isinstance(b, dict):
-                        continue
-                    btype = b.get("type")
-                    if btype == "tool_use" and b.get("name") == "ExitPlanMode":
-                        bid = b.get("id")
-                        if isinstance(bid, str):
-                            exit_plan_ids.add(bid)
-                    elif btype == "tool_result":
-                        tid = b.get("tool_use_id")
-                        if isinstance(tid, str):
-                            resolved_ids.add(tid)
+        with open(jsonl, "rb") as f:
+            f.seek(start)
+            data = f.read(size - start)
     except OSError:
-        _plan_pending_cache[claude_session_id] = (mtime, False)
-        return False
+        return bool(outstanding)
 
-    pending = bool(exit_plan_ids - resolved_ids)
+    # Parse only up to the last complete line; a trailing half-written line is
+    # left for the next call (its terminating '\n' hasn't been flushed yet).
+    last_nl = data.rfind(b"\n")
+    if last_nl == -1:
+        return bool(outstanding)
+    consumed = start + last_nl + 1
 
-    _plan_pending_cache[claude_session_id] = (mtime, pending)
-    return pending
+    for raw in data[: last_nl + 1].split(b"\n"):
+        if not raw:
+            continue
+        # Skip lines that can't contribute. `plan_mode_exit` is subsumed by
+        # `plan_mode`. Byte-substring pre-filter avoids JSON-parsing every line.
+        if (
+            b"ExitPlanMode" not in raw
+            and b'"tool_result"' not in raw
+            and b"plan_mode" not in raw
+        ):
+            continue
+        try:
+            d = _json.loads(raw)
+        except Exception:
+            continue
+
+        # plan_mode_exit attachment — approve path bulk-resolves every
+        # outstanding ExitPlanMode id. Usually redundant with the matching
+        # tool_result, but kept as a fallback for CLI edge cases.
+        if d.get("type") == "attachment":
+            att = d.get("attachment")
+            if isinstance(att, dict) and att.get("type") == "plan_mode_exit":
+                outstanding.clear()
+            continue
+
+        msg = d.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "tool_use" and b.get("name") == "ExitPlanMode":
+                bid = b.get("id")
+                if isinstance(bid, str):
+                    outstanding.add(bid)
+            elif btype == "tool_result":
+                tid = b.get("tool_use_id")
+                if isinstance(tid, str):
+                    outstanding.discard(tid)
+
+    _plan_state_cache[claude_session_id] = (consumed, outstanding)
+    return bool(outstanding)
 
 
 def configure(store: SessionStore, tmux: TmuxService) -> None:
@@ -697,83 +752,48 @@ def get_external_preview(agent_session_id: str, cwd: str, user_id: CurrentUser, 
     return {"turns": preview, "total": total, "truncated_before": truncated_before}
 
 
-@router.get("/status")
-def list_sessions_status(
-    user_id: CurrentUser,
-    scope: str = Query(default="all"),
-) -> SessionStatusListResponse:
-    """Lightweight endpoint: returns only status/activity fields, no Claude enrichment.
+def compute_session_status(s, tmux, store) -> dict:
+    """Compute the owner-independent live-status fields for ONE session:
+    AUQ / approval / plan-pending / compacting / TUI hint.
 
-    `scope="active"` restricts the result to RUNNING/DETACHED sessions. The
-    high-frequency frontend poll uses it: attention (plan/auq/approve) and the
-    live TUI hint only exist for eligible sessions, so terminated/stopped ones
-    contribute nothing yet still cost a per-session loop iteration and payload.
-    Non-active sessions are refreshed by the slower full session-list poll.
+    This is the expensive part of the status poll (incremental JSONL scans +
+    tmux pane captures). It is run off the request path by the background
+    snapshot loop (claudemanager.lifespan) and cached in `_STATUS_SNAPSHOT`;
+    the /status endpoint reads the snapshot. Returns a dict of SessionStatusView
+    kwargs, EXCLUDING the cheap per-request fields (status, attached_clients,
+    has_new_output, scheduled_tasks, is_streaming) which the endpoint fills in.
     """
-    store = _get_store()
-    tmux = _get_tmux()
-    items = store.list_for_owner(user_id)
-    if scope == "active":
-        items = [s for s in items if s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)]
-    session_ids = [s.id for s in items]
-    new_output_map = store.get_has_new_output_bulk(session_ids, user_id)
-    task_map = store.list_pending_tasks_for_sessions(session_ids)
-    views = []
-    for s in items:
-        tasks = task_map.get(s.id, [])
-        task_views = [
-            TaskView(
-                id=t.id,
-                command=t.command,
-                run_at=t.run_at.isoformat(),
-                status=t.status,
-                created_at=t.created_at.isoformat(),
-                loop_seconds=t.loop_seconds,
-            )
-            for t in tasks
-        ]
-        # Codex app-server transport bypasses the Claude PID/hook machinery
-        # entirely. The manager owns the live AUQ/approval cache; route via
-        # the adapter so this branch stays explicit at the top.
-        if s.tool == "codex" and s.codex_transport == "app_server":
-            from app.agents import get_adapter
-            ws = None
-            if s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED):
-                try:
-                    ws = get_adapter("codex").get_waiting_state(
-                        agent_session_id=s.agent_session_id,
-                        agent_pid=None,
-                        cwd=s.cwd,
-                        session_id=s.id,
-                    )
-                except Exception:
-                    ws = None
-            tui_auq_data = ws.get("raw") if ws and ws.get("kind") == "auq" else None
-            tui_approve_data = ws.get("raw") if ws and ws.get("kind") == "approve" else None
-            tui_hint = ws.get("hint") if ws else None
-            is_compacting = bool(ws and ws.get("kind") == "compacting")
-            views.append(
-                SessionStatusView(
-                    id=s.id,
-                    status=s.status,
-                    attached_clients=s.attached_clients,
-                    has_new_output=new_output_map.get(s.id, False),
-                    is_streaming=False,
-                    is_compacting=is_compacting,
-                    compacting_progress=None,
-                    scheduled_tasks=task_views,
-                    tui_hint=tui_hint,
-                    tui_auq_data=tui_auq_data,
-                    tui_approve_data=tui_approve_data,
+    # Codex app-server transport bypasses the Claude PID/hook machinery
+    # entirely. The manager owns the live AUQ/approval cache; route via
+    # the adapter so this branch stays explicit at the top.
+    if s.tool == "codex" and s.codex_transport == "app_server":
+        from app.agents import get_adapter
+        ws = None
+        if s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED):
+            try:
+                ws = get_adapter("codex").get_waiting_state(
+                    agent_session_id=s.agent_session_id,
+                    agent_pid=None,
+                    cwd=s.cwd,
+                    session_id=s.id,
                 )
-            )
-            continue
-        # A session keeps its Claude process — and thus its PID file, hooks and
-        # tmux pane — alive while DETACHED; only the browser has gone away. So
-        # detect AUQ / approval for DETACHED too, not just RUNNING, otherwise a
-        # session waiting for a decision vanishes from the session list and the
-        # notifier the moment you switch away from it. (Plan/compact detection
-        # below already uses this same RUNNING|DETACHED eligibility.)
+            except Exception:
+                ws = None
+        return {
+            "tui_auq_data": ws.get("raw") if ws and ws.get("kind") == "auq" else None,
+            "tui_approve_data": ws.get("raw") if ws and ws.get("kind") == "approve" else None,
+            "tui_hint": ws.get("hint") if ws else None,
+            "is_compacting": bool(ws and ws.get("kind") == "compacting"),
+            "compacting_progress": None,
+            "tui_plan_pending": False,
+        }
+    # A session keeps its Claude process — and thus its PID file, hooks and
+    # tmux pane — alive while DETACHED; only the browser has gone away. So
+    # detect AUQ / approval for DETACHED too, not just RUNNING, otherwise a
+    # session waiting for a decision vanishes from the session list and the
+    # notifier the moment you switch away from it. (Plan/compact detection
+    # below already uses this same RUNNING|DETACHED eligibility.)
+    if True:
         eligible = s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)
         # PID file is checked first, but Claude Code 2.1.142+ no longer reliably
         # sets waitingFor for AUQ, so we additionally consult the PreToolUse hook
@@ -928,19 +948,116 @@ def list_sessions_status(
                 tui_plan_pending = _pending_plan_from_jsonl(s.agent_session_id, s.cwd)
             except Exception:
                 tui_plan_pending = False
+        return {
+            "is_compacting": is_compacting,
+            "compacting_progress": compacting_progress,
+            "tui_hint": tui_hint,
+            "tui_auq_data": tui_auq_data,
+            "tui_approve_data": tui_approve_data,
+            "tui_plan_pending": tui_plan_pending,
+        }
+
+
+# ── Background status snapshot ──────────────────────────────────────────────
+# compute_session_status() does incremental JSONL scans + tmux pane captures —
+# the expensive part of the status poll. Running it per-request, per-session
+# made /status take 5-6s on large sessions and let the browser's connection
+# queue grow without bound (ρ>1). Instead a background loop (claudemanager.
+# lifespan) recomputes this for all active sessions at a bounded cadence
+# (≥2s between starts), in parallel on a dedicated thread pool, and stores the
+# result here. The /status endpoint just reads the snapshot → O(active) with no
+# file I/O on the request path. The whole dict is swapped atomically each cycle
+# (GIL-safe; readers take a local reference), so terminated sessions drop out
+# automatically and no lock is needed.
+_STATUS_SNAPSHOT: dict[str, dict] = {}
+
+
+def get_status_snapshot(session_id: str) -> dict | None:
+    return _STATUS_SNAPSHOT.get(session_id)
+
+
+async def refresh_status_snapshot(store, tmux, pool) -> None:
+    """Recompute the status snapshot for all active (RUNNING/DETACHED) sessions.
+
+    Each session's compute_session_status runs on `pool` (a dedicated thread
+    pool, kept off the default executor that terminal WebSockets use, so the
+    scans can't starve interactive traffic). Results are gathered and the
+    snapshot dict is replaced atomically.
+    """
+    global _STATUS_SNAPSHOT
+    active = [
+        s for s in store.all()
+        if s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)
+    ]
+    if not active:
+        _STATUS_SNAPSHOT = {}
+        return
+    loop = asyncio.get_event_loop()
+    results = await asyncio.gather(
+        *(loop.run_in_executor(pool, compute_session_status, s, tmux, store) for s in active),
+        return_exceptions=True,
+    )
+    snap: dict[str, dict] = {}
+    for s, r in zip(active, results):
+        if isinstance(r, Exception):
+            continue
+        snap[s.id] = r
+    _STATUS_SNAPSHOT = snap
+
+
+@router.get("/status")
+def list_sessions_status(
+    user_id: CurrentUser,
+    scope: str = Query(default="all"),
+) -> SessionStatusListResponse:
+    """Lightweight endpoint: returns only status/activity fields, no Claude enrichment.
+
+    `scope="active"` restricts the result to RUNNING/DETACHED sessions. The
+    high-frequency frontend poll uses it: attention (plan/auq/approve) and the
+    live TUI hint only exist for eligible sessions, so terminated/stopped ones
+    contribute nothing yet still cost a per-session loop iteration and payload.
+    Non-active sessions are refreshed by the slower full session-list poll.
+
+    The expensive per-session computation (compute_session_status) is served
+    from the background snapshot (_STATUS_SNAPSHOT); this handler only does
+    cheap per-user store lookups + assembly. On a snapshot miss (a session that
+    just became active before the background loop ran, or a non-active session
+    under scope="all") it computes inline once — cheap now that the scans are
+    incremental.
+    """
+    store = _get_store()
+    tmux = _get_tmux()
+    items = store.list_for_owner(user_id)
+    if scope == "active":
+        items = [s for s in items if s.status in (SessionStatus.RUNNING, SessionStatus.DETACHED)]
+    session_ids = [s.id for s in items]
+    new_output_map = store.get_has_new_output_bulk(session_ids, user_id)
+    task_map = store.list_pending_tasks_for_sessions(session_ids)
+    views = []
+    for s in items:
+        tasks = task_map.get(s.id, [])
+        task_views = [
+            TaskView(
+                id=t.id,
+                command=t.command,
+                run_at=t.run_at.isoformat(),
+                status=t.status,
+                created_at=t.created_at.isoformat(),
+                loop_seconds=t.loop_seconds,
+            )
+            for t in tasks
+        ]
+        snap = get_status_snapshot(s.id)
+        if snap is None:
+            snap = compute_session_status(s, tmux, store)
         views.append(SessionStatusView(
             id=s.id,
             status=s.status,
             attached_clients=s.attached_clients,
             has_new_output=new_output_map.get(s.id, False),
             is_streaming=False,  # streaming detected via WS, not REST
-            is_compacting=is_compacting,
-            compacting_progress=compacting_progress,
             scheduled_tasks=task_views,
-            tui_hint=tui_hint,
-            tui_auq_data=tui_auq_data,
-            tui_approve_data=tui_approve_data,
-            tui_plan_pending=tui_plan_pending,
+            **snap,
         ))
     return SessionStatusListResponse(items=views, total=len(views))
 
@@ -2297,6 +2414,11 @@ def set_agent_session_id(session_id: str, body: SetAgentSessionIdRequest, user_i
     store.update_agent_session_id(session_id, body.agent_session_id)
 
 
+# Incremental total-newline cache for get_raw_messages, keyed by JSONL path:
+#   {path: (size, mtime_ns, newline_count)}  (count excludes the trailing-line +1)
+_total_cache: dict[str, tuple[int, int, int]] = {}
+
+
 @router.get("/{session_id}/raw-messages")
 def get_raw_messages(
     session_id: str,
@@ -2373,12 +2495,35 @@ def get_raw_messages(
                 return {"messages": [], "total": 0, "token": token}
 
             with _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ) as mm:
-                # ── Total line count: fast chunk-based newline scan, no JSON parse ──
-                total = 0
+                # ── Total line count: incremental newline scan, no JSON parse ──
+                # The JSONL is append-only; touching all 100+MB just to count
+                # newlines is what made the cold first-fetch slow (it faults the
+                # whole file into the page cache). Cache the pure newline count
+                # per path and only scan the newly-appended region [old, size).
+                # A grow keeps the base; a same-size+same-mtime hit reuses it as
+                # is (only the proxy snapshot changed, not the file); any other
+                # mismatch (shrink / in-place rewrite) → full recount.
                 chunk = 65536
-                for start in range(0, size, chunk):
-                    total += mm[start:start + chunk].count(b"\n")
-                # If the file doesn't end with \n, the last line is uncounted
+                _pk = str(jsonl_path)
+                _tc = _total_cache.get(_pk)
+                if _tc and (
+                    size > _tc[0]
+                    or (size == _tc[0] and _jstat.st_mtime_ns == _tc[1])
+                ):
+                    nl = _tc[2]
+                    pos = _tc[0]
+                else:
+                    nl = 0
+                    pos = 0
+                while pos < size:
+                    nl += mm[pos:pos + chunk].count(b"\n")
+                    pos += chunk
+                _total_cache[_pk] = (size, _jstat.st_mtime_ns, nl)
+                total = nl
+                # If the file doesn't end with \n, the last line is uncounted.
+                # (size > 0 here — the size == 0 case returned above.) This +1 is
+                # applied to the displayed total only, never folded into the
+                # cached newline count, so the increment stays correct.
                 if mm[size - 1] != 10:  # ord('\n') == 10
                     total += 1
 

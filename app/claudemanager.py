@@ -7,6 +7,7 @@ import os
 import shlex
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -688,6 +689,28 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("share cleanup error")
 
+    # Dedicated pool for per-session status scans. Kept OFF the default executor
+    # (which terminal WebSockets use via run_in_executor) so the scans can't
+    # starve interactive traffic. Workers scale with session count but capped.
+    status_scan_pool = ThreadPoolExecutor(
+        max_workers=min(8, (os.cpu_count() or 2)), thread_name_prefix="status-scan"
+    )
+
+    async def _status_snapshot_loop():
+        # Recompute the /status snapshot in the background so the endpoint reads
+        # cached data instead of scanning JSONLs per request. Enforce ≥2s
+        # between the START of consecutive passes regardless of pass duration.
+        loop = asyncio.get_event_loop()
+        while True:
+            start = loop.time()
+            try:
+                await sessions_api.refresh_status_snapshot(
+                    session_store, tmux, status_scan_pool
+                )
+            except Exception:
+                logger.exception("status snapshot error")
+            await asyncio.sleep(max(0.5, 2.0 - (loop.time() - start)))
+
     # Warm the in-memory share cache from the durable store.
     try:
         share_cache.load(session_store.list_active_shares(time.time()))
@@ -699,17 +722,19 @@ async def lifespan(app: FastAPI):
     scheduler = asyncio.create_task(_task_scheduler())
     proxy_tap_cleaner = asyncio.create_task(_proxy_tap_cleanup_loop())
     share_cleaner = asyncio.create_task(_share_cleanup_loop())
+    status_snapshotter = asyncio.create_task(_status_snapshot_loop())
     prompt_backfill = asyncio.create_task(
         prompt_history_backfill_loop(session_store, prompt_backfill_stop)
     )
     yield
     prompt_backfill_stop.set()
-    for t in (watchdog, scheduler, proxy_tap_cleaner, share_cleaner, prompt_backfill):
+    for t in (watchdog, scheduler, proxy_tap_cleaner, share_cleaner, status_snapshotter, prompt_backfill):
         t.cancel()
         try:
             await t
         except asyncio.CancelledError:
             pass
+    status_scan_pool.shutdown(wait=False)
     # Detach from every codex app-server WITHOUT terminating the process —
     # this leaves them alive so the next backend restart can reconnect via
     # the startup reconciliation block above.
